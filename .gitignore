@@ -5,7 +5,6 @@
 GoTracer
 dist/
 main
-vendor
 *.prof
 profile*.pdf
 .DS_Store

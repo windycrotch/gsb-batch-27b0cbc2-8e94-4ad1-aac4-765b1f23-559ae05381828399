@@ -19,7 +19,7 @@ type TracerOutput struct {
 func GoTrace(
 	env *models.Specification,
 	sharePixelProgress bool, progress chan<- *models.Pixel,
-	isClosable bool, closeChan <-chan bool,
+	isClosable bool, closeChan <-chan struct{},
 ) *TracerOutput {
 	if env.Settings.RenderDepth > 0 {
 		MaxRenderDepth = env.Settings.RenderDepth
@@ -41,10 +41,24 @@ func GoTrace(
 
 	processingGroupData := make([][][2]int, renderRoutines)
 	for i := range processingGroupData {
-		processingGroupData[i] = make([][2]int, 2)
+		processingGroupData[i] = make([][2]int, 0)
 	}
 
 	imin, imax, jmin, jmax := env.Image.GetPatch()
+
+	// isClosed reports whether the caller asked us to stop (e.g. the
+	// websocket connection to the master went away).
+	isClosed := func() bool {
+		if !isClosable || closeChan == nil {
+			return false
+		}
+		select {
+		case <-closeChan:
+			return true
+		default:
+			return false
+		}
+	}
 
 	var output *TracerOutput
 	if !sharePixelProgress {
@@ -65,17 +79,6 @@ func GoTrace(
 			processingGroupData[processingGroup] = append(processingGroupData[processingGroup], [2]int{i, j})
 			division += 1
 
-			/*
-				// Check if go tracer is asked for close
-				if isClosable {
-					select {
-					case <-closeChan:
-						break IMAGE_PROCESSING
-					default:
-					}
-				}
-			*/
-
 		}
 	}
 
@@ -91,10 +94,20 @@ func GoTrace(
 			rng := rand.New(rand.NewSource(time.Now().Unix() + rand.Int63()))
 
 			for _, point := range data {
+				// Stop rendering if the consumer went away.
+				if isClosed() {
+					return
+				}
+
 				i, j := point[0], point[1]
 				pixel := processPixel(i, j, width, height, samples, scene, rng)
 				if sharePixelProgress {
-					progress <- pixel
+					// Do not block forever if the consumer stopped reading.
+					select {
+					case progress <- pixel:
+					case <-closeChan:
+						return
+					}
 				} else {
 					output.Pixels[i][j] = pixel
 				}
@@ -104,7 +117,7 @@ func GoTrace(
 
 	renderWg.Wait()
 
-	if sharePixelProgress {
+	if sharePixelProgress && !isClosed() {
 		progress <- nil
 	}
 

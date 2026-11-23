@@ -8,7 +8,11 @@ type RenderResponseCode string
 
 const (
 	RenderRequestAccepted                 RenderResponseCode = "RenderRequestAccepted"
-	RenderRequestTracingAlreadyInProgress                    = "RenderRequestTracingAlreadyInProgress"
+	RenderRequestTracingAlreadyInProgress RenderResponseCode = "RenderRequestTracingAlreadyInProgress"
+	// RenderRequestDuplicate is returned when the same shard (identified by
+	// OperationId) is dispatched to an agent more than once. The agent does
+	// not re-render it, so no column is ever returned twice.
+	RenderRequestDuplicate RenderResponseCode = "RenderRequestDuplicate"
 )
 
 type WebSocketMessage struct {

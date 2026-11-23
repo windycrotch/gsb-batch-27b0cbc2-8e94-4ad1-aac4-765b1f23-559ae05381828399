@@ -1,8 +1,11 @@
 package main
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
 	"sync"
@@ -15,7 +18,6 @@ import (
 	"github.com/DheerendraRathor/GoTracer/models"
 	"github.com/DheerendraRathor/GoTracer/net/constants"
 	"github.com/DheerendraRathor/GoTracer/tracer"
-	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 )
 
@@ -26,13 +28,18 @@ const (
 )
 
 type RenderingClient struct {
-	Conn                *websocket.Conn
-	Results             chan *models.Pixel
-	IsTracingInProgress bool
-	CloseChan           chan bool
-	OperationId         string
-	PongChannel         chan bool
-	WaitGroup           sync.WaitGroup
+	Conn        *websocket.Conn
+	Results     chan *models.Pixel
+	CloseChan   chan struct{}
+	PongChannel chan bool
+	WaitGroup   sync.WaitGroup
+
+	// mu guards Conn writes (both goroutines below write to the connection)
+	// as well as the fields that follow it.
+	mu                  sync.Mutex
+	isTracingInProgress bool
+	operationId         string
+	seenOperations      map[string]bool
 }
 
 func (c *RenderingClient) Initialize() {
@@ -40,7 +47,10 @@ func (c *RenderingClient) Initialize() {
 
 	c.Conn.SetPongHandler(
 		func(message string) error {
-			c.PongChannel <- true
+			select {
+			case c.PongChannel <- true:
+			default:
+			}
 			return nil
 		},
 	)
@@ -53,6 +63,27 @@ func (c *RenderingClient) Initialize() {
 	go c.ResultSender()
 
 	c.WaitGroup.Wait()
+}
+
+// writeJSON serializes writes to the websocket connection; ReadHandler and
+// ResultSender both write, and gorilla/websocket allows only one concurrent
+// writer.
+func (c *RenderingClient) writeJSON(v interface{}) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := c.Conn.WriteJSON(v); err != nil {
+		log.Printf("Unable to write message to master: %s", err)
+	}
+}
+
+// newOperationId generates a random operation id without external
+// dependencies.
+func newOperationId() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Sprintf("op-%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b)
 }
 
 var addr = flag.String("addr", "", "http service address")
@@ -93,113 +124,148 @@ func pingThread(conn *websocket.Conn, pongChan <-chan bool) {
 }
 
 func (c *RenderingClient) ReadHandler() {
-	closeChan := make(chan bool)
-
 	defer func() {
 		c.WaitGroup.Done()
-		closeChan <- true
+		// Signal the tracer and ResultSender that the connection is gone.
+		close(c.CloseChan)
 	}()
 
 	var message messages.WebSocketMessage
-	var renderReqMsg messages.RenderRequestMessage
 	for {
 		_, msgStr, err := c.Conn.ReadMessage()
 		if err != nil {
 			log.Printf("Unable to understand message: %s", err)
-			break
+			return
 		}
 
-		json.Unmarshal(msgStr, &message)
-
-		if message.Type == messages.RenderRequest {
-			json.Unmarshal(msgStr, &renderReqMsg)
-			operationId := renderReqMsg.OperationId
-			if strings.TrimSpace(operationId) == "" {
-				byteOpId, _ := uuid.NewRandom()
-				operationId = byteOpId.String()
-			}
-			c.OperationId = operationId
-
-			responseMessage := messages.RenderRequestResponseMessage{
-				Type:        messages.RenderRequestResponse,
-				OperationId: c.OperationId,
-			}
-
-			if !c.IsTracingInProgress {
-				go tracer.GoTrace(&renderReqMsg.Data, true, c.Results, true, closeChan)
-				c.IsTracingInProgress = true
-				responseMessage.Code = messages.RenderRequestAccepted
-			} else {
-				responseMessage.Code = messages.RenderRequestTracingAlreadyInProgress
-			}
-
-			c.Conn.WriteJSON(message)
+		if err := json.Unmarshal(msgStr, &message); err != nil {
+			continue
 		}
+
+		if message.Type != messages.RenderRequest {
+			continue
+		}
+
+		// Fresh variable per request: the tracer goroutine reads Data while
+		// the next message is being decoded.
+		var renderReqMsg messages.RenderRequestMessage
+		if err := json.Unmarshal(msgStr, &renderReqMsg); err != nil {
+			continue
+		}
+
+		operationId := strings.TrimSpace(renderReqMsg.OperationId)
+		if operationId == "" {
+			operationId = newOperationId()
+		}
+
+		c.mu.Lock()
+		var code messages.RenderResponseCode
+		switch {
+		case c.seenOperations[operationId]:
+			// The same shard was dispatched twice. Do not render it again:
+			// re-rendering would make two agents (or two runs) stream the
+			// same columns and overwrite each other's pixels.
+			code = messages.RenderRequestDuplicate
+		case c.isTracingInProgress:
+			// A previous render is still running. Reject the new request;
+			// the old task keeps streaming its results undisturbed.
+			code = messages.RenderRequestTracingAlreadyInProgress
+		default:
+			c.seenOperations[operationId] = true
+			c.isTracingInProgress = true
+			c.operationId = operationId
+			code = messages.RenderRequestAccepted
+			go tracer.GoTrace(&renderReqMsg.Data, true, c.Results, true, c.CloseChan)
+		}
+		c.mu.Unlock()
+
+		c.writeJSON(messages.RenderRequestResponseMessage{
+			Type:        messages.RenderRequestResponse,
+			Code:        code,
+			OperationId: operationId,
+		})
 	}
 }
 
 func (c *RenderingClient) ResultSender() {
 	defer c.WaitGroup.Done()
 
-	message := messages.WebSocketMessage{
-		Type: messages.PixelResult,
-	}
+	for {
+		select {
+		case <-c.CloseChan:
+			return
+		case pixel := <-c.Results:
+			c.mu.Lock()
+			operationId := c.operationId
+			c.mu.Unlock()
 
-	for pixel := range c.Results {
-		message.OperationId = c.OperationId
-		if pixel == nil {
-			message.Type = messages.RenderingCompleted
-			c.Conn.WriteJSON(message)
-			break
+			if pixel == nil {
+				// The current render finished: notify the master and allow
+				// the next render request to be accepted.
+				c.writeJSON(messages.WebSocketMessage{
+					Type:        messages.RenderingCompleted,
+					OperationId: operationId,
+				})
+				c.mu.Lock()
+				c.isTracingInProgress = false
+				c.mu.Unlock()
+				continue
+			}
+
+			c.writeJSON(messages.WebSocketMessage{
+				Type:        messages.PixelResult,
+				Data:        pixel,
+				OperationId: operationId,
+			})
 		}
-
-		message.Data = pixel
-		c.Conn.WriteJSON(message)
 	}
 }
 
 func agentHandler(w http.ResponseWriter, r *http.Request) {
 	log.Println("Received a connection request")
-	shouldConnect := true
 
 	mutex.Lock()
 	if activeConn != nil {
+		mutex.Unlock()
 		log.Print("An active connection already exists")
 		http.Error(w, "An active connection already exists", http.StatusConflict)
-		shouldConnect = false
+		return
 	}
 
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
+		mutex.Unlock()
 		log.Print("upgrade:", err)
-		shouldConnect = false
+		return
 	}
 	activeConn = conn
 	mutex.Unlock()
 
 	defer func() {
+		mutex.Lock()
 		activeConn = nil
+		mutex.Unlock()
 		conn.Close()
 	}()
 
-	if !shouldConnect {
-		return
-	}
-
 	client := RenderingClient{
-		Conn:                conn,
-		PongChannel:         make(chan bool),
-		Results:             make(chan *models.Pixel, 100),
-		IsTracingInProgress: false,
-		OperationId:         "",
+		Conn:           conn,
+		PongChannel:    make(chan bool, 1),
+		Results:        make(chan *models.Pixel, 100),
+		CloseChan:      make(chan struct{}),
+		seenOperations: make(map[string]bool),
 	}
 
 	client.Initialize()
 }
 
 func agentStatusHandler(w http.ResponseWriter, r *http.Request) {
+	mutex.Lock()
+	available := activeConn == nil
+	mutex.Unlock()
+
 	status := messages.AgentStatus{
-		Available: activeConn == nil,
+		Available: available,
 		Cores:     runtime.NumCPU(),
 	}
 

@@ -16,7 +16,6 @@ import (
 	"github.com/DheerendraRathor/GoTracer/models"
 	"github.com/DheerendraRathor/GoTracer/tracer"
 	"github.com/DheerendraRathor/GoTracer/utils"
-	"gopkg.in/cheggaaa/pb.v1"
 )
 
 var renderSpecFile string
@@ -62,17 +61,14 @@ func main() {
 		defer close(progress)
 
 		var pbWg sync.WaitGroup
-		var progressBar *pb.ProgressBar
+		var progressBar *utils.Progress
 
 		pbWg.Add(1)
 		go func() {
 			defer pbWg.Done()
 
 			total := env.Image.Width * env.Image.Height
-			progressBar = pb.StartNew(total)
-			progressBar.ShowFinalTime = true
-			progressBar.ShowTimeLeft = false
-			progressBar.ShowBar = false
+			progressBar = utils.StartProgress(total)
 
 			for pixel := range progress {
 				if pixel == nil {
