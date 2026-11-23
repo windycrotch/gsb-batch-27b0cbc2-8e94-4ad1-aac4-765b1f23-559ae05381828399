@@ -1,0 +1,17 @@
+# Ignore binaries
+
+webrtc-cdn.exe
+webrtc-cdn
+
+# Ignore temp files
+
+temp
+
+# Ignore .env
+
+.env
+*.log
+
+# Ignore doc
+
+doc
