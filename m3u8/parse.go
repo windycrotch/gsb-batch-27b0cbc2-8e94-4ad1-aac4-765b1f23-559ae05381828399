@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -23,117 +22,200 @@ const (
 	tagSessionData         = "#EXT-X-SESSION-DATA"         // RFC 8216, 4.3.4.4
 )
 
+// parser consumes a stream of lexed items. Unlike reading directly from
+// the lexer's channel, a parser can never block: end of input is
+// reported as an item of type itemEOF. This keeps error paths simple
+// and guarantees no goroutine is left blocked on a send.
+type parser struct {
+	items []item
+	pos   int
+}
+
+// next returns the next item, or an item of type itemEOF once the
+// input is exhausted.
+func (p *parser) next() item {
+	if p.pos >= len(p.items) {
+		return item{typ: itemEOF}
+	}
+	it := p.items[p.pos]
+	p.pos++
+	return it
+}
+
+// value returns the next item, converting lexical errors and
+// unexpected end of input into errors.
+func (p *parser) value() (item, error) {
+	it := p.next()
+	switch it.typ {
+	case itemError:
+		return it, errors.New(it.val)
+	case itemEOF:
+		return it, errors.New("unexpected end of playlist")
+	}
+	return it, nil
+}
+
+// skipLine discards items up to and including the next newline. It is
+// used to ignore tags which are lexically valid but unsupported by this
+// package. A lexical error terminates the scan and is returned.
+func skipLine(p *parser) error {
+	for {
+		switch it := p.next(); it.typ {
+		case itemNewline, itemEOF:
+			return nil
+		case itemError:
+			return errors.New(it.val)
+		}
+	}
+}
+
 func Decode(rd io.Reader) (*Playlist, error) {
 	lex := newLexer(rd)
 	go lex.run()
-	it := <-lex.items
-	if it.typ == itemError {
+	// Drain the lexer's entire item stream before parsing. The lexer
+	// goroutine always runs to completion, so it is never left blocked
+	// on a send even when parsing fails partway through, and a failed
+	// Decode cannot affect any subsequent call.
+	var items []item
+	for it := range lex.items {
+		items = append(items, it)
+	}
+	return parsePlaylist(items)
+}
+
+func parsePlaylist(items []item) (*Playlist, error) {
+	p := &Playlist{}
+	pa := &parser{items: items}
+
+	it := pa.next()
+	switch it.typ {
+	case itemEOF:
+		return nil, errors.New("empty playlist")
+	case itemError:
 		return nil, errors.New(it.val)
 	}
 	if it.typ != itemTag || it.val != tagHead {
-		return nil, fmt.Errorf("expected head tag, got %q", it.val)
+		return nil, fmt.Errorf("expected head tag, got %s", it)
 	}
 
-	p := &Playlist{}
-	var err error
-	for it := range lex.items {
+	for {
+		it = pa.next()
 		switch it.typ {
+		case itemEOF:
+			return p, nil
 		case itemError:
-			return p, errors.New(it.val)
+			return nil, errors.New(it.val)
 		case itemNewline:
 			continue
+		case itemTag:
+			// ok; handled below
 		default:
-			if it.typ != itemTag {
-				return p, fmt.Errorf("unexpected %s %q, expected tag", it.typ, it.val)
-			}
+			return nil, fmt.Errorf("unexpected %s %q, expected tag", it.typ, it.val)
 		}
 
 		switch it.val {
 		case tagVersion:
-			it = <-lex.items
 			if p.Version != 0 {
-				return p, fmt.Errorf("parse %s: playlist version already specified", it)
+				return nil, fmt.Errorf("parse %s: playlist version already specified", tagVersion)
+			}
+			it, err := pa.value()
+			if err != nil {
+				return nil, fmt.Errorf("parse %s: %w", tagVersion, err)
 			}
 			p.Version, err = strconv.Atoi(it.val)
 			if err != nil {
-				return p, fmt.Errorf("parse playlist version: %w", err)
+				return nil, fmt.Errorf("parse playlist version: %w", err)
 			}
 		case tagIndependentSegments:
 			p.IndependentSegments = true
 		case tagVariant:
-			variant, err := parseVariant(lex.items)
+			variant, err := parseVariant(pa)
 			if err != nil {
-				return p, fmt.Errorf("parse variant: %w", err)
+				return nil, fmt.Errorf("parse variant: %w", err)
 			}
 			p.Variants = append(p.Variants, *variant)
 		case tagRendition:
-			rend, err := parseRendition(lex.items)
+			rend, err := parseRendition(pa)
 			if err != nil {
-				return p, fmt.Errorf("parse rendition: %w", err)
+				return nil, fmt.Errorf("parse rendition: %w", err)
 			}
 			p.Media = append(p.Media, *rend)
 		case tagPlaylistType:
-			it = <-lex.items
+			it, err := pa.value()
+			if err != nil {
+				return nil, fmt.Errorf("parse %s: %w", tagPlaylistType, err)
+			}
 			typ, err := parsePlaylistType(it)
 			if err != nil {
-				return p, fmt.Errorf("parse playlist type: %w", err)
+				return nil, fmt.Errorf("parse playlist type: %w", err)
 			}
 			p.Type = typ
 
 		case tagTargetDuration:
-			it = <-lex.items
+			it, err := pa.value()
+			if err != nil {
+				return nil, fmt.Errorf("parse %s: %w", tagTargetDuration, err)
+			}
 			dur, err := parseTargetDuration(it)
 			if err != nil {
-				return p, fmt.Errorf("parse target duration: %w", err)
+				return nil, fmt.Errorf("parse target duration: %w", err)
 			}
 			p.TargetDuration = dur
 
-		case tagSegmentDuration, tagByteRange, tagKey:
-			segment, err := parseSegment(lex.items, it)
+		case tagSegmentDuration, tagByteRange, tagKey, tagMap, tagDateTime, tagDiscontinuity:
+			segment, err := parseSegment(pa, it)
 			if err != nil {
-				return p, fmt.Errorf("parse segment: %w", err)
+				return nil, fmt.Errorf("parse segment: %w", err)
 			}
 			p.Segments = append(p.Segments, *segment)
 
 		case tagEndList:
 			p.End = true
 		case tagMediaSequence:
-			it = <-lex.items
+			it, err := pa.value()
+			if err != nil {
+				return nil, fmt.Errorf("parse %s: %w", tagMediaSequence, err)
+			}
 			seq, err := strconv.Atoi(it.val)
 			if err != nil {
-				return p, fmt.Errorf("parse media sequence: %w", err)
+				return nil, fmt.Errorf("parse media sequence: %w", err)
 			}
 			p.Sequence = seq
 		default:
-			if lex.debug {
-				fmt.Fprintln(os.Stderr, "unknown tag", it)
+			// Lexically valid but unsupported tag: ignore the
+			// rest of the line. Unlike a syntax error this must
+			// not fail the parse, but the whole line is consumed
+			// so following tags stay aligned.
+			if err := skipLine(pa); err != nil {
+				return nil, fmt.Errorf("parse %s: %w", it.val, err)
 			}
-			// throw away whatever is next; we don't support it but also don't want to
-			// return errors while this package is in development.
-			<-lex.items
 		}
 	}
-	return p, nil
 }
 
-func parseVariant(items chan item) (*Variant, error) {
+func parseVariant(p *parser) (*Variant, error) {
 	var v Variant
-	for it := range items {
+	for {
+		it := p.next()
 		switch it.typ {
 		case itemError:
 			return nil, errors.New(it.val)
+		case itemEOF:
+			return nil, fmt.Errorf("unexpected end of playlist in %s", tagVariant)
 		case itemComma, itemNewline:
 			continue
 		case itemURL:
 			v.URI = it.val
 			return &v, nil
-		default:
-			if it.typ != itemAttrName {
-				return nil, fmt.Errorf("expected %s, got %s", itemAttrName, it.typ)
-			}
+		}
+		if it.typ != itemAttrName {
+			return nil, fmt.Errorf("expected %s, got %s", itemAttrName, it.typ)
 		}
 		attr := it
-		it = <-items
+		it, err := p.value()
+		if err != nil {
+			return nil, fmt.Errorf("parse %s attribute: %w", attr.val, err)
+		}
 		if it.typ != itemEquals {
 			return nil, fmt.Errorf("missing equals after %s", attr)
 		}
@@ -142,8 +224,15 @@ func parseVariant(items chan item) (*Variant, error) {
 		case "PROGRAM-ID", "NAME":
 			// parsing PROGRAM-ID attribute unsupported; removed in HLS version 6
 			// NAME is non-standard, should be set in Rendition.
+			// Consume the value so the following attributes stay aligned.
+			if _, err := p.value(); err != nil {
+				return nil, fmt.Errorf("parse %s attribute: %w", attr.val, err)
+			}
 		case "BANDWIDTH", "AVERAGE-BANDWIDTH":
-			it = <-items
+			it, err := p.value()
+			if err != nil {
+				return nil, fmt.Errorf("parse bandwidth attribute: %w", err)
+			}
 			if it.typ != itemNumber {
 				return nil, fmt.Errorf("parse bandwidth attribute: unexpected %s", it)
 			}
@@ -157,20 +246,29 @@ func parseVariant(items chan item) (*Variant, error) {
 				v.AverageBandwidth = n
 			}
 		case "CODECS":
-			it = <-items
+			it, err := p.value()
+			if err != nil {
+				return nil, fmt.Errorf("parse codecs attribute: %w", err)
+			}
 			if it.typ != itemString {
 				return nil, fmt.Errorf("parse codecs attribute: unexpected %s", it)
 			}
 			v.Codecs = strings.Split(strings.Trim(it.val, `"`), ",")
 		case "RESOLUTION":
-			it = <-items
+			it, err := p.value()
+			if err != nil {
+				return nil, fmt.Errorf("parse resolution attribute: %w", err)
+			}
 			res, err := parseResolution(it.val)
 			if err != nil {
 				return nil, fmt.Errorf("parse resolution: %w", err)
 			}
 			v.Resolution = res
 		case "FRAME-RATE":
-			it = <-items
+			it, err := p.value()
+			if err != nil {
+				return nil, fmt.Errorf("parse frame rate attribute: %w", err)
+			}
 			if it.typ != itemNumber {
 				return nil, fmt.Errorf("parse frame rate: unexpected %s", it)
 			}
@@ -180,7 +278,10 @@ func parseVariant(items chan item) (*Variant, error) {
 			}
 			v.FrameRate = float32(n)
 		case "HDCP-LEVEL":
-			it = <-items
+			it, err := p.value()
+			if err != nil {
+				return nil, fmt.Errorf("parse HDCP-LEVEL attribute: %w", err)
+			}
 			l, err := parseHDCPLevel(it.val)
 			if err != nil {
 				return nil, fmt.Errorf("parse HDCP level: %w", err)
@@ -188,7 +289,10 @@ func parseVariant(items chan item) (*Variant, error) {
 			v.HDCP = l
 		case "AUDIO", "VIDEO", "SUBTITLES":
 			name := attr.val
-			it = <-items
+			it, err := p.value()
+			if err != nil {
+				return nil, fmt.Errorf("parse %s attribute: %w", name, err)
+			}
 			if it.typ != itemString {
 				return nil, fmt.Errorf("parse %s: unexpected %s", name, it)
 			}
@@ -201,7 +305,10 @@ func parseVariant(items chan item) (*Variant, error) {
 				v.Subtitles = it.val
 			}
 		case "CLOSED-CAPTIONS":
-			it = <-items
+			it, err := p.value()
+			if err != nil {
+				return nil, fmt.Errorf("parse closed-captions attribute: %w", err)
+			}
 			if it.typ != itemString {
 				return nil, fmt.Errorf("parse closed-captions: unexpected %s", it)
 			}
@@ -210,7 +317,6 @@ func parseVariant(items chan item) (*Variant, error) {
 			return nil, fmt.Errorf("unknown attribute %s", attr.val)
 		}
 	}
-	return nil, fmt.Errorf("no url")
 }
 
 func parseResolution(s string) (res [2]int, err error) {
@@ -244,19 +350,32 @@ func parseHDCPLevel(s string) (HDCPLevel, error) {
 	return 0, fmt.Errorf("unknown HDCP level %q", s)
 }
 
-func parseRendition(items chan item) (*Rendition, error) {
+func parseRendition(p *parser) (*Rendition, error) {
 	var rend Rendition
 	var err error
-	for it := range items {
+	for {
+		it := p.next()
+		switch it.typ {
+		case itemError:
+			return nil, errors.New(it.val)
+		case itemEOF:
+			return nil, fmt.Errorf("unexpected end of playlist in %s", tagRendition)
+		}
 		if it.typ != itemAttrName {
 			return nil, fmt.Errorf("expected attribute name, got %s", it)
 		}
 		attr := it
-		it = <-items
+		it, err = p.value()
+		if err != nil {
+			return nil, fmt.Errorf("parse %s: %w", attr.val, err)
+		}
 		if it.typ != itemEquals {
 			return nil, fmt.Errorf("parse %s: expected =, got %s", attr, it)
 		}
-		it = <-items
+		it, err = p.value()
+		if err != nil {
+			return nil, fmt.Errorf("parse %s: %w", attr.val, err)
+		}
 		switch attr.val {
 		case "TYPE":
 			rend.Type, err = parseMediaType(it.val)
@@ -297,7 +416,7 @@ func parseRendition(items chan item) (*Rendition, error) {
 		default:
 			return nil, fmt.Errorf("unknown rendition attribute %s", attr.val)
 		}
-		it = <-items
+		it = p.next()
 		switch it.typ {
 		case itemError:
 			return nil, fmt.Errorf("next attribute: %s", it.val)
@@ -305,11 +424,12 @@ func parseRendition(items chan item) (*Rendition, error) {
 			continue
 		case itemNewline:
 			return &rend, nil
+		case itemEOF:
+			return nil, fmt.Errorf("unexpected end of playlist in %s", tagRendition)
 		default:
 			return nil, fmt.Errorf("next attribute: expected comma or newline, got %s", it)
 		}
 	}
-	return &rend, nil
 }
 
 func parseMediaType(s string) (MediaType, error) {

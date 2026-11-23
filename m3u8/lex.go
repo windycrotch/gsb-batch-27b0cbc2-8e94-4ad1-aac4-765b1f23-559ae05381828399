@@ -155,7 +155,7 @@ func lexStart(l *lexer) stateFn {
 		l.emit(itemNewline)
 	}
 	if err := l.sc.Err(); err != nil {
-		panic(err)
+		return l.errorf("read playlist: %v", err)
 	}
 	return nil
 }
@@ -244,7 +244,9 @@ func lexAttrs(l *lexer) stateFn {
 func lexAttrValue(l *lexer) stateFn {
 	r := l.next()
 	switch r {
-	case '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '.', ':':
+	case '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '.', ':', '@':
+		// '@' can appear in a byte range directly after a tag's
+		// colon, e.g. #EXT-X-BYTERANGE:4587770@14872.
 		return lexNumber(l)
 	case '"':
 		return lexQString(l)
@@ -294,7 +296,6 @@ Loop:
 	}
 	return lexAttrs(l)
 }
-
 
 func lexQString(l *lexer) stateFn {
 	for {
