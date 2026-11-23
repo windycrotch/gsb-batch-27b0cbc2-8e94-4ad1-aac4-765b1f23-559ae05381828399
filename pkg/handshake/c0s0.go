@@ -21,7 +21,7 @@ func (c *C0S0) Read(r io.Reader) error {
 	c.Version = buf[0]
 
 	if c.Version != 3 && c.Version != 6 {
-		return fmt.Errorf("invalid rtmp version (%d)", c.Version)
+		return fmt.Errorf("%w: invalid rtmp version (%d)", ErrPeerInvalidData, c.Version)
 	}
 
 	return nil
