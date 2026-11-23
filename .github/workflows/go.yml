@@ -1,0 +1,37 @@
+name: Go
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+jobs:
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v2
+
+    - name: Set up Go
+      uses: actions/setup-go@v2
+      with:
+        go-version: 1.17
+
+    - name: Get dependencies
+      run: sudo apt-get update && sudo apt-get install libasound2-dev
+      if: ${{ runner.os == 'Linux' }}
+
+    - name: Build
+      run: go build -v ./...
+
+    - name: Go Test
+      run: go test -v -coverprofile=coverage.txt -covermode=atomic ./...
+
+    - name: Upload coverage report
+      uses: codecov/codecov-action@v1.0.2
+      with:
+        token: 4a4ba14f-7546-4000-9113-7b67b111ebd6
+        file: ./coverage.txt
+        flags: unittests
+        name: codecov-qiniu-audio
