@@ -3,13 +3,13 @@ module github.com/gaetanlhf/rtp2webrtc
 go 1.20
 
 require (
+	github.com/google/uuid v1.6.0
 	github.com/pion/webrtc/v3 v3.2.38
 	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (
 	github.com/davecgh/go-spew v1.1.1 // indirect
-	github.com/google/uuid v1.6.0 // indirect
 	github.com/pion/datachannel v1.5.6 // indirect
 	github.com/pion/dtls/v2 v2.2.10 // indirect
 	github.com/pion/ice/v2 v2.3.19 // indirect

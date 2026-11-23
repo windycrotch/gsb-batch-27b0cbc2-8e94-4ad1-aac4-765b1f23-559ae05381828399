@@ -73,6 +73,46 @@ api-location: /rtp2webrtc/api/v1/offer
 allow-cross-origin: false
 ```
 
+## Reliability model
+
+### Per-viewer sessions
+
+Each HTTP negotiation request is fully isolated: the incoming SDP is decoded
+into a request-local variable and every viewer gets its own `PeerConnection`
+tracked in a concurrency-safe session registry. There is no shared global
+session description, so requests arriving simultaneously can never overwrite
+each other, and a failure in one negotiation only answers that single request —
+all other viewers keep streaming.
+
+A viewer identifies itself with the `X-RTP2WEBRTC-Session-Id` request header
+(or the `sessionId` query parameter); viewers that omit it receive a generated
+id in the matching response header. Re-submitting a negotiation with the same
+id replaces the previous connection: the newest negotiation wins and the old
+`PeerConnection` is closed orderly, with its callbacks detached, instead of
+leaking resources. Stale disconnect callbacks are matched by instance identity,
+so they can never close a newer connection belonging to the same or another
+viewer. When a connection reaches the `disconnected`, `failed` or `closed`
+state, its `PeerConnection` and registered callbacks are released automatically.
+
+### Media reception resilience
+
+Each RTP media path (audio/video) runs independently and never crashes the
+process. Bind and read errors are retried with a bounded budget (5 consecutive
+failures, 2 s apart). Once the budget is exhausted the media path is parked in
+the `stopped` state while the HTTP service keeps running, and a background
+recovery loop retries the socket every 10 s; as soon as the port or network
+becomes available again, new viewers receive media without a restart.
+
+### Observability
+
+A `GET` on the API endpoint returns a JSON status report with the number of
+live sessions and, per media kind, the state (`active` / `reconnecting` /
+`stopped`), bound address, consecutive failure count and packet counter.
+Every negotiation response also carries an
+`X-RTP2WEBRTC-Media-<Kind>` header giving the current state of each media path,
+and negotiation errors embed the same status report so clients can react to an
+outage explicitly.
+
 ## Run
 ### Direct use
 

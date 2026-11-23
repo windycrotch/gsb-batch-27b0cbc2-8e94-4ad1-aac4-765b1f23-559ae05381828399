@@ -1,21 +1,22 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
-	"github.com/pion/webrtc/v3"
 	"gopkg.in/yaml.v3"
 )
 
 var (
-	version         string
-	buildTime       string
-	config          ConfigStruct
-	videoTrack      *webrtc.TrackLocalStaticRTP
-	audioTrack      *webrtc.TrackLocalStaticRTP
-	iceServersArray []string
+	version   string
+	buildTime string
+	config    ConfigStruct
 )
 
 type IceServersStruct struct {
@@ -49,26 +50,79 @@ func main() {
 		log.Fatal(err)
 	}
 
-	err = yaml.Unmarshal(configFile, &config)
-	if err != nil {
-		log.Fatal(err.Error())
+	if err := yaml.Unmarshal(configFile, &config); err != nil {
+		log.Fatal(err)
 	}
 
+	iceServersArray := make([]string, 0, len(config.IceServers))
 	for _, iceServer := range config.IceServers {
 		iceServersArray = append(iceServersArray, iceServer.IceServer)
 	}
 
+	media := make(map[string]*MediaSource)
+
 	if config.EnableVideo {
-		videoTrack = initWebrtcTrack("video", config.VideoCodec, config.VideoTrackName)
-		go listenRtp(config.RtpHost, config.RtpVideoPort, "video", videoTrack)
+		track, err := initWebrtcTrack("video", config.VideoCodec, config.VideoTrackName)
+		if err != nil {
+			log.Fatalf("cannot create video track: %v", err)
+		}
+		source := NewMediaSource("video", config.RtpHost, config.RtpVideoPort, track)
+		media["video"] = source
+		go source.Run()
 	}
 
 	if config.EnableAudio {
-		audioTrack = initWebrtcTrack("audio", config.AudioCodec, config.AudioTrackName)
-		go listenRtp(config.RtpHost, config.RtpAudioPort, "audio", audioTrack)
+		track, err := initWebrtcTrack("audio", config.AudioCodec, config.AudioTrackName)
+		if err != nil {
+			log.Fatalf("cannot create audio track: %v", err)
+		}
+		source := NewMediaSource("audio", config.RtpHost, config.RtpAudioPort, track)
+		media["audio"] = source
+		go source.Run()
 	}
 
-	http.HandleFunc(config.ApiLocation, OnConnect)
-	log.Printf("Serving API on %s:%s", config.ServeIp, config.ServePort)
-	log.Panicln(http.ListenAndServe(config.ServeIp+":"+config.ServePort, nil))
+	server := NewServer(config, iceServersArray, media)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc(config.ApiLocation, server.ServeHTTP)
+
+	httpServer := &http.Server{
+		Addr:              config.ServeIp + ":" + config.ServePort,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+
+	// Stop media reception and release viewer sessions on SIGINT/SIGTERM.
+	signalCh := make(chan os.Signal, 1)
+	signal.Notify(signalCh, os.Interrupt, syscall.SIGTERM)
+
+	serverErr := make(chan error, 1)
+	go func() {
+		log.Printf("Serving API on %s:%s", config.ServeIp, config.ServePort)
+		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serverErr <- err
+		}
+		close(serverErr)
+	}()
+
+	select {
+	case err := <-serverErr:
+		if err != nil {
+			log.Printf("HTTP server error: %v", err)
+		}
+	case sig := <-signalCh:
+		log.Printf("received signal %v, shutting down", sig)
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := httpServer.Shutdown(shutdownCtx); err != nil {
+		log.Printf("HTTP shutdown error: %v", err)
+	}
+
+	server.Shutdown()
+	for _, source := range media {
+		source.Stop()
+	}
+	log.Printf("shutdown complete")
 }
