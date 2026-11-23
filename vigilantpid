@@ -1,0 +1,88 @@
+#!/bin/bash
+
+BIN_DIR=/home/pi/vigilantpi
+
+export CONFIG=$BIN_DIR/config.yaml
+export LOG=$BIN_DIR/vigilantpi.log
+export PATH="$PATH:$BIN_DIR"
+export DB=$BIN_DIR/db.json
+
+checkupdate() {
+    cd $BIN_DIR
+    echo checking for update
+
+    if [ -e "vigilantpi" ]; then
+       	version=$(vigilantpi version)
+        if [ "$version" = development ]; then
+            echo development version - wont update
+            return
+        fi
+    else
+        touch vigilantpi
+    fi
+
+    version=$(vigilantpi version)
+    res=$(curl -s https://api.github.com/repos/petersondmg/vigilantpi/releases/latest)
+
+    latest_version=$(echo "$res" | grep tag_name | cut -d\" -f4)
+    echo lastest release: $latest_version
+
+    if [ "$version" = "$latest_version" ]; then
+        echo no update available
+        return
+    fi
+
+    cd $BIN_DIR
+
+    rm -rf $BIN_DIR/_update
+    echo downloading newer version $latest_version...
+    url=$(echo "$res" | grep "browser_download_url" | cut -d : -f 2,3 | cut -d\" -f2)
+    curl -Ls "$url" -o $BIN_DIR/vigilantpi.tar.gz \
+        && mkdir $BIN_DIR/_update \
+        && echo extracting update... \
+        && tar vxzf vigilantpi.tar.gz -C $BIN_DIR/_update \
+        && mv $BIN_DIR/_update/vigilantpi $BIN_DIR/vigilantpi_latest
+}
+
+move_logs() {
+    local mountdir=$(vigilantpi mount-dir)
+    if mountpoint -q "$mountdir"; then
+        if [ ! -L "$LOG" ]; then
+            touch "$mountdir/vigilantpi.log" && \
+            mv "$LOG" "$LOG-tmp" && \
+            ln -sf "$mountdir/vigilantpi.log" "$LOG" && \
+            cat "$LOG-tmp" >> "$LOG" && \
+            chmod 666 "$LOG" && \
+            rm -f "$LOG-tmp" && \
+            echo "log moved to $mountdir"
+        fi	
+    fi
+}
+
+(while true; do
+    move_logs
+
+    checkupdate
+	
+    if [ -e $BIN_DIR/vigilantpi_latest ]; then
+        echo updating binary...
+
+        mv $BIN_DIR/vigilantpi $BIN_DIR/vigilantpi_bkp \
+            && mv $BIN_DIR/vigilantpi_latest $BIN_DIR/vigilantpi \
+            && echo updated... \
+            || echo error updating...
+    fi
+
+    echo starting vigilantpi
+
+	vigilantpi
+    if [ $? -eq 2 ]; then
+        echo exited with code 2. rebooting via sysrq
+        sleep 1
+        echo b > /proc/sysrq-trigger
+    fi
+
+	echo vigilantpi died. restarting
+
+	sleep 1
+done) >> $LOG 2>&1

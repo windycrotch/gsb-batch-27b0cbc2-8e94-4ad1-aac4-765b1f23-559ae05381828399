@@ -1,0 +1,84 @@
+wifi_ssdi:
+wifi_pass:
+
+admin:
+  user:
+  pass:
+  addr: :80
+
+ffmpeg: /usr/bin/ffmpeg
+# useful on raspberry pi
+# to grant HDD is mounted
+mount_dir: /mnt/hdd
+
+# device to mount
+# try to mount if setted
+mount_dev: /dev/sda1
+
+# set to true if experiencing hdd becoming unavailable
+# after some time running
+prevent_hdd_spindown: true
+
+videos_dir: /mnt/hdd/cameras
+
+duration: 30m
+
+delete_after_days: 20
+
+cameras:
+- name: fundo_hall
+  url: rtsp://192.168.10.104:10554/udp/av0_1
+  motion_detection:
+    alg: difference 
+    min_distance: 2
+    max_distance: 20
+    snapshot_interval: 1m
+    time_range:
+        start: 0h0m1s
+        end: 23h59m59s
+
+- name: palco
+  url: rtsp://192.168.10.109:10554/udp/av0_1
+  before_rec:
+  - say_starting
+  after_rec:
+  - say_finished
+
+cron:
+- every: 6h
+  tasks:
+  - reboot_camera_fundo_all
+  - reboot_camera_palco
+
+tasks:
+- name: reboot_camera_fundo_hall
+  request:
+    url: http://192.168.10.104/reboot.cgi?&loginuse=admin&loginpas=admin
+    basic_user: admin
+    basic_pass: admin
+    method: get
+    headers:
+    expect: result="ok"
+    desc: reboot camera fundo_hall
+  
+- name: reboot_camera_palco
+  request:
+    url: http://192.168.10.109/reboot.cgi?&loginuse=admin&loginpas=admin&user=admin
+    basic_user: admin
+    basic_pass: admin
+    method: get
+    headers:
+    expect: result="ok"
+    desc: reboot camera palco
+
+- name: say_starting
+  command: |
+    echo starting recording
+
+- name: say_finished
+  command: |
+    echo finished recording
+
+# raspberry pi only!!!
+raspberry_pi:
+  led_pin: 19
