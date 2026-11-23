@@ -94,12 +94,32 @@ type Subscriber struct {
 var (
 	errUpstreamClosed = errors.New("upstream closed")
 	errLateSubscriber = errors.New("late subscriber")
+	// ErrSyncTimeout is returned when a subscriber does not receive
+	// decoder initialization data within the configured sync timeout
+	ErrSyncTimeout = errors.New("sync timeout")
 )
 
 func (s *Subscriber) Read() (*Buffer, error) {
 	select {
 	case <-s.chanClosed:
 		return nil, errUpstreamClosed
+	case buf, ok := <-s.ch:
+		if !ok {
+			return nil, errLateSubscriber
+		}
+		return buf, nil
+	}
+}
+
+// ReadTimeout reads a buffer like Read, but returns ErrSyncTimeout
+// when the timeout channel fires before a buffer arrives or the
+// upstream is closed. A nil timeout channel disables the timeout.
+func (s *Subscriber) ReadTimeout(timeout <-chan time.Time) (*Buffer, error) {
+	select {
+	case <-s.chanClosed:
+		return nil, errUpstreamClosed
+	case <-timeout:
+		return nil, ErrSyncTimeout
 	case buf, ok := <-s.ch:
 		if !ok {
 			return nil, errLateSubscriber

@@ -34,6 +34,11 @@ addresses = ["localhost:1337"]
 # Currently just implemented for H.264
 #syncClients = false
 
+# Maximum time in milliseconds a synchronized client waits for decoder
+# initialization data (PAT/PMT, SPS/PPS) before being disconnected.
+# Only applies when syncClients is enabled.
+#syncTimeout = 10000
+
 # Set packet size in Bytes for SRT socket, 1316 Bytes is generally used for MPEG-TS the maximum is 1456 Bytes
 #packetSize = 1316
 

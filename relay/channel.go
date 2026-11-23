@@ -122,7 +122,12 @@ func (ch *Channel) Sub() (*Subscriber, UnsubscribeFunc) {
 			return
 		}
 
-		ch.subs = ch.subs.Remove(sub.ch)
+		subs := ch.subs.Remove(sub.ch)
+		// Subscriber was already removed, don't count it twice
+		if len(subs) == len(ch.subs) {
+			return
+		}
+		ch.subs = subs
 		ch.clients.Store(len(ch.subs))
 		ch.activeClients.Dec()
 	}

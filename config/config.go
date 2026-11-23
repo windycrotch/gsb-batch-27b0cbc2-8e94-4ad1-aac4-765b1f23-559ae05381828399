@@ -41,6 +41,10 @@ type AppConfig struct {
 	// Whether to sync clients to GOP start
 	SyncClients bool `toml:"syncClients"`
 
+	// Maximum time in milliseconds a synced client waits for decoder
+	// initialization data before being disconnected
+	SyncTimeout uint `toml:"syncTimeout"`
+
 	// The value up to which the Reorder Tolerance may grow, 0 by default
 	LossMaxTTL uint32 `toml:"lossMaxTTL"`
 
@@ -82,9 +86,10 @@ func Parse(paths []string) (*Config, error) {
 	config := Config{
 		App: AppConfig{
 			Addresses:  []string{"localhost:1337"},
-			LatencyMs:  200,
-			Buffersize: 384000, // 1s @ 3Mbits/s
-			PacketSize: 1316,   // max is 1456
+			LatencyMs:   200,
+			Buffersize:  384000, // 1s @ 3Mbits/s
+			PacketSize:  1316,   // max is 1456
+			SyncTimeout: 10000,  // 10s
 		},
 		Auth: AuthConfig{
 			Type: "static",

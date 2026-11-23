@@ -6,6 +6,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 func TestChannel_PubSub(t *testing.T) {
@@ -103,6 +105,49 @@ func TestChannel_UnsubscribeAfterClose(t *testing.T) {
 	}
 	if ch.subs != nil {
 		t.Errorf("Expected nil subscribers slice after close, got len=%d", len(ch.subs))
+	}
+}
+
+func TestChannel_ActiveClientsMetric(t *testing.T) {
+	ch := NewChannel("metric-test", 0)
+	baseline := testutil.ToFloat64(activeClients.WithLabelValues("metric-test"))
+
+	_, unsub1 := ch.Sub()
+	_, unsub2 := ch.Sub()
+	if got := testutil.ToFloat64(activeClients.WithLabelValues("metric-test")); got != baseline+2 {
+		t.Errorf("Expected %v active clients after 2 subs, got %v", baseline+2, got)
+	}
+	if got := ch.Stats().clients; got != 2 {
+		t.Errorf("Expected 2 clients in stats, got %d", got)
+	}
+
+	unsub1()
+	if got := testutil.ToFloat64(activeClients.WithLabelValues("metric-test")); got != baseline+1 {
+		t.Errorf("Expected %v active clients after 1 unsub, got %v", baseline+1, got)
+	}
+
+	// double unsubscribe must not decrement twice
+	unsub1()
+	if got := testutil.ToFloat64(activeClients.WithLabelValues("metric-test")); got != baseline+1 {
+		t.Errorf("Expected %v active clients after duplicate unsub, got %v", baseline+1, got)
+	}
+
+	unsub2()
+	if got := testutil.ToFloat64(activeClients.WithLabelValues("metric-test")); got != baseline {
+		t.Errorf("Expected %v active clients after all unsubs, got %v", baseline, got)
+	}
+	if got := ch.Stats().clients; got != 0 {
+		t.Errorf("Expected 0 clients in stats, got %d", got)
+	}
+
+	// closing the channel removes the metric and resets stats
+	_, _ = ch.Sub()
+	ch.Close()
+	if got := ch.Stats().clients; got != 0 {
+		t.Errorf("Expected 0 clients after close, got %d", got)
+	}
+	if got := testutil.ToFloat64(activeClients.WithLabelValues("metric-test")); got != 0 {
+		t.Errorf("Expected metric to be reset after close, got %v", got)
 	}
 }
 

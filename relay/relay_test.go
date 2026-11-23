@@ -114,3 +114,82 @@ func TestRelayImpl_ChannelExists(t *testing.T) {
 		t.Fatal("Channel should exist after publishing")
 	}
 }
+
+func TestSubscriber_ReadTimeout(t *testing.T) {
+	config := RelayConfig{BufferSize: 4, PacketSize: 4}
+	relay := NewRelay(&config)
+
+	pub, err := relay.Publish("test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer close(pub)
+
+	sub, unsub, err := relay.Subscribe("test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unsub()
+
+	// timeout fires when no data arrives
+	start := time.Now()
+	_, err = sub.ReadTimeout(time.After(50 * time.Millisecond))
+	if err != ErrSyncTimeout {
+		t.Errorf("Expected ErrSyncTimeout, got %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("Timeout took too long: %v", elapsed)
+	}
+
+	// regular read still works with a generous timeout
+	buf := relay.AcquireBuffer()
+	copy(buf.Bytes(), []byte{1, 2, 3, 4})
+	buf.Resize(4)
+	pub <- buf
+	got, err := sub.ReadTimeout(time.After(time.Second))
+	if err != nil {
+		t.Fatalf("Read failed: %v", err)
+	}
+	got.Release()
+
+	// nil timeout behaves like Read
+	buf = relay.AcquireBuffer()
+	copy(buf.Bytes(), []byte{1, 2, 3, 4})
+	buf.Resize(4)
+	pub <- buf
+	got, err = sub.ReadTimeout(nil)
+	if err != nil {
+		t.Fatalf("Read with nil timeout failed: %v", err)
+	}
+	got.Release()
+}
+
+func TestSubscriber_ReadTimeoutUpstreamClose(t *testing.T) {
+	config := RelayConfig{BufferSize: 4, PacketSize: 4}
+	relay := NewRelay(&config)
+
+	pub, err := relay.Publish("test")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sub, unsub, err := relay.Subscribe("test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unsub()
+
+	// close upstream while subscriber is waiting with a long timeout
+	close(pub)
+
+	// Wait for async teardown in publisher goroutine
+	time.Sleep(100 * time.Millisecond)
+
+	start := time.Now()
+	if _, err := sub.ReadTimeout(time.After(time.Minute)); err == nil || err == ErrSyncTimeout {
+		t.Errorf("Expected upstream closed error, got %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("Upstream close was not detected promptly, took %v", elapsed)
+	}
+}

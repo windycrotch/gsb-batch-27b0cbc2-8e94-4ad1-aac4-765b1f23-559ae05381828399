@@ -35,7 +35,14 @@ type ServerConfig struct {
 	PacketSize    uint32
 	Auth          auth.Authenticator
 	SyncClients   bool
+	// SyncTimeout is the maximum time a play client waits for decoder
+	// initialization data when SyncClients is enabled
+	SyncTimeout time.Duration
 }
+
+// DefaultSyncTimeout is the default maximum time a play client waits
+// for decoder initialization data when SyncClients is enabled
+const DefaultSyncTimeout = 10 * time.Second
 
 type Server struct {
 	config    *ServerConfig
@@ -50,6 +57,9 @@ type Server struct {
 
 // NewServer creates a server
 func NewServer(config *Config) *Server {
+	if config.Server.SyncTimeout <= 0 {
+		config.Server.SyncTimeout = DefaultSyncTimeout
+	}
 	r := relay.NewRelay(&config.Relay)
 	return &Server{
 		relay:  r,
@@ -209,8 +219,29 @@ func (s *Server) play(conn *srtConn) error {
 
 	demux := format.NewDemuxer()
 	playing := !s.config.SyncClients
+
+	// Arm the sync timeout from the moment the subscription starts.
+	// Clients which do not receive decoder initialization data in time
+	// are disconnected with an observable error instead of hanging.
+	var syncTimeout <-chan time.Time
+	if !playing {
+		timer := time.NewTimer(s.config.SyncTimeout)
+		defer timer.Stop()
+		syncTimeout = timer.C
+	}
+
 	forward := func() (error, bool) {
-		buf, err := sub.Read()
+		var buf *relay.Buffer
+		var err error
+		if playing {
+			buf, err = sub.Read()
+		} else {
+			buf, err = sub.ReadTimeout(syncTimeout)
+		}
+		// Sync timed out before any initialization data arrived
+		if errors.Is(err, relay.ErrSyncTimeout) {
+			return fmt.Errorf("sync timeout after %s: %w", s.config.SyncTimeout, relay.ErrSyncTimeout), false
+		}
 		// Upstream closed, drop connection
 		if err != nil {
 			conn.log.Info("disconnecting", "error", err)
@@ -219,7 +250,6 @@ func (s *Server) play(conn *srtConn) error {
 		defer buf.Release()
 
 		// Find initial synchronization point
-		// TODO: implement timeout for sync
 		if !playing {
 			init, err := demux.FindInit(buf.Bytes())
 			if err != nil {

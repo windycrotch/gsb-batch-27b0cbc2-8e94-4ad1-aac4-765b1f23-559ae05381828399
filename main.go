@@ -84,6 +84,7 @@ func main() {
 			LatencyMs:     conf.App.LatencyMs,
 			LossMaxTTL:    conf.App.LossMaxTTL,
 			SyncClients:   conf.App.SyncClients,
+			SyncTimeout:   time.Duration(conf.App.SyncTimeout) * time.Millisecond,
 			PacketSize:    conf.App.PacketSize,
 			Auth:          auth,
 		},

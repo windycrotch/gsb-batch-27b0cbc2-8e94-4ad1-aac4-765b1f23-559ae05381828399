@@ -3,6 +3,7 @@ addresses = ["127.0.0.1:5432"]
 latency = 1337
 buffersize = 123000
 syncClients = true
+syncTimeout = 2500
 packetSize = 1456
 lossMaxTTL= 50
 publicAddress = "dontlookmeup:5432"
