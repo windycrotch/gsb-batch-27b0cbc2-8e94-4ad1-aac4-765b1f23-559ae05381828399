@@ -2,7 +2,6 @@
 package external
 
 import (
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -16,7 +15,6 @@ import (
 	"github.com/SladkyCitron/resona/afmt"
 	"github.com/SladkyCitron/resona/aio"
 	"github.com/SladkyCitron/resona/codec/wav"
-	"github.com/zeebo/xxh3"
 )
 
 var _ concat.Concatenator = (*Concatenator)(nil)
@@ -44,11 +42,23 @@ func New(name string, sampleFmt afmt.SampleFormat) *Concatenator {
 
 func (c *Concatenator) Concatenate(tail []float32, note []float32, cfg concat.ConcatenateConfig) ([]float32, error) {
 	if len(cfg.Envelope) < 4 || len(cfg.Envelope) > 5 {
-		return nil, errors.New("envelope curve must have 4 or 5 points")
+		return nil, fmt.Errorf("envelope curve must have 4 or 5 points, got %d", len(cfg.Envelope))
 	}
 
-	tailWav, noteWav, err := c.createTempWav(tail, note, cfg)
+	// A private temporary directory per invocation keeps concurrent renders
+	// from overwriting each other's tail/note/output files, and lets every exit
+	// path clean up reliably: nothing in it is needed once the samples have been
+	// decoded into memory.
+	dir, err := os.MkdirTemp("", "gotau-externalconcat-*")
 	if err != nil {
+		return nil, fmt.Errorf("external: failed to create temporary directory: %w", err)
+	}
+	defer func() { _ = os.RemoveAll(dir) }()
+
+	tailWav := filepath.Join(dir, "tail.wav")
+	noteWav := filepath.Join(dir, "note.wav")
+
+	if err := c.createTempWav(tailWav, noteWav, tail, note, cfg); err != nil {
 		return nil, fmt.Errorf("external: failed to create temporary wav files: %w", err)
 	}
 
@@ -92,90 +102,61 @@ func (c *Concatenator) Concatenate(tail []float32, note []float32, cfg concat.Co
 		return nil, fmt.Errorf("external: failed to run wavtool command: %w", err)
 	}
 
-	if err := os.Remove(noteWav); err != nil {
-		return nil, fmt.Errorf("external: failed to remove temporary note wav file: %w", err)
-	}
-
-	if _, err := os.Stat(tailWav); err == nil || !errors.Is(err, os.ErrNotExist) {
-		// wav path
-		f, err := os.Open(tailWav)
-		if err != nil {
-			return nil, fmt.Errorf("external: failed to open temporary output wav: %w", err)
-		}
-		deco, err := wav.NewDecoder(f)
+	// The wavtool may write a single wav file or a .whd + .dat pair; the
+	// temporary directory is discarded afterwards either way.
+	//
+	// A stat error other than "does not exist" (e.g. permission denied) is not
+	// treated as "no wav output", so that it surfaces as a decode error instead
+	// of silently switching to the whd/dat path.
+	if _, statErr := os.Stat(tailWav); statErr == nil || !errors.Is(statErr, os.ErrNotExist) {
+		out, err := c.decodeWavFile(tailWav)
 		if err != nil {
 			return nil, fmt.Errorf("external: failed to decode temporary output wav: %w", err)
 		}
-		out, err := aio.ReadAll(deco)
-		if err != nil {
-			return nil, fmt.Errorf("external: failed to read temporary output wav: %w", err)
-		}
-		if err := f.Close(); err != nil {
-			return nil, fmt.Errorf("external: failed to close temporary output wav: %w", err)
-		}
-		if err := os.Remove(f.Name()); err != nil {
-			return nil, fmt.Errorf("external: failed to remove temporary output wav: %w", err)
-		}
-		return out, nil
-	} else {
-		// whd + dat path
-		whdPath := tailWav[:len(tailWav)-len(filepath.Ext(tailWav))] + ".whd"
-		datPath := tailWav[:len(tailWav)-len(filepath.Ext(tailWav))] + ".dat"
-
-		whdFile, err := os.Open(whdPath)
-		if err != nil {
-			return nil, fmt.Errorf("external: failed to open temporary whd: %w", err)
-		}
-		datFile, err := os.Open(datPath)
-		if err != nil {
-			return nil, fmt.Errorf("external: failed to open temporary dat: %w", err)
-		}
-		r := io.MultiReader(whdFile, datFile)
-		deco, err := wav.NewDecoder(r)
-		if err != nil {
-			return nil, fmt.Errorf("external: failed to decode output wav: %w", err)
-		}
-		out, err := aio.ReadAll(deco)
-		if err != nil {
-			return nil, fmt.Errorf("external: failed to read output wav: %w", err)
-		}
-		if err := whdFile.Close(); err != nil {
-			return nil, fmt.Errorf("external: failed to close temporary whd: %w", err)
-		}
-		if err := datFile.Close(); err != nil {
-			return nil, fmt.Errorf("external: failed to close temporary dat: %w", err)
-		}
-		if err := os.Remove(whdFile.Name()); err != nil {
-			return nil, fmt.Errorf("external: failed to remove temporary whd: %w", err)
-		}
-		if err := os.Remove(datFile.Name()); err != nil {
-			return nil, fmt.Errorf("external: failed to remove temporary dat: %w", err)
-		}
 		return out, nil
 	}
+
+	whdPath := tailWav[:len(tailWav)-len(filepath.Ext(tailWav))] + ".whd"
+	datPath := tailWav[:len(tailWav)-len(filepath.Ext(tailWav))] + ".dat"
+
+	whdFile, err := os.Open(whdPath)
+	if err != nil {
+		return nil, fmt.Errorf("external: failed to open temporary whd: %w", err)
+	}
+	defer whdFile.Close()
+
+	datFile, err := os.Open(datPath)
+	if err != nil {
+		return nil, fmt.Errorf("external: failed to open temporary dat: %w", err)
+	}
+	defer datFile.Close()
+
+	deco, err := wav.NewDecoder(io.MultiReader(whdFile, datFile))
+	if err != nil {
+		return nil, fmt.Errorf("external: failed to decode output wav: %w", err)
+	}
+	out, err := aio.ReadAll(deco)
+	if err != nil {
+		return nil, fmt.Errorf("external: failed to read output wav: %w", err)
+	}
+	return out, nil
 }
 
-func (c *Concatenator) createTempWav(tail []float32, note []float32, cfg concat.ConcatenateConfig) (string, string, error) {
-	// create filename
-	h := xxh3.New()
-	_, _ = h.WriteString(c.cmdName)
-	_ = binary.Write(h, binary.LittleEndian, tail)
-	_ = binary.Write(h, binary.LittleEndian, note)
-	_ = binary.Write(h, binary.LittleEndian, cfg.Offset)
-	_ = binary.Write(h, binary.LittleEndian, int64(cfg.Duration))
-	_ = binary.Write(h, binary.LittleEndian, cfg.Tempo)
-	_ = binary.Write(h, binary.LittleEndian, int64(cfg.Resolution))
-	_ = binary.Write(h, binary.LittleEndian, cfg.LengthDelta)
-	_ = binary.Write(h, binary.LittleEndian, cfg.Overlap)
-	_ = binary.Write(h, binary.LittleEndian, uint64(len(cfg.Envelope)))
-	for i := range cfg.Envelope {
-		_ = binary.Write(h, binary.LittleEndian, cfg.Envelope[i].X)
-		_ = binary.Write(h, binary.LittleEndian, cfg.Envelope[i].Y)
+func (c *Concatenator) decodeWavFile(path string) ([]float32, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
 	}
-	sum := h.Sum64()
-	tailPath := filepath.Join(os.TempDir(), fmt.Sprintf("gotau-externalconcat-tail-%016x.wav", sum))
-	notePath := filepath.Join(os.TempDir(), fmt.Sprintf("gotau-externalconcat-note-%016x.wav", sum))
+	defer f.Close()
 
+	deco, err := wav.NewDecoder(f)
+	if err != nil {
+		return nil, err
+	}
+	return aio.ReadAll(deco)
+}
+
+func (c *Concatenator) createTempWav(tailPath, notePath string, tail []float32, note []float32, cfg concat.ConcatenateConfig) error {
 	var wavFormat uint16
 	switch c.sampleFmt.Encoding {
 	case afmt.SampleEncodingInt, afmt.SampleEncodingUint:
@@ -183,40 +164,32 @@ func (c *Concatenator) createTempWav(tail []float32, note []float32, cfg concat.
 	case afmt.SampleEncodingFloat:
 		wavFormat = wav.FormatFloat
 	default:
-		return "", "", fmt.Errorf("invalid sample format: %s", c.sampleFmt.String())
+		return fmt.Errorf("invalid sample format: %s", c.sampleFmt.String())
 	}
 
-	tailFile, err := os.Create(tailPath)
-	if err != nil {
-		return "", "", err
+	if err := writeWav(tailPath, tail, cfg.AudioFormat, c.sampleFmt, wavFormat); err != nil {
+		return err
 	}
-	defer tailFile.Close()
-	tailEnc, err := wav.NewEncoder(tailFile, cfg.AudioFormat, c.sampleFmt, wavFormat)
-	if err != nil {
-		return "", "", err
-	}
-	if _, err := tailEnc.WriteSamples(tail); err != nil {
-		return "", "", err
-	}
-	if err := tailEnc.Close(); err != nil {
-		return "", "", err
-	}
+	return writeWav(notePath, note, cfg.AudioFormat, c.sampleFmt, wavFormat)
+}
 
-	noteFile, err := os.Create(notePath)
+func writeWav(path string, samples []float32, format afmt.Format, sampleFmt afmt.SampleFormat, wavFormat uint16) (err error) {
+	f, err := os.Create(path)
 	if err != nil {
-		return "", "", err
+		return err
 	}
-	defer noteFile.Close()
-	noteEnc, err := wav.NewEncoder(noteFile, cfg.AudioFormat, c.sampleFmt, wavFormat)
-	if err != nil {
-		return "", "", err
-	}
-	if _, err := noteEnc.WriteSamples(note); err != nil {
-		return "", "", err
-	}
-	if err := noteEnc.Close(); err != nil {
-		return "", "", err
-	}
+	defer func() {
+		if closeErr := f.Close(); closeErr != nil && err == nil {
+			err = closeErr
+		}
+	}()
 
-	return tailPath, notePath, nil
+	enc, err := wav.NewEncoder(f, format, sampleFmt, wavFormat)
+	if err != nil {
+		return err
+	}
+	if _, err := enc.WriteSamples(samples); err != nil {
+		return err
+	}
+	return enc.Close()
 }

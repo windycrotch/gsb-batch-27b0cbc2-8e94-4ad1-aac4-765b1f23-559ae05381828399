@@ -3,6 +3,7 @@ package gotau
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -32,16 +33,17 @@ import (
 
 // Synth is the main singing voice synthsizer that renders notes into audio samples.
 type Synth struct {
-	vb        *voicebank.Voicebank
-	ph        phonemizer.Phonemizer
-	res       resampler.Resampler
-	cat       concat.Concatenator
-	resCache  cache.Cache
-	sched     *scheduler
-	sr        int
-	renderBuf []float32
-	readPos   int
-	prevNote  *sequence.Note
+	vb          *voicebank.Voicebank
+	ph          phonemizer.Phonemizer
+	res         resampler.Resampler
+	cat         concat.Concatenator
+	resCache    cache.Cache
+	sched       *scheduler
+	sr          int
+	renderBuf   []float32
+	readPos     int
+	prevNote    *sequence.Note
+	cacheErrHan func(error)
 }
 
 // New creates a new [Synth] with the given sample rate, voicebank, resampler, and concatenator.
@@ -74,6 +76,28 @@ func (s *Synth) SetPhonemizer(ph phonemizer.Phonemizer) {
 // SetResamplerCache sets the cache for storing resampled notes.
 func (s *Synth) SetResamplerCache(c cache.Cache) {
 	s.resCache = c
+}
+
+// SetCacheErrorHandler sets a callback that is invoked whenever the resampler
+// cache cannot be read or written.
+//
+// Cache failures are never fatal: the synthesizer always falls back to
+// rendering the note and returns its audio. The handler exists so that callers
+// can surface and diagnose cache problems (e.g. an unwritable cache directory)
+// without losing the rendered result. If no handler is set, errors are logged.
+func (s *Synth) SetCacheErrorHandler(fn func(error)) {
+	s.cacheErrHan = fn
+}
+
+func (s *Synth) reportCacheError(err error) {
+	if err == nil {
+		return
+	}
+	if s.cacheErrHan != nil {
+		s.cacheErrHan(err)
+		return
+	}
+	log.Printf("gotau Synth: resampler cache: %v", err)
 }
 
 // SetResolution sets the timing resolution in ticks per quarter note (TPQN).
@@ -304,11 +328,10 @@ func (s *Synth) renderSingleNote(note sequence.Note, otoEntry otoini.Entry, next
 	var doCache bool
 	key := s.getKeyFunc(resampleCfg, otoEntry.FilePath(), fileinfo)
 	ctx := context.Background()
-	if rc, err := s.resCache.Open(ctx, key); err == nil {
-		resampled, err = wav.NewDecoder(rc)
-		if err != nil {
-			return err
-		}
+
+	noteBuf, cached := s.loadCachedNote(ctx, key, resampleCfg)
+	if cached {
+		s.debugLog("cache hit", note)
 	} else {
 		f, err := s.vb.FS().Open(otoEntry.FilePath())
 		if err != nil {
@@ -332,11 +355,13 @@ func (s *Synth) renderSingleNote(note sequence.Note, otoEntry otoini.Entry, next
 			analysisFile, err := s.vb.FS().Open(analysisPath)
 			if err == nil {
 				resampled, err = analyzer.ResampleWithAnalysis(deco, analysisFile, resampleCfg)
+				// The sidecar must be released even if resampling failed.
+				closeErr := analysisFile.Close()
 				if err != nil {
 					return fmt.Errorf("failed to resample: %w", err)
 				}
-				if err := analysisFile.Close(); err != nil {
-					return fmt.Errorf("failed to close analysis sidecar file: %w", err)
+				if closeErr != nil {
+					return fmt.Errorf("failed to close analysis sidecar file: %w", closeErr)
 				}
 			} else {
 				// nope
@@ -352,60 +377,29 @@ func (s *Synth) renderSingleNote(note sequence.Note, otoEntry otoini.Entry, next
 			}
 		}
 
-		doCache = true
-	}
+		noteBuf, err = aio.ReadAll(resampled)
+		if closer, ok := resampled.(io.Closer); ok {
+			// Resampler output may own temporary files (e.g. external resamplers);
+			// release them even when reading failed.
+			if closeErr := closer.Close(); closeErr != nil && err == nil {
+				err = closeErr
+			}
+		}
+		if err != nil {
+			return fmt.Errorf("failed to read resampled audio: %w", err)
+		}
 
-	noteBuf, err := aio.ReadAll(resampled)
-	if err != nil {
-		return fmt.Errorf("failed to read resampled audio: %w", err)
+		doCache = true
 	}
 
 	var doCacheDone chan error
 	if doCache {
+		// Copy the samples: the caching goroutine runs concurrently with
+		// concatenation below, which also reads noteBuf.
+		cacheBuf := slices.Clone(noteBuf)
 		doCacheDone = make(chan error, 1)
-		// cache the resampled audio
 		go func() {
-			var cacheErr error
-			defer func() {
-				doCacheDone <- cacheErr
-			}()
-
-			f, err := s.resCache.Create(ctx, key)
-			if err != nil {
-				_ = f.Abort()
-				cacheErr = fmt.Errorf("failed to create cache entry: %w", err)
-				return
-			}
-
-			enc, err := wav.NewEncoder(
-				f,
-				resampleCfg.AudioFormat,
-				afmt.SampleFormat{BitDepth: 32, Encoding: afmt.SampleEncodingFloat, Endian: binary.LittleEndian},
-				wav.FormatFloat,
-			)
-			if err != nil {
-				_ = f.Abort()
-				cacheErr = fmt.Errorf("failed to create wav encoder for caching: %w", err)
-				return
-			}
-
-			if _, err := enc.WriteSamples(noteBuf); err != nil {
-				_ = f.Abort()
-				cacheErr = fmt.Errorf("failed to cache resampled audio: %w", err)
-				return
-			}
-
-			if err := enc.Close(); err != nil {
-				_ = f.Abort()
-				cacheErr = fmt.Errorf("failed to close wav encoder for caching: %w", err)
-				return
-			}
-
-			if err := f.Close(); err != nil {
-				_ = f.Abort()
-				cacheErr = fmt.Errorf("failed to close cache entry: %w", err)
-				return
-			}
+			doCacheDone <- s.storeCachedNote(ctx, key, resampleCfg, cacheBuf)
 		}()
 	}
 
@@ -422,16 +416,121 @@ func (s *Synth) renderSingleNote(note sequence.Note, otoEntry otoini.Entry, next
 	}
 	s.renderBuf, err = s.cat.Concatenate(s.renderBuf, noteBuf, concatCfg)
 	if err != nil {
+		if doCache {
+			// Don't leave a background writer running after a failure.
+			s.reportCacheError(<-doCacheDone)
+		}
 		return fmt.Errorf("failed to concatenate: %w", err)
 	}
 
-	// wait for caching to finish and check error
+	// Caching is best-effort: a cache failure must never discard or fail
+	// audio that has already been rendered.
 	if doCache {
-		if err := <-doCacheDone; err != nil {
-			// log error instead???
-			// it's non-critical (kinda) since it only affects caching
-			return err
+		s.reportCacheError(<-doCacheDone)
+	}
+
+	return nil
+}
+
+// loadCachedNote tries to read a previously resampled note from the cache.
+//
+// It returns the decoded samples and true on a cache hit. Any problem with the
+// cached entry (an unreadable entry, a corrupt payload, or a payload whose
+// audio format does not match the requested one) is reported and the entry is
+// invalidated so that later renders do not keep reusing it. A miss or a failure
+// returns ok == false, which makes the caller fall back to resampling.
+func (s *Synth) loadCachedNote(ctx context.Context, key cache.KeyFunc, cfg resampler.ResampleConfig) (samples []float32, ok bool) {
+	rc, err := s.resCache.Open(ctx, key)
+	if err != nil {
+		if !errors.Is(err, cache.ErrNotFound) {
+			s.reportCacheError(fmt.Errorf("failed to open cache entry: %w", err))
 		}
+		return nil, false
+	}
+
+	deco, err := wav.NewDecoder(rc)
+	if err != nil {
+		_ = rc.Close()
+		s.reportCacheError(fmt.Errorf("failed to decode cached audio: %w", err))
+		s.invalidateCachedNote(ctx, key)
+		return nil, false
+	}
+
+	samples, err = aio.ReadAll(deco)
+	// The decoder may not own the reader; close it separately.
+	closeErr := rc.Close()
+	if err != nil {
+		s.reportCacheError(fmt.Errorf("failed to read cached audio: %w", err))
+		s.invalidateCachedNote(ctx, key)
+		return nil, false
+	}
+	if closeErr != nil {
+		s.reportCacheError(fmt.Errorf("failed to close cache entry: %w", closeErr))
+	}
+
+	if got := deco.Format(); got != cfg.AudioFormat {
+		s.reportCacheError(fmt.Errorf("cached audio format %v does not match requested format %v", got, cfg.AudioFormat))
+		s.invalidateCachedNote(ctx, key)
+		return nil, false
+	}
+
+	return samples, true
+}
+
+// invalidateCachedNote removes a bad cache entry on a best-effort basis.
+func (s *Synth) invalidateCachedNote(ctx context.Context, key cache.KeyFunc) {
+	deleter, ok := s.resCache.(cache.Deleter)
+	if !ok {
+		return
+	}
+	if err := deleter.Delete(ctx, key); err != nil {
+		s.reportCacheError(fmt.Errorf("failed to delete bad cache entry: %w", err))
+	}
+}
+
+// storeCachedNote writes the resampled audio to the cache. It never affects
+// synthesis; the returned error is meant for diagnostics only.
+//
+// It never reports anything itself: errors are returned so that the caller,
+// which waits for the result, reports them from the synthesis goroutine. That
+// keeps [Synth.SetCacheErrorHandler] callbacks from firing on the cache writer
+// goroutine.
+func (s *Synth) storeCachedNote(ctx context.Context, key cache.KeyFunc, cfg resampler.ResampleConfig, samples []float32) (err error) {
+	f, err := s.resCache.Create(ctx, key)
+	if err != nil {
+		// Create may fail before returning a writer; there is nothing to abort.
+		return fmt.Errorf("failed to create cache entry: %w", err)
+	}
+	// Abort on every error path so that no partial entry or temporary file is
+	// left behind, and so that the entry never becomes visible to Open.
+	defer func() {
+		if err != nil {
+			if abortErr := f.Abort(); abortErr != nil {
+				err = fmt.Errorf("%w (also failed to abort cache entry: %v)", err, abortErr)
+			}
+		}
+	}()
+
+	enc, err := wav.NewEncoder(
+		f,
+		cfg.AudioFormat,
+		afmt.SampleFormat{BitDepth: 32, Encoding: afmt.SampleEncodingFloat, Endian: binary.LittleEndian},
+		wav.FormatFloat,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create wav encoder for caching: %w", err)
+	}
+
+	if _, err := enc.WriteSamples(samples); err != nil {
+		return fmt.Errorf("failed to cache resampled audio: %w", err)
+	}
+
+	if err := enc.Close(); err != nil {
+		return fmt.Errorf("failed to close wav encoder for caching: %w", err)
+	}
+
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("failed to close cache entry: %w", err)
 	}
 
 	return nil

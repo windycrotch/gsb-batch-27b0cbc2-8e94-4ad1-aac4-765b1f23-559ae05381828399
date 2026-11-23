@@ -18,14 +18,25 @@ func (c *NopCache) Create(_ context.Context, _ KeyFunc) (BlobWriter, error) {
 	return &nopBlobWriter{}, nil
 }
 
-type nopBlobWriter struct{}
-
-func (c *nopBlobWriter) Write(_ []byte) (int, error) {
-	return 0, nil
+type nopBlobWriter struct {
+	pos int64
 }
 
-func (c *nopBlobWriter) Seek(_ int64, _ int) (int64, error) {
-	return 0, nil
+func (c *nopBlobWriter) Write(p []byte) (int, error) {
+	c.pos += int64(len(p))
+	return len(p), nil
+}
+
+func (c *nopBlobWriter) Seek(offset int64, whence int) (int64, error) {
+	switch whence {
+	case io.SeekStart:
+		c.pos = offset
+	case io.SeekCurrent:
+		c.pos += offset
+	case io.SeekEnd:
+		c.pos += offset
+	}
+	return c.pos, nil
 }
 
 func (c *nopBlobWriter) Close() error {

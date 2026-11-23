@@ -96,6 +96,21 @@ func (c *Cache) Create(ctx context.Context, key cache.KeyFunc) (cache.BlobWriter
 	}
 }
 
+func (c *Cache) Delete(ctx context.Context, key cache.KeyFunc) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+
+	path := c.pathForHash(c.hash(key))
+
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("diskcache: failed to remove cached file: %w", err)
+	}
+	return nil
+}
+
 // Dir returns the default directory for the disk cache based on the user's cache directory and the subdirectory.
 func Dir(name string) (string, error) {
 	cacheDir, err := os.UserCacheDir()

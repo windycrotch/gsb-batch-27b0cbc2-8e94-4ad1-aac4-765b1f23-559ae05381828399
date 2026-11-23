@@ -3,7 +3,6 @@ package external
 
 import (
 	"bytes"
-	"encoding/binary"
 	"fmt"
 	"io"
 	"os"
@@ -17,7 +16,6 @@ import (
 	"github.com/SladkyCitron/resona/afmt"
 	"github.com/SladkyCitron/resona/aio"
 	"github.com/SladkyCitron/resona/codec/wav"
-	"github.com/zeebo/xxh3"
 )
 
 var _ resampler.Analyzer = (*Resampler)(nil)
@@ -47,56 +45,47 @@ func (r *Resampler) ID() string {
 }
 
 func (r *Resampler) Resample(in aio.SampleReader, cfg resampler.ResampleConfig) (aio.SampleReader, error) {
-	input, err := r.createTempWav(in, cfg)
-	if err != nil {
-		return nil, fmt.Errorf("external: failed to create temporary wav file: %w", err)
-	}
-
-	output := input[:len(input)-len(filepath.Ext(input))] + "-out.wav"
-
-	if err := r.runCmd(input, output, cfg); err != nil {
-		return nil, err
-	}
-
-	if err := os.Remove(input); err != nil {
-		return nil, fmt.Errorf("external: failed to remove temporary wav file: %w", err)
-	}
-
-	out, err := r.decodeOutFile(output)
-	if err != nil {
-		return nil, fmt.Errorf("external: failed to decode output wav file: %w", err)
-	}
-
-	return out, nil
+	return r.resample(in, nil, cfg)
 }
 
 func (r *Resampler) ResampleWithAnalysis(in aio.SampleReader, analysis io.Reader, cfg resampler.ResampleConfig) (aio.SampleReader, error) {
 	if analysis == nil {
 		return r.Resample(in, cfg)
 	}
+	return r.resample(in, analysis, cfg)
+}
 
-	input, err := r.createTempWav(in, cfg)
+// resample runs the external resampler using a private temporary directory.
+//
+// A dedicated directory per invocation keeps concurrent resampler runs (for the
+// same note or not) from overwriting each other's temporary WAV and analysis
+// files. The directory is removed on every path out of this function, so a
+// failed command or a failed read never leaves temporary or output files
+// behind. The returned reader decodes from memory, so no files outlive it.
+func (r *Resampler) resample(in aio.SampleReader, analysis io.Reader, cfg resampler.ResampleConfig) (aio.SampleReader, error) {
+	dir, err := os.MkdirTemp("", "gotau-externalresampler-*")
 	if err != nil {
+		return nil, fmt.Errorf("external: failed to create temporary directory: %w", err)
+	}
+	// Whether we succeed or fail, nothing in the directory is needed after this
+	// function returns; the decoded samples live in memory.
+	defer func() { _ = os.RemoveAll(dir) }()
+
+	input := filepath.Join(dir, "in.wav")
+	output := filepath.Join(dir, "out.wav")
+
+	if err := r.createTempWav(input, in, cfg.AudioFormat); err != nil {
 		return nil, fmt.Errorf("external: failed to create temporary wav file: %w", err)
 	}
 
-	analysisPath, err := r.createTempAnalysis(analysis, input)
-	if err != nil {
-		return nil, fmt.Errorf("external: failed to create temporary analysis sidecar file: %w", err)
+	if analysis != nil {
+		if err := r.createTempAnalysis(analysis, input); err != nil {
+			return nil, fmt.Errorf("external: failed to create temporary analysis sidecar file: %w", err)
+		}
 	}
-
-	output := input[:len(input)-len(filepath.Ext(input))] + "-out.wav"
 
 	if err := r.runCmd(input, output, cfg); err != nil {
 		return nil, err
-	}
-
-	if err := os.Remove(input); err != nil {
-		return nil, fmt.Errorf("external: failed to remove temporary wav file: %w", err)
-	}
-
-	if err := os.Remove(analysisPath); err != nil {
-		return nil, fmt.Errorf("external: failed to remove temporary wav file: %w", err)
 	}
 
 	out, err := r.decodeOutFile(output)
@@ -108,62 +97,42 @@ func (r *Resampler) ResampleWithAnalysis(in aio.SampleReader, analysis io.Reader
 }
 
 func (r *Resampler) Analyze(in aio.SampleReader, format afmt.Format) (io.ReadCloser, error) {
-	input, err := os.CreateTemp("", "gotau-externalresampler-analysis-*.wav")
+	dir, err := os.MkdirTemp("", "gotau-externalresampler-analysis-*")
 	if err != nil {
+		return nil, fmt.Errorf("external: failed to create temporary directory: %w", err)
+	}
+
+	input := filepath.Join(dir, "in.wav")
+	output := filepath.Join(dir, "out.wav")
+
+	// The analysis file itself must outlive this call; the caller owns it and
+	// removes it on Close. Everything else is cleaned up here.
+	keep := false
+	defer func() {
+		if !keep {
+			_ = os.RemoveAll(dir)
+		}
+	}()
+
+	if err := r.createTempWav(input, in, format); err != nil {
+		return nil, fmt.Errorf("external: failed to create temporary wav file: %w", err)
+	}
+
+	if err := r.runAnalyzeCmd(input, output); err != nil {
 		return nil, err
-	}
-	defer func() { _ = os.Remove(input.Name()) }() // clean up
-
-	var wavFormat uint16
-	switch r.sampleFmt.Encoding {
-	case afmt.SampleEncodingInt, afmt.SampleEncodingUint:
-		wavFormat = wav.FormatInt
-	case afmt.SampleEncodingFloat:
-		wavFormat = wav.FormatFloat
-	default:
-		_ = input.Close()
-		return nil, fmt.Errorf("invalid sample format: %s", r.sampleFmt.String())
-	}
-	enc, err := wav.NewEncoder(input, format, r.sampleFmt, wavFormat)
-	if err != nil {
-		_ = input.Close()
-		return nil, err
-	}
-
-	if _, err := aio.Copy(enc, in); err != nil {
-		_ = input.Close()
-		return nil, err
-	}
-
-	if err := enc.Close(); err != nil {
-		_ = input.Close()
-		return nil, err
-	}
-
-	if err := input.Close(); err != nil {
-		return nil, err
-	}
-
-	dummyOutput := input.Name()[:len(input.Name())-len(filepath.Ext(input.Name()))] + "-out.wav"
-
-	cmd := exec.Command(r.cmdName, input.Name(), dummyOutput, "0", "0", "GN")
-	if r.ConfigureCmd != nil {
-		r.ConfigureCmd(cmd)
-	}
-	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("external: failed to run resampler command: %w", err)
-	}
-
-	if err := os.Remove(dummyOutput); err != nil {
-		return nil, fmt.Errorf("external: failed to remove dummy output file: %w", err)
 	}
 
 	// most resamplers accept e.g. something_wav.frq
-	ext := filepath.Ext(input.Name())
-	extless := input.Name()[:len(input.Name())-len(ext)]
-	analysisPath := extless + strings.ReplaceAll(ext, ".", "_") + r.analysisExt
+	analysisPath := analysisSidecarPath(input, r.analysisExt)
+	rc, err := openTemp(analysisPath)
+	if err != nil {
+		return nil, fmt.Errorf("external: failed to open analysis sidecar file: %w", err)
+	}
 
-	return openTemp(analysisPath)
+	// Remove the analysis file along with the rest of the directory when the
+	// caller closes the returned reader.
+	keep = true
+	return &dirCleanupReadCloser{ReadCloser: rc, dir: dir}, nil
 }
 
 func (r *Resampler) AnalysisExt() string {
@@ -202,30 +171,35 @@ func (r *Resampler) runCmd(input, output string, cfg resampler.ResampleConfig) e
 	return nil
 }
 
-func (r *Resampler) createTempWav(in aio.SampleReader, cfg resampler.ResampleConfig) (string, error) {
-	// create filename
-	h := xxh3.New()
-	_, _ = h.WriteString(r.cmdName)
-	_, _ = h.Write([]byte{byte(cfg.Pitch)})
-	_ = binary.Write(h, binary.LittleEndian, cfg.Velocity)
-	flags, _ := cfg.Flags.MarshalBinary()
-	_, _ = h.Write(flags)
-	_ = binary.Write(h, binary.LittleEndian, cfg.Offset)
-	_ = binary.Write(h, binary.LittleEndian, cfg.Length)
-	_ = binary.Write(h, binary.LittleEndian, cfg.Consonant)
-	_ = binary.Write(h, binary.LittleEndian, cfg.Cutoff)
-	_ = binary.Write(h, binary.LittleEndian, cfg.Intensity)
-	_ = binary.Write(h, binary.LittleEndian, cfg.Modulation)
-	_ = binary.Write(h, binary.LittleEndian, cfg.Tempo)
-	_ = binary.Write(h, binary.LittleEndian, uint64(len(cfg.PitchBend)))
-	_ = binary.Write(h, binary.LittleEndian, cfg.PitchBend)
-	path := filepath.Join(os.TempDir(), fmt.Sprintf("gotau-externalresampler-%016x.wav", h.Sum64()))
+func (r *Resampler) runAnalyzeCmd(input, output string) error {
+	cmd := exec.Command(r.cmdName, input, output, "0", "0", "GN")
+	if r.ConfigureCmd != nil {
+		r.ConfigureCmd(cmd)
+	}
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("external: failed to run resampler command: %w", err)
+	}
+	return nil
+}
 
+// analysisSidecarPath returns the UTAU-style analysis sidecar path for the given
+// wav path, e.g. "song.wav" -> "song_wav.frq".
+func analysisSidecarPath(wavPath, analysisExt string) string {
+	ext := filepath.Ext(wavPath)
+	extless := wavPath[:len(wavPath)-len(ext)]
+	return extless + strings.ReplaceAll(ext, ".", "_") + analysisExt
+}
+
+func (r *Resampler) createTempWav(path string, in aio.SampleReader, format afmt.Format) (err error) {
 	f, err := os.Create(path)
 	if err != nil {
-		return "", err
+		return err
 	}
-	defer f.Close()
+	defer func() {
+		if closeErr := f.Close(); closeErr != nil && err == nil {
+			err = closeErr
+		}
+	}()
 
 	var wavFormat uint16
 	switch r.sampleFmt.Encoding {
@@ -234,41 +208,36 @@ func (r *Resampler) createTempWav(in aio.SampleReader, cfg resampler.ResampleCon
 	case afmt.SampleEncodingFloat:
 		wavFormat = wav.FormatFloat
 	default:
-		return "", fmt.Errorf("invalid sample format: %s", r.sampleFmt.String())
+		return fmt.Errorf("invalid sample format: %s", r.sampleFmt.String())
 	}
-	enc, err := wav.NewEncoder(f, cfg.AudioFormat, r.sampleFmt, wavFormat)
+	enc, err := wav.NewEncoder(f, format, r.sampleFmt, wavFormat)
 	if err != nil {
-		return "", err
+		return err
 	}
 
 	if _, err := aio.Copy(enc, in); err != nil {
-		return "", err
+		return err
 	}
 
-	if err := enc.Close(); err != nil {
-		return "", err
-	}
-
-	return path, nil
+	return enc.Close()
 }
 
-func (r *Resampler) createTempAnalysis(analysis io.Reader, wavPath string) (string, error) {
-	// most resamplers accept e.g. something_wav.frq
-	ext := filepath.Ext(wavPath)
-	extless := wavPath[:len(wavPath)-len(ext)]
-	newPath := extless + strings.ReplaceAll(ext, ".", "_") + r.analysisExt
-
-	f, err := os.Create(newPath)
+func (r *Resampler) createTempAnalysis(analysis io.Reader, wavPath string) (err error) {
+	f, err := os.Create(analysisSidecarPath(wavPath, r.analysisExt))
 	if err != nil {
-		return "", err
+		return err
 	}
-	defer f.Close()
+	defer func() {
+		if closeErr := f.Close(); closeErr != nil && err == nil {
+			err = closeErr
+		}
+	}()
 
 	if _, err := io.Copy(f, analysis); err != nil {
-		return "", err
+		return err
 	}
 
-	return newPath, nil
+	return nil
 }
 
 func (r *Resampler) decodeOutFile(path string) (aio.SampleReader, error) {
@@ -282,9 +251,20 @@ func (r *Resampler) decodeOutFile(path string) (aio.SampleReader, error) {
 		return nil, err
 	}
 
-	if err := os.Remove(path); err != nil {
-		return nil, err
-	}
-
 	return deco, nil
+}
+
+// dirCleanupReadCloser removes a temporary directory when the wrapped reader is
+// closed.
+type dirCleanupReadCloser struct {
+	io.ReadCloser
+	dir string
+}
+
+func (c *dirCleanupReadCloser) Close() error {
+	err := c.ReadCloser.Close()
+	if rmErr := os.RemoveAll(c.dir); rmErr != nil && err == nil {
+		err = rmErr
+	}
+	return err
 }

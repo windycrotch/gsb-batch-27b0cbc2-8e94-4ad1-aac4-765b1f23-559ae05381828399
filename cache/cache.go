@@ -24,6 +24,10 @@ type Cache interface {
 }
 
 // BlobWriter is an interface for writing data to the cache. It is returned by [Cache.Create] and should be closed when done.
+//
+// Data written to a [BlobWriter] must only become visible to [Cache.Open] after a
+// successful [BlobWriter.Close]. Implementations must not expose partially
+// written entries, and [BlobWriter.Abort] must discard any temporary data.
 type BlobWriter interface {
 	io.Writer
 	io.Seeker
@@ -31,4 +35,15 @@ type BlobWriter interface {
 
 	// Abort aborts the write operation and discards any temporary data.
 	Abort() error
+}
+
+// Deleter is an optional interface for caches that are able to remove entries.
+//
+// The synthesizer uses it on a best-effort basis to discard entries that cannot
+// be decoded or that do not match the expected audio format, so that subsequent
+// renders do not keep reusing a bad entry. Caches that do not implement it are
+// still fully functional; bad entries are simply re-rendered each time.
+type Deleter interface {
+	// Delete removes the entry for the given key. Removing a missing entry must not be an error.
+	Delete(ctx context.Context, key KeyFunc) error
 }

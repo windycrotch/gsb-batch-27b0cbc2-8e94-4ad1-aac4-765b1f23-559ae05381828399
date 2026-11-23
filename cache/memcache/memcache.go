@@ -50,6 +50,21 @@ func (c *Cache) Open(ctx context.Context, key cache.KeyFunc) (io.ReadCloser, err
 	return io.NopCloser(bytes.NewReader(newBlob)), nil
 }
 
+func (c *Cache) Delete(ctx context.Context, key cache.KeyFunc) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+
+	hash := c.hash(key)
+
+	c.mu.Lock()
+	delete(c.blobs, hash)
+	c.mu.Unlock()
+	return nil
+}
+
 func (c *Cache) Create(ctx context.Context, key cache.KeyFunc) (cache.BlobWriter, error) {
 	select {
 	case <-ctx.Done():

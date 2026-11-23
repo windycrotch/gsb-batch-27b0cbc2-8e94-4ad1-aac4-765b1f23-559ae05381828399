@@ -32,10 +32,14 @@ func Create(path string, mode os.FileMode) (*File, error) {
 }
 
 // Close commits the file by atomic renaming the temporary file to the actual path.
+//
+// After Close returns, regardless of the outcome, the temporary file has either
+// been renamed into place or removed; a later [File.Abort] is a no-op.
 func (f *File) Close() error {
 	if f.done {
 		return nil
 	}
+	f.done = true
 	if err := f.Sync(); err != nil {
 		_ = f.File.Close()
 		_ = os.Remove(f.Name())
@@ -45,7 +49,7 @@ func (f *File) Close() error {
 		_ = os.Remove(f.Name())
 		return err
 	}
-	if err := atomicRename(f.Name(), f.path); err != nil {
+	if err := atomicRenameRetry(f.Name(), f.path); err != nil {
 		_ = os.Remove(f.Name())
 		return err
 	}
@@ -54,7 +58,6 @@ func (f *File) Close() error {
 			return fmt.Errorf("failed to sync directory: %w", err)
 		}
 	*/
-	f.done = true
 	return nil
 }
 
@@ -63,6 +66,7 @@ func (f *File) Abort() error {
 	if f.done {
 		return nil
 	}
+	f.done = true
 	if err := f.File.Close(); err != nil {
 		_ = os.Remove(f.Name())
 		return err
@@ -70,7 +74,6 @@ func (f *File) Abort() error {
 	if err := os.Remove(f.Name()); err != nil {
 		return err
 	}
-	f.done = true
 	return nil
 }
 
