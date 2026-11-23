@@ -5,7 +5,6 @@ import (
 
 	"github.com/hajimehoshi/ebiten/v2"
 	graphics "github.com/quasilyte/ebitengine-graphics"
-	"github.com/quasilyte/ebitengine-graphics/internal/cache"
 	"github.com/quasilyte/ebitengine-graphics/internal/xmath"
 	"github.com/quasilyte/gmath"
 )
@@ -25,7 +24,15 @@ type Renderer struct {
 	bucketIDByImage map[*ebiten.Image]int
 	bucketList      []*rendererBucket
 	freeList        []*rendererBucket
-	disposed        bool
+
+	// Scratch buffers are per-renderer (not shared globally),
+	// so independent renderers never interfere with each other,
+	// even if they happen to be used from different goroutines.
+	batchSlice []*Emitter
+	vertices   []ebiten.Vertex
+	indices    []uint16
+
+	disposed bool
 }
 
 type rendererBucket struct {
@@ -39,6 +46,9 @@ func NewRenderer() *Renderer {
 		bucketIDByImage: make(map[*ebiten.Image]int, 8),
 		bucketList:      make([]*rendererBucket, 0, 8),
 		freeList:        make([]*rendererBucket, 0, 2),
+		batchSlice:      make([]*Emitter, 0, 8),
+		vertices:        make([]ebiten.Vertex, 0, 40*4),
+		indices:         make([]uint16, 0, 40*6),
 	}
 }
 
@@ -109,15 +119,23 @@ func (r *Renderer) drawBucket(dst *ebiten.Image, img *ebiten.Image, opts graphic
 	const batchThreshold = math.MaxUint16 / 24 // Doesn't have to be bigger
 	batchParticles := 0
 
-	batch := sharedResources.batchSlice[:0]
+	batch := r.batchSlice[:0]
 	defer func() {
-		sharedResources.batchSlice = batch[:0]
+		r.batchSlice = batch[:0]
 	}()
 
 	activeEmitters := emitters[:0]
 
 	for _, e := range emitters {
 		if e.IsDisposed() {
+			// Disposed emitters are removed from the bucket
+			// and never drawn again.
+			continue
+		}
+		if !e.emitting && e.NumParticles() == 0 {
+			// The emitter was stopped and all of its particles
+			// have expired; remove it from the visible set, so
+			// its bucket can be recycled once it becomes empty.
 			continue
 		}
 		activeEmitters = append(activeEmitters, e)
@@ -152,11 +170,11 @@ func (r *Renderer) drawBucket(dst *ebiten.Image, img *ebiten.Image, opts graphic
 
 func (r *Renderer) drawBatch(dst, img *ebiten.Image, opts graphics.DrawOptions, emitters []*Emitter) {
 	// Use pre-allocated slices.
-	vertices := cache.Global.ScratchVertices[:0]
-	indices := cache.Global.ScratchIndices[:0]
+	vertices := r.vertices[:0]
+	indices := r.indices[:0]
 	defer func() {
-		cache.Global.ScratchVertices = vertices[:0]
-		cache.Global.ScratchIndices = indices[:0]
+		r.vertices = vertices[:0]
+		r.indices = indices[:0]
 	}()
 
 	idx := uint16(0)

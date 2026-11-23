@@ -129,12 +129,16 @@ func (e *Emitter) UpdateWithDelta(delta float64) {
 	e.dtError += fract
 
 	live := e.particles[:0]
-	dt := uint16(deltaMS)
+	dt := uint32(deltaMS)
 	for _, p := range e.particles {
-		p.counter += dt
-		if p.counter > p.lifetime {
+		// Do the arithmetic in uint32 to avoid the uint16 overflow:
+		// a wrapped-around counter would make a particle live
+		// (almost) forever instead of expiring.
+		counter := uint32(p.counter) + dt
+		if counter > uint32(p.lifetime) {
 			continue
 		}
+		p.counter = uint16(counter)
 		live = append(live, p)
 	}
 	e.particles = live
@@ -198,7 +202,10 @@ func (e *Emitter) emit(t float32) {
 				randSeq++
 			}
 			v *= e.lifetimeMultiplier
-			lifetime = uint16(v * 1000)
+			// Saturate instead of overflowing the uint16:
+			// a wrapped-around lifetime would make the particle
+			// disappear long before its time.
+			lifetime = secondsToUint16MS(v)
 		}
 
 		scalingSeed := uint8(0)
@@ -213,7 +220,7 @@ func (e *Emitter) emit(t float32) {
 		}
 
 		p := particle{
-			counter:      uint16(t * 1000),
+			counter:      secondsToUint16MS(t),
 			lifetime:     lifetime,
 			paletteIndex: paletteIndex,
 			scalingSeed:  scalingSeed,
@@ -236,4 +243,18 @@ func (e *Emitter) emit(t float32) {
 
 		e.particles = append(e.particles, p)
 	}
+}
+
+// secondsToUint16MS converts a time in seconds to milliseconds,
+// saturating at the max value a uint16 can hold instead of
+// overflowing (which would corrupt the particle lifetime logic).
+func secondsToUint16MS(sec float32) uint16 {
+	ms := sec * 1000
+	if ms >= math.MaxUint16 {
+		return math.MaxUint16
+	}
+	if ms <= 0 {
+		return 0
+	}
+	return uint16(ms)
 }
