@@ -12,7 +12,23 @@ import (
 // #include <libavcodec/avcodec.h>
 // #include <libavutil/imgutils.h>
 // #include <libswscale/swscale.h>
+//
+// // avcodec_close was removed in libavcodec 61; use the modern replacement
+// // there so the package builds against both old and new ffmpeg releases.
+// static void waveguide_avcodec_close(AVCodecContext *ctx) {
+// #if LIBAVCODEC_VERSION_MAJOR >= 61
+// 	avcodec_free_context(&ctx);
+// #else
+// 	avcodec_close(ctx);
+// #endif
+// }
 import "C"
+
+// freeCodecContext releases a codec context allocated with
+// avcodec_alloc_context3 on any supported ffmpeg version.
+func freeCodecContext(ctx *C.AVCodecContext) {
+	C.waveguide_avcodec_close(ctx)
+}
 
 func frameData(frame *C.AVFrame) **C.uint8_t {
 	return (**C.uint8_t)(unsafe.Pointer(&frame.data[0]))
@@ -46,13 +62,13 @@ func NewH264Decoder() (*H264Decoder, error) {
 
 	res := C.avcodec_open2(codecCtx, codec, nil)
 	if res < 0 {
-		C.avcodec_close(codecCtx)
+		freeCodecContext(codecCtx)
 		return nil, fmt.Errorf("avcodec_open2() failed")
 	}
 
 	srcFrame := C.av_frame_alloc()
 	if srcFrame == nil {
-		C.avcodec_close(codecCtx)
+		freeCodecContext(codecCtx)
 		return nil, fmt.Errorf("av_frame_alloc() failed")
 	}
 
@@ -78,7 +94,7 @@ func (d *H264Decoder) Close() {
 	}
 
 	C.av_frame_free(&d.srcFrame)
-	C.avcodec_close(d.codecCtx)
+	freeCodecContext(d.codecCtx)
 }
 
 func (d *H264Decoder) Decode(nalu []byte) (image.Image, error) {
