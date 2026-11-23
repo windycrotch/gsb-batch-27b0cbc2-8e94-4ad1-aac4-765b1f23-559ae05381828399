@@ -2,6 +2,14 @@
 
 ## develop
 
+- Add `pkg/capture`, a platform independent event driven capture session.
+- Rewrite `_example/LoopbackCaptureSharedEventDriven` to use `pkg/capture`. Fixed
+  the capture loop hanging after Ctrl-C, the incomplete WAV data, the per-loop
+  event watcher goroutines that were never reclaimed, and capture buffers that
+  were not released on exit.
+- Fix the non-Windows stubs of `IAudioMeterInformation` so the package builds on
+  every platform.
+
 ## v0.2.0
 
 - Support IMMNotificationClient registration.

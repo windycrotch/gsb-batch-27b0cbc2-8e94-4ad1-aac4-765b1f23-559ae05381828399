@@ -1,11 +1,9 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"flag"
 	"fmt"
-	"io"
 	"io/ioutil"
 	"log"
 	"os"
@@ -17,6 +15,7 @@ import (
 
 	"github.com/go-ole/go-ole"
 	"github.com/moutend/go-wav"
+	"github.com/moutend/go-wca/pkg/capture"
 	"github.com/moutend/go-wca/pkg/wca"
 )
 
@@ -88,22 +87,37 @@ func run(args []string) (err error) {
 		return
 	}
 
+	// The context is the single source of truth for "stop capturing". Every
+	// interrupt only cancels it, so repeated interrupts are harmless and the
+	// capture session finishes exactly once.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	signalChan := make(chan os.Signal, 1)
 	signal.Notify(signalChan, os.Interrupt)
-	ctx, cancel := context.WithCancel(context.Background())
+	defer signal.Stop(signalChan)
 
 	go func() {
-		select {
-		case <-signalChan:
-			fmt.Println("Interrupted by SIGINT")
-			cancel()
+		// Keep handling signals while the session is shutting down. Canceling
+		// an already canceled context is a no-op, so repeated interrupts are
+		// harmless and cleanup still happens exactly once.
+		for {
+			select {
+			case <-signalChan:
+				fmt.Println("Interrupted by SIGINT")
+				cancel()
+			case <-ctx.Done():
+				return
+			}
 		}
-		return
 	}()
 
 	if audio, err = loopbackCaptureSharedEventDriven(ctx, durationFlag.Value); err != nil {
 		return
 	}
+	// Everything captured before the interrupt has already been written into
+	// audio, so marshaling and writing the file below always produces a
+	// complete WAV stream.
 	if file, err = wav.Marshal(audio); err != nil {
 		return
 	}
@@ -203,6 +217,10 @@ func loopbackCaptureSharedEventDriven(ctx context.Context, duration time.Duratio
 	}
 
 	fakeAudioReadyEvent := wca.CreateEventExA(0, 0, 0, wca.EVENT_MODIFY_STATE|wca.SYNCHRONIZE)
+	if fakeAudioReadyEvent == 0 {
+		err = fmt.Errorf("failed to create the capture event")
+		return
+	}
 	defer wca.CloseHandle(fakeAudioReadyEvent)
 
 	if err = cac.SetEventHandle(fakeAudioReadyEvent); err != nil {
@@ -210,6 +228,10 @@ func loopbackCaptureSharedEventDriven(ctx context.Context, duration time.Duratio
 	}
 
 	audioReadyEvent := wca.CreateEventExA(0, 0, 0, wca.EVENT_MODIFY_STATE|wca.SYNCHRONIZE)
+	if audioReadyEvent == 0 {
+		err = fmt.Errorf("failed to create the render event")
+		return
+	}
 	defer wca.CloseHandle(audioReadyEvent)
 
 	if err = rac.SetEventHandle(audioReadyEvent); err != nil {
@@ -244,6 +266,9 @@ func loopbackCaptureSharedEventDriven(ctx context.Context, duration time.Duratio
 		return
 	}
 	if err = cac.Start(); err != nil {
+		// The render client is already running; stop it before returning so
+		// that the stream does not outlive this function.
+		_ = rac.Stop()
 		return
 	}
 
@@ -253,105 +278,42 @@ func loopbackCaptureSharedEventDriven(ctx context.Context, duration time.Duratio
 		fmt.Println("Press Ctrl-C to save and quit")
 	}
 
-	var output = []byte{}
-	var buf []byte
-	var offset int
-	var lim int
-	var start unsafe.Pointer
-	var isCapturing bool = true
-	var currentDuration time.Duration
-	var data *byte
-	var b *byte
-	var availableFrameSize uint32
-	var flags uint32
-	var devicePosition uint64
-	var qcpPosition uint64
-
-	errorChan := make(chan error, 1)
-
-	time.Sleep(latency)
-
-	for {
-		if !isCapturing {
-			close(errorChan)
-			break
-		}
-		go func() {
-			errorChan <- watchEvent(ctx, audioReadyEvent)
-		}()
-		select {
-		case <-ctx.Done():
-			isCapturing = false
-			<-errorChan
-			break
-		case err = <-errorChan:
-			currentDuration = time.Duration(float64(offset) / float64(wfx.WBitsPerSample/8) / float64(wfx.NChannels) / float64(wfx.NSamplesPerSec) * float64(time.Second))
-			if duration != 0 && currentDuration > duration {
-				isCapturing = false
-				break
-			}
-			if err != nil {
-				isCapturing = false
-				break
-			}
-			if err = acc.GetBuffer(&data, &availableFrameSize, &flags, &devicePosition, &qcpPosition); err != nil {
-				continue
-			}
-			if availableFrameSize == 0 {
-				continue
-			}
-
-			start = unsafe.Pointer(data)
-			lim = int(availableFrameSize) * int(wfx.NBlockAlign)
-			buf = make([]byte, lim)
-
-			for n := 0; n < lim; n++ {
-				b = (*byte)(unsafe.Pointer(uintptr(start) + uintptr(n)))
-				buf[n] = *b
-			}
-
-			offset += lim
-			output = append(output, buf...)
-
-			if err = acc.ReleaseBuffer(availableFrameSize); err != nil {
-				return
-			}
-		}
+	// Wait for the first period so that the capture endpoint has data. The
+	// wait is interruptible, so Ctrl-C is still handled immediately.
+	select {
+	case <-time.After(latency):
+	case <-ctx.Done():
 	}
 
-	io.Copy(audio, bytes.NewBuffer(output))
+	events, err := capture.NewEventSource(audioReadyEvent)
+	if err != nil {
+		_ = cac.Stop()
+		_ = rac.Stop()
+		return
+	}
+
+	buffers, err := capture.NewBufferSource(acc, wfx.NBlockAlign)
+	if err != nil {
+		_ = cac.Stop()
+		_ = rac.Stop()
+		return
+	}
+
+	session := &capture.Session{
+		Events:         events,
+		Buffers:        buffers,
+		Output:         audio,
+		Duration:       duration,
+		BytesPerSecond: wfx.NAvgBytesPerSec,
+		// The capture client must be stopped before the render client, which
+		// mirrors the reverse of the start order.
+		Stoppers: []capture.Stopper{cac, rac},
+	}
+
+	if err = session.Run(ctx); err != nil {
+		return
+	}
 
 	fmt.Println("Stop capturing")
-	if err = cac.Stop(); err != nil {
-		return
-	}
-	if err = rac.Stop(); err != nil {
-		return
-	}
-
-	return
-}
-
-func watchEvent(ctx context.Context, event uintptr) (err error) {
-	errorChan := make(chan error, 1)
-	go func() {
-		errorChan <- eventEmitter(event)
-	}()
-	select {
-	case err = <-errorChan:
-		close(errorChan)
-		return
-	case <-ctx.Done():
-		err = ctx.Err()
-		return
-	}
-	return
-}
-
-func eventEmitter(event uintptr) (err error) {
-	dw := wca.WaitForSingleObject(event, wca.INFINITE)
-	if dw != 0 {
-		return fmt.Errorf("failed to watch event")
-	}
 	return
 }
