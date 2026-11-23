@@ -7,6 +7,7 @@ import (
 	"hash"
 	"io"
 	"strings"
+	"sync"
 
 	flac "github.com/tphakala/go-flac"
 	"github.com/tphakala/go-flac/internal/bitio"
@@ -23,7 +24,16 @@ import (
 // can be passed directly. Do not wrap a source in a bufio.Reader when seeking is
 // needed: bufio.Reader does not implement io.Seeker, so SeekToSample would return
 // flac.ErrSeekUnsupported.
+//
+// A Decoder is safe for concurrent use: Read, WriteTo, SeekToSample, Reset and the
+// accessors (Info, OutputBitDepth, Vendor, Tags) may be called from multiple
+// goroutines at once. Each call is serialized, so it applies entirely to the stream
+// bound at the time it runs — calls never interleave halfway through a Reset or a
+// seek. This makes a Decoder safe to share through a sync.Pool whose borrowers may
+// overlap.
 type Decoder struct {
+	mu sync.Mutex // serializes all public methods; every field below is mu-guarded
+
 	br       *bitio.Reader
 	rs       io.ReadSeeker // non-nil when the source is seekable
 	info     flac.StreamInfo
@@ -137,6 +147,8 @@ func NewDecoder(r io.Reader, opts ...DecoderOption) (*Decoder, error) {
 // than 8, 16, 24 or 32) makes Reset return an error wrapping flac.ErrUnsupported and
 // leaves the decoder in the same recoverable failed state as a bad header.
 func (d *Decoder) Reset(r io.Reader, opts ...DecoderOption) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
 	if err := d.init("Reset", r); err != nil {
 		return err
 	}
@@ -280,13 +292,21 @@ func (d *Decoder) clearStream() {
 // Info returns the stream's STREAMINFO-derived properties. It always describes the
 // stream itself, so Info().BitDepth is the native depth even under WithConvertTo; see
 // OutputBitDepth for the depth of the samples Read yields.
-func (d *Decoder) Info() flac.StreamInfo { return d.info }
+func (d *Decoder) Info() flac.StreamInfo {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.info
+}
 
 // OutputBitDepth returns the bit depth of the samples Read and WriteTo yield: the
 // WithConvertTo target when that option was given, otherwise the stream's own
 // Info().BitDepth. Each sample occupies (OutputBitDepth()+7)/8 little-endian bytes.
 // It is 0 on a decoder whose NewDecoder or Reset failed.
-func (d *Decoder) OutputBitDepth() int { return d.outBits }
+func (d *Decoder) OutputBitDepth() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.outBits
+}
 
 // Vendor returns the VORBIS_COMMENT vendor string. It is "" both when the stream
 // carried no VORBIS_COMMENT block and when the block declared an empty vendor string,
@@ -294,7 +314,11 @@ func (d *Decoder) OutputBitDepth() int { return d.outBits }
 // not validated as UTF-8, so a stream written by another tool may yield a value that
 // is not valid UTF-8; the go-flac encoder rejects non-UTF-8 vendor strings, so a
 // vendor string written by this package always round-trips as valid UTF-8.
-func (d *Decoder) Vendor() string { return d.vendor }
+func (d *Decoder) Vendor() string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.vendor
+}
 
 // Tags returns the stream's VORBIS_COMMENT fields as ordered flac.Tag values, each
 // split at the first '=' of its "NAME=value" comment. It returns nil both when the
@@ -306,6 +330,8 @@ func (d *Decoder) Vendor() string { return d.vendor }
 // go-flac encoder rejects non-UTF-8 values, so tags written by this package always
 // round-trip as valid UTF-8.
 func (d *Decoder) Tags() []flac.Tag {
+	d.mu.Lock()
+	defer d.mu.Unlock()
 	if len(d.comments) == 0 {
 		return nil
 	}
@@ -361,6 +387,8 @@ var errSeekFrameCut = fmt.Errorf("%w: %w", flac.ErrTruncatedStream, io.ErrUnexpe
 // ErrSeekUnsupported are argument and capability errors that touch no state, so they
 // leave the decoder readable.
 func (d *Decoder) SeekToSample(sampleIndex int64) (int64, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
 	if !d.seekable {
 		return 0, flac.ErrSeekUnsupported
 	}
@@ -674,9 +702,12 @@ func (d *Decoder) finish() error {
 func (d *Decoder) Read(p []byte) (int, error) {
 	if len(p) == 0 {
 		// Per io.Reader, a zero-length read returns immediately; do not decode
-		// a frame just to copy nothing.
+		// a frame just to copy nothing. It touches no decoder state, so it
+		// needs no lock.
 		return 0, nil
 	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
 	if d.err != nil {
 		return 0, d.err
 	}
@@ -692,6 +723,8 @@ func (d *Decoder) Read(p []byte) (int, error) {
 
 // WriteTo drains all decoded PCM into w.
 func (d *Decoder) WriteTo(w io.Writer) (int64, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
 	if d.err != nil {
 		return 0, d.err
 	}
