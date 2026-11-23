@@ -1,0 +1,34 @@
+# Build output
+build/bin/
+*.exe
+*.exe~
+*.syso
+/dist/
+
+# Generated
+frontend/wailsjs/
+!frontend/dist/
+!frontend/dist/**
+
+# Go
+vendor/
+*.test
+*.out
+*.prof
+coverage.*
+
+# Clip library (user-supplied)
+/sounds/
+*.part
+.raw_*
+
+# Local
+_*.png
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini

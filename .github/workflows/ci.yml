@@ -1,0 +1,92 @@
+# CI for SoundBoard.
+#
+# The module is Windows-only by construction: the audio routing is WASAPI +
+# IPolicyConfig, and internal/apm embeds a Windows DLL. There is no Linux or
+# macOS job because the code cannot build there.
+#
+# cgo is required (malgo/miniaudio and the vendored RNNoise C sources), so the
+# MinGW-w64 gcc that ships with windows-latest is a hard dependency.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: Build & test (windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.25.5'
+          cache: true
+
+      # cgo toolchain must be present or the build silently degrades.
+      - name: Verify gcc
+        run: gcc --version
+
+      - name: go vet
+        run: go vet ./...
+        env:
+          CGO_ENABLED: 1
+
+      - name: go build
+        run: go build -trimpath ./...
+        env:
+          CGO_ENABLED: 1
+
+      - name: go test
+        run: go test -count=1 ./...
+        env:
+          CGO_ENABLED: 1
+
+      # Wails hides its real CreateApp behind `!dev && !production && !bindings`.
+      # A build missing those tags still compiles, links and exits 0 — it only
+      # fails when a user launches it and gets a "wrong build tags" message box.
+      # Build the shipping binary the documented way and assert the stub is absent.
+      - name: Build shipping binary and assert it is not the Wails stub
+        shell: bash
+        run: |
+          go build -trimpath -tags desktop,production -ldflags "-H=windowsgui -s -w" -o build/bin/soundboard.exe .
+          if strings -a build/bin/soundboard.exe | grep -q "will not build without the correct build tags"; then
+            echo "::error::Binary contains the Wails stub CreateApp — build tags are missing."
+            exit 1
+          fi
+          echo "OK: real CreateApp linked."
+        env:
+          CGO_ENABLED: 1
+
+      # The real-time audio path is the part most worth race-checking.
+      - name: go test -race (audio)
+        run: go test -race -count=1 ./internal/audio/... ./internal/catalog/...
+        env:
+          CGO_ENABLED: 1
+
+  secret-scan:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    # In pull_request context gitleaks-action enumerates the PR's commits via
+    # GET /repos/{owner}/{repo}/pulls/{n}/commits, which the workflow-level
+    # `contents: read` does not cover. Without this the job errors out on every
+    # PR while still passing on push to main, which reads as a failing secret
+    # scan when nothing was ever scanned. Scoped to this job so the build keeps
+    # the narrower default.
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

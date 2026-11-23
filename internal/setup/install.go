@@ -1,0 +1,419 @@
+package setup
+
+import (
+	"archive/zip"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strings"
+	"syscall"
+	"time"
+	"unsafe"
+)
+
+// cableDownloadURLs are the official VB-Audio direct download URLs for the
+// VB-CABLE driver pack, newest first. The current release at build time is
+// Pack45; Pack43 is kept as a fallback in case VB-Audio rotates the "current"
+// file. Both are served from VB-Audio's own CDN (download.vb-audio.com) — never
+// a mirror — and both were confirmed reachable (HTTP 200, ~1.3 MB zip).
+var cableDownloadURLs = []string{
+	"https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack45.zip",
+	"https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack43.zip",
+}
+
+// setupExeName is the 64-bit silent installer inside the driver pack zip. We
+// run it with "-i -h": -i installs the driver, -h runs headless (no GUI). A
+// reboot is typically required before the CABLE Input/Output endpoints appear.
+const setupExeName = "VBCABLE_Setup_x64.exe"
+
+// allowedDownloadHost is the ONLY host the driver-pack download (and every
+// redirect hop) may resolve to. The extracted installer is run ELEVATED, so the
+// bytes must originate from VB-Audio's own CDN over TLS — never a redirected or
+// hijacked host. Enforced at request time and on every redirect, not just by the
+// static URL list (which a 30x could otherwise bypass).
+const allowedDownloadHost = "download.vb-audio.com"
+
+// ErrUnsafeDownload means the download URL — or a redirect target — was not
+// HTTPS on the expected VB-Audio host, so it was refused before any bytes were
+// written. Surfaced distinctly from a plain network failure.
+var ErrUnsafeDownload = errors.New("setup: refused unsafe VB-CABLE download (must be HTTPS on " + allowedDownloadHost + ")")
+
+// validateDownloadURL rejects any URL that is not HTTPS on allowedDownloadHost.
+// Host comparison is case-insensitive and ignores any port. Used both for the
+// initial request and for every redirect hop.
+func validateDownloadURL(u *url.URL) error {
+	if u == nil || !strings.EqualFold(u.Scheme, "https") || !strings.EqualFold(u.Hostname(), allowedDownloadHost) {
+		got := "<nil>"
+		if u != nil {
+			got = u.Scheme + "://" + u.Host
+		}
+		return fmt.Errorf("%w: got %s", ErrUnsafeDownload, got)
+	}
+	return nil
+}
+
+// safeHTTPClient is an http.Client whose CheckRedirect re-validates every
+// redirect target against validateDownloadURL, so a 30x to an arbitrary host can
+// never redirect the elevated-installer download off VB-Audio's CDN. It also
+// bounds the hop count.
+var safeHTTPClient = &http.Client{
+	CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 10 {
+			return errors.New("setup: too many redirects")
+		}
+		return validateDownloadURL(req.URL)
+	},
+}
+
+// downloadTimeout bounds the whole download; the zip is ~1.3 MB so this is
+// generous. installWait bounds how long we wait for the elevated installer.
+const (
+	downloadTimeout = 90 * time.Second
+	installWait     = 5 * time.Minute
+)
+
+// ErrInstallDeclined means the user dismissed the UAC elevation prompt, so the
+// installer never ran. Surfaced distinctly so the UI can say "you need to
+// approve the admin prompt" rather than a generic failure.
+var ErrInstallDeclined = errors.New("setup: VB-CABLE install declined at the UAC prompt")
+
+// ErrNoNetwork means the driver pack could not be downloaded from any official
+// URL (offline, DNS failure, server error).
+var ErrNoNetwork = errors.New("setup: could not download VB-CABLE (no network or server unreachable)")
+
+// installCable downloads the VB-CABLE driver pack, extracts the x64 setup, and
+// runs it elevated and silently. It blocks until the installer exits or ctx is
+// cancelled. The caller must NOT assume the endpoints exist on return — Windows
+// often needs a reboot before the virtual cable enumerates.
+func installCable(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	tmp, err := os.MkdirTemp("", "soundboard-vbcable-")
+	if err != nil {
+		return fmt.Errorf("setup: temp dir: %w", err)
+	}
+	defer os.RemoveAll(tmp)
+
+	zipPath := filepath.Join(tmp, "vbcable.zip")
+	if err := downloadAny(ctx, cableDownloadURLs, zipPath); err != nil {
+		return err
+	}
+
+	exePath, err := extractSetup(zipPath, tmp)
+	if err != nil {
+		return err
+	}
+
+	// Run the installer AND immediately try to surface the new endpoints in THIS
+	// Windows session — a PnP device rescan plus an Audio Endpoint Builder service
+	// restart (which cascades to Windows Audio) — so a full Windows reboot can be
+	// avoided on machines whose audio services have no third-party dependencies.
+	// All steps run in ONE elevated process (a single UAC prompt). On machines
+	// that genuinely still need a reboot, the cable simply won't enumerate until
+	// restart, and the caller detects that and says so. The service bounce briefly
+	// drops all system audio for a moment — expected, not a failure.
+	// The installer's OWN exit code is what decides success — it must survive the
+	// two best-effort steps that follow it. %ERRORLEVEL% is captured into EC on
+	// the line immediately after the installer (a plain statement, not inside a
+	// parenthesised block, so no delayed expansion is needed) and re-raised by the
+	// final `exit /b %EC%`. An earlier revision ended with a literal `exit /b 0`,
+	// which meant cmd.exe ALWAYS reported success: a silently failing install was
+	// indistinguishable from a working one, and the UI told users "VB-CABLE
+	// installed" for an install that never happened.
+	//
+	// `cd /d` puts the working directory on the extracted driver pack, because
+	// ShellExecuteEx's lpDirectory is the launched image's directory (System32,
+	// since we launch cmd.exe) rather than the payload's.
+	batPath := filepath.Join(tmp, "vbcable_install.bat")
+	script := "@echo off\r\n" +
+		`cd /d "` + filepath.Dir(exePath) + `"` + "\r\n" +
+		`"` + exePath + `" -i -h` + "\r\n" +
+		"set EC=%ERRORLEVEL%\r\n" +
+		"pnputil /scan-devices >nul 2>&1\r\n" +
+		`powershell -NoProfile -ExecutionPolicy Bypass -Command "Restart-Service -Name 'AudioEndpointBuilder' -Force -ErrorAction SilentlyContinue"` + " >nul 2>&1\r\n" +
+		"exit /b %EC%\r\n"
+	if err := os.WriteFile(batPath, []byte(script), 0o600); err != nil {
+		return fmt.Errorf("setup: write install script: %w", err)
+	}
+
+	comspec := os.Getenv("ComSpec")
+	if comspec == "" {
+		comspec = `C:\Windows\System32\cmd.exe`
+	}
+	// Log the install attempt and its outcome. Until now NOTHING in this file
+	// logged: install results reached the UI only as Wails events, so a remote
+	// user's soundboard.log recorded that the cable was missing but never a single
+	// word about what the installer did — leaving no way to tell a declined
+	// driver-trust prompt from a blocked driver from a download fallback.
+	log.Printf("install: launching elevated VB-CABLE installer (%s -i -h)", exePath)
+	err = runElevatedAndWait(ctx, comspec, `/c "`+batPath+`"`)
+	if err != nil {
+		log.Printf("install: FAILED: %v", err)
+	} else {
+		log.Printf("install: installer completed successfully (endpoints may still need a Windows restart)")
+	}
+	return err
+}
+
+// downloadAny tries each URL in order and writes the first successful response
+// body to dst. Network/server failures across all URLs collapse to ErrNoNetwork
+// with the last underlying error wrapped for diagnostics.
+func downloadAny(ctx context.Context, urls []string, dst string) error {
+	dctx, cancel := context.WithTimeout(ctx, downloadTimeout)
+	defer cancel()
+
+	var lastErr error
+	for i, url := range urls {
+		if err := downloadOne(dctx, url, dst); err != nil {
+			log.Printf("install: download %s failed: %v", url, err)
+			lastErr = err
+			continue
+		}
+		// Which pack was used matters and must be in the log. The newest pack is
+		// WHCP-signed and installs without Windows' driver-trust prompt; the older
+		// fallback is not, so a transient CDN failure silently downgrades the user
+		// to a pack that can stall on a prompt our headless install cannot answer.
+		if i > 0 {
+			log.Printf("install: WARNING using fallback driver pack %s (the current pack was unreachable)", url)
+		} else {
+			log.Printf("install: downloaded driver pack %s", url)
+		}
+		return nil
+	}
+	return fmt.Errorf("%w: %v", ErrNoNetwork, lastErr)
+}
+
+// downloadOne fetches rawURL into dst, failing on any non-2xx status. The URL
+// and every redirect hop are validated to be HTTPS on the expected VB-Audio
+// host before any bytes are written, because the downloaded payload is run
+// elevated — we never fetch the installer from an arbitrary (redirected or
+// hijacked) host.
+func downloadOne(ctx context.Context, rawURL, dst string) error {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("setup: parse download URL: %w", err)
+	}
+	if err := validateDownloadURL(parsed); err != nil {
+		return err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := safeHTTPClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	// Defense in depth: confirm the final responding URL is still the expected
+	// host/scheme even if CheckRedirect's contract ever changed.
+	if err := validateDownloadURL(resp.Request.URL); err != nil {
+		return err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("download %s: status %d", rawURL, resp.StatusCode)
+	}
+
+	f, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if _, err := io.Copy(f, resp.Body); err != nil {
+		return fmt.Errorf("write %s: %w", dst, err)
+	}
+	return nil
+}
+
+// extractSetup unzips destDir and returns the path to VBCABLE_Setup_x64.exe.
+// It guards against zip-slip by rejecting entries that escape destDir.
+func extractSetup(zipPath, destDir string) (string, error) {
+	zr, err := zip.OpenReader(zipPath)
+	if err != nil {
+		return "", fmt.Errorf("setup: open zip: %w", err)
+	}
+	defer zr.Close()
+
+	var setupPath string
+	for _, zf := range zr.File {
+		if zf.FileInfo().IsDir() {
+			continue
+		}
+		// Clean the entry name; reject path traversal.
+		clean := filepath.Clean(filepath.FromSlash(zf.Name))
+		if strings.HasPrefix(clean, ".."+string(os.PathSeparator)) || strings.Contains(clean, ".."+string(os.PathSeparator)) {
+			continue
+		}
+		out := filepath.Join(destDir, clean)
+		if !strings.HasPrefix(out, filepath.Clean(destDir)+string(os.PathSeparator)) {
+			continue // escapes destDir
+		}
+		if err := extractFile(zf, out); err != nil {
+			return "", err
+		}
+		if strings.EqualFold(filepath.Base(out), setupExeName) {
+			setupPath = out
+		}
+	}
+	if setupPath == "" {
+		return "", fmt.Errorf("setup: %s not found in driver pack", setupExeName)
+	}
+	return setupPath, nil
+}
+
+// extractFile writes a single zip entry to dst, creating parent dirs.
+func extractFile(zf *zip.File, dst string) error {
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return err
+	}
+	rc, err := zf.Open()
+	if err != nil {
+		return fmt.Errorf("setup: open %s in zip: %w", zf.Name, err)
+	}
+	defer rc.Close()
+
+	f, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o755)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if _, err := io.Copy(f, rc); err != nil { //nolint:gosec // size bounded by trusted VB-Audio zip
+		return fmt.Errorf("setup: extract %s: %w", zf.Name, err)
+	}
+	return nil
+}
+
+// --- Elevated launch via ShellExecuteExW("runas") ---------------------------
+
+var (
+	modshell32          = syscall.NewLazyDLL("shell32.dll")
+	modkernel32         = syscall.NewLazyDLL("kernel32.dll")
+	procShellExecuteExW = modshell32.NewProc("ShellExecuteExW")
+	procWaitForSingle   = modkernel32.NewProc("WaitForSingleObject")
+	procGetExitCode     = modkernel32.NewProc("GetExitCodeProcess")
+	procCloseHandle     = modkernel32.NewProc("CloseHandle")
+)
+
+// shellExecuteInfoW mirrors SHELLEXECUTEINFOW (shellapi.h) on amd64. Field order
+// and sizes match the documented struct exactly; cbSize must be set to the Go
+// struct size before the call.
+type shellExecuteInfoW struct {
+	cbSize       uint32
+	fMask        uint32
+	hwnd         uintptr
+	lpVerb       *uint16
+	lpFile       *uint16
+	lpParameters *uint16
+	lpDirectory  *uint16
+	nShow        int32
+	hInstApp     uintptr
+	lpIDList     uintptr
+	lpClass      *uint16
+	hkeyClass    uintptr
+	dwHotKey     uint32
+	hIconOrMon   uintptr
+	hProcess     uintptr
+}
+
+const (
+	seeMaskNoCloseProcess = 0x00000040 // hProcess receives the process handle
+	seeMaskNoAsync        = 0x00000100 // complete synchronously before returning
+	seeMaskFlagNoUI       = 0x00000400 // suppress our own error dialogs (UAC still shows)
+	swHide                = 0          // SW_HIDE — the installer runs headless anyway
+	infinite              = 0xFFFFFFFF
+	waitObject0           = 0x00000000
+	waitTimeout           = 0x00000102
+	errorCancelled        = 1223 // ERROR_CANCELLED — UAC prompt declined
+)
+
+// runElevatedAndWait launches exePath with the given argument string elevated
+// (UAC "runas") and waits up to installWait (or ctx) for it to finish. UAC
+// decline returns ErrInstallDeclined.
+func runElevatedAndWait(ctx context.Context, exePath, args string) error {
+	verb, _ := syscall.UTF16PtrFromString("runas")
+	file, err := syscall.UTF16PtrFromString(exePath)
+	if err != nil {
+		return fmt.Errorf("setup: encode exe path: %w", err)
+	}
+	params, err := syscall.UTF16PtrFromString(args)
+	if err != nil {
+		return fmt.Errorf("setup: encode args: %w", err)
+	}
+	dir, _ := syscall.UTF16PtrFromString(filepath.Dir(exePath))
+
+	info := shellExecuteInfoW{
+		fMask:        seeMaskNoCloseProcess | seeMaskNoAsync | seeMaskFlagNoUI,
+		lpVerb:       verb,
+		lpFile:       file,
+		lpParameters: params,
+		lpDirectory:  dir,
+		nShow:        swHide,
+	}
+	info.cbSize = uint32(unsafe.Sizeof(info))
+
+	ret, _, callErr := procShellExecuteExW.Call(uintptr(unsafe.Pointer(&info)))
+	if ret == 0 {
+		// ShellExecuteExW returned FALSE; callErr holds GetLastError().
+		if errno, ok := callErr.(syscall.Errno); ok && uintptr(errno) == errorCancelled {
+			return ErrInstallDeclined
+		}
+		return fmt.Errorf("setup: ShellExecuteExW(runas) failed: %w", callErr)
+	}
+	if info.hProcess == 0 {
+		// Elevation succeeded but no waitable process handle (rare); we cannot
+		// confirm completion, so report success — the install was launched.
+		return nil
+	}
+	defer procCloseHandle.Call(info.hProcess)
+
+	return waitProcess(ctx, info.hProcess)
+}
+
+// waitProcess blocks until the process handle signals, ctx is cancelled, or
+// installWait elapses, polling in short slices so ctx cancellation is honoured.
+func waitProcess(ctx context.Context, hProcess uintptr) error {
+	deadline := time.Now().Add(installWait)
+	for {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("setup: install cancelled: %w", err)
+		}
+		if time.Now().After(deadline) {
+			return errors.New("setup: timed out waiting for VB-CABLE installer")
+		}
+		// Wait in 500 ms slices so ctx cancellation stays responsive.
+		r, _, _ := procWaitForSingle.Call(hProcess, uintptr(500))
+		if r == waitObject0 {
+			return checkExitCode(hProcess)
+		}
+		if r != waitTimeout {
+			return fmt.Errorf("setup: WaitForSingleObject returned 0x%x", r)
+		}
+	}
+}
+
+// checkExitCode reads the installer's exit code, which the install script
+// re-raises through cmd.exe (see installCable). VBCABLE_Setup returns 0 on a
+// clean install; any non-zero code means the driver did NOT install and is
+// surfaced to the user, because the alternative — reporting success — sends them
+// into a reinstall loop that can never succeed. A successful install may still
+// need a reboot before the endpoints enumerate; that is not an error here.
+func checkExitCode(hProcess uintptr) error {
+	var code uint32
+	r, _, _ := procGetExitCode.Call(hProcess, uintptr(unsafe.Pointer(&code)))
+	if r == 0 {
+		return nil // could not read code; assume launched OK
+	}
+	if code != 0 {
+		return fmt.Errorf("setup: the VB-CABLE installer failed (exit code %d) — the driver was not installed. Try installing VB-CABLE manually from %s: unzip it, right-click VBCABLE_Setup_x64.exe, choose \"Run as administrator\", then restart Windows", code, primaryDownloadURL)
+	}
+	return nil
+}

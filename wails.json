@@ -1,0 +1,20 @@
+{
+  "$schema": "https://wails.io/schemas/config.v2.json",
+  "name": "SoundBoard",
+  "outputfilename": "soundboard",
+  "frontend:dir": "frontend",
+  "frontend:install": "",
+  "frontend:build": "",
+  "frontend:dev:watcher": "",
+  "frontend:dev:serverUrl": "",
+  "author": {
+    "name": "SoundBoard Contributors"
+  },
+  "info": {
+    "companyName": "jodagreyhame",
+    "productName": "SoundBoard",
+    "productVersion": "1.1.1",
+    "comments": "Windows soundboard that mixes clips over your live microphone via VB-CABLE, so any voice app hears them.",
+    "copyright": "Copyright (c) 2026 jodagreyhame. MIT Licence. See THIRD_PARTY_NOTICES.md for bundled components."
+  }
+}

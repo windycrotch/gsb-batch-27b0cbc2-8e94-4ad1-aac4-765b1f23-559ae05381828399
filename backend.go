@@ -1,0 +1,576 @@
+// backend.go owns the REAL backend the Wails App binds to: the malgo duplex
+// engine, the sound catalog, device enumeration, the VB-CABLE setup/routing
+// controller, global hotkeys, and the persisted settings. It is the Wails
+// counterpart of the bootstrap that the legacy Fyne main.go performs inline:
+// the SAME internal/* packages, wired the SAME way (auto-engage routing before
+// resolving the mic, capture the previous default mic, mix into CABLE Input,
+// monitor on the real speakers, seed gains + processing from saved settings).
+//
+// Nothing here changes internal/* behavior: it reuses the existing engine,
+// catalog, setup, devices, hotkeys, and config APIs exactly as the Fyne build
+// does. Only the OWNER of the wiring moves from main() into a Backend the App
+// can reach from its bound methods.
+package main
+
+import (
+	"io"
+	"log"
+	"os"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/gen2brain/malgo"
+
+	"github.com/jodagreyhame/SoundBoard/internal/apm"
+	"github.com/jodagreyhame/SoundBoard/internal/audio"
+	"github.com/jodagreyhame/SoundBoard/internal/config"
+	"github.com/jodagreyhame/SoundBoard/internal/devices"
+	"github.com/jodagreyhame/SoundBoard/internal/hotkeys"
+	"github.com/jodagreyhame/SoundBoard/internal/setup"
+	"github.com/jodagreyhame/SoundBoard/internal/winaudio"
+)
+
+// Backend bundles the live backend objects the bound App methods drive. It is
+// constructed once at process start (newBackend) and torn down once on quit
+// (close). The engine's setters are atomic/RT-safe so the App may call them from
+// the webview/bound-method goroutine without locking; settings mutation + Save
+// is serialized by the App's own mutex (see app.go).
+type Backend struct {
+	settings *config.Settings
+	engine   *audio.Engine
+	setup    *routingController
+	hotkeys  *hotkeys.Manager
+
+	// clipOpMu serializes WHOLE clip-folder operations (reload, relocate). The
+	// read-index-swap-record sequence is not atomic, so two overlapping
+	// operations could otherwise interleave their swaps and their metadata
+	// writes independently, leaving the engine on one library while the
+	// recorded path names another - which the App then persists to config,
+	// making the mismatch survive a restart.
+	clipOpMu sync.Mutex
+
+	// Clip-folder metadata, guarded by libMu. The library ITSELF is not held
+	// here: it lives in the engine, which is the single owner, so a reload
+	// cannot leave the grid rendering clips the engine can no longer play.
+	// These fields only describe where that library came from and what went
+	// wrong, if anything, getting it.
+	libMu               sync.RWMutex
+	clipFolder          string
+	clipFolderIsDefault bool
+	clipFolderErr       string
+	clipFolderNotice    string
+
+	ctx *malgo.AllocatedContext // malgo audio context; freed in close
+
+	// audioRunning reports whether the duplex engine actually started (cable
+	// present + Configure/Start succeeded). When false the app runs in setup mode:
+	// the UI renders and routing can be installed, but triggering a clip is a no-op
+	// because there is no audio path yet. The events loop only emits gate levels
+	// while this is true.
+	audioRunning bool
+
+	closeOnce sync.Once
+}
+
+// newBackend performs the full backend bootstrap, mirroring the Fyne main(): load
+// settings, build the catalog from sounds/, init the audio context, enumerate
+// devices, detect + auto-engage VB-CABLE routing, resolve the real mic + cable +
+// monitor, configure/start the duplex engine, seed gains + processing, and
+// register hotkeys. It NEVER fatals on a degraded path: a missing cable, a
+// failed Configure, or a hotkey error leaves the app running in setup mode so the
+// window still opens and the user can install/relaunch, exactly like the Fyne
+// build's degraded behavior.
+func newBackend() *Backend {
+	b := &Backend{}
+
+	settings, err := config.Load()
+	if err != nil {
+		log.Printf("load settings: %v (continuing with defaults)", err)
+		settings = &config.Settings{}
+	}
+	b.settings = settings
+
+	lib := b.initClipFolder()
+
+	ctx, err := malgo.InitContext(
+		[]malgo.Backend{malgo.BackendWasapi, malgo.BackendDsound},
+		malgo.ContextConfig{},
+		nil,
+	)
+	if err != nil {
+		log.Printf("init audio context: %v (running without audio routing)", err)
+		b.setup = &routingController{audioUnavailable: true}
+		b.engine = audio.NewEngine(nil, lib)
+		b.hotkeys = hotkeys.New()
+		b.hotkeys.Run()
+		return b
+	}
+	b.ctx = ctx
+
+	playback, capture, err := devices.Enumerate(ctx)
+	enumFailed := err != nil
+	if enumFailed {
+		log.Printf("enumerate devices: %v (running without audio routing)", err)
+		playback, capture = nil, nil
+	}
+	status := setup.DetectSystem(playback, capture)
+	if !enumFailed && !status.CableInputPresent {
+		log.Printf("VB-CABLE not detected. Install from %s", setup.DownloadURL())
+		logDeviceInventory(playback, capture)
+	}
+	// A failed enumeration says nothing about whether the cable exists; do not let
+	// it masquerade as "VB-CABLE absent" and push the user at the installer.
+	b.setup = &routingController{status: status, audioUnavailable: enumFailed}
+
+	// Auto-engage routing at startup when the cable is present so Discord needs
+	// ZERO changes immediately. Engaging hijacks the default capture endpoint, so
+	// this MUST happen before resolving the mic (capture the PREVIOUS default).
+	if status.CanEngage {
+		if err := b.setup.Engage(); err != nil {
+			// One non-error outcome wears an error coat: CABLE Output is ALREADY the
+			// Windows default mic (a prior session engaged it, or the user set it
+			// manually). Routing is then effectively live — Discord set to "CABLE
+			// Output" already hears the board — but we own no restore closure, so we
+			// must NOT revert that default on quit. Reflect this as engaged (without
+			// a restore) so the banner/pill tell the truth instead of inviting the
+			// user to click "Engage" only to hit the same already-default condition.
+			if b.setup.alreadyDefaultRouted() {
+				b.setup.markEngagedNoRestore()
+				log.Printf("routing already engaged: CABLE Output is already the default mic (left as-is on quit)")
+			} else {
+				log.Printf("auto-engage routing: %v (you can retry from the window banner)", err)
+			}
+		} else {
+			log.Printf("routing engaged: Windows default mic now points at CABLE Output (restored on quit)")
+		}
+	}
+
+	engine := audio.NewEngine(ctx, lib)
+	b.engine = engine
+	applyVolumesW(engine, settings)
+	applyProcessingW(engine, settings)
+	// The APM-backed NS tiers (standard/high) are no-ops without the WebRTC APM; the
+	// "strong" tier uses RNNoise instead, so it is unaffected by APM availability.
+	switch settings.Processing.NoiseSuppressionTier {
+	case config.NSModeStandard, config.NSModeHigh:
+		if !apm.Available() {
+			log.Printf("noise suppression tier %q needs the WebRTC APM, which is unavailable (%v); it will be a no-op", settings.Processing.NoiseSuppressionTier, apm.LoadError())
+		}
+	}
+
+	mic, _ := resolveMicW(capture, settings.MicName)
+	cable, cableOK := resolveCableW(playback, settings.CableName)
+
+	if cableOK {
+		log.Printf("audio endpoints: capturing mic %q -> playing into cable %q", mic.Name, cable.Name)
+		if err := engine.Configure(mic, cable); err != nil {
+			log.Printf("configure engine: %v (running without audio routing)", err)
+		} else if err := engine.Start(); err != nil {
+			log.Printf("start engine: %v (running without audio routing)", err)
+		} else {
+			b.audioRunning = true
+			if spk, ok := resolveSpeakersW(playback); ok {
+				if err := engine.SetMonitor(&spk); err != nil {
+					log.Printf("enable local monitor: %v", err)
+				} else {
+					log.Printf("monitor: clips also play on %q", spk.Name)
+				}
+			} else {
+				log.Printf("no local output device found; you will not hear your own clips")
+			}
+		}
+	} else {
+		log.Printf("VB-CABLE absent: starting in setup mode (no audio routing). Install VB-CABLE and relaunch.")
+	}
+
+	hk := hotkeys.New()
+	hk.OnTrigger(func(clipID string) { engine.TriggerGain(clipID, clipGainW(settings, clipID)) })
+	for combo, clipID := range settings.Hotkeys {
+		if lib.Get(clipID) == nil {
+			log.Printf("hotkey %q: clip %q not found in library", combo, clipID)
+		}
+		if err := hk.Register(combo, clipID); err != nil {
+			log.Printf("hotkey %q: %v", combo, err)
+		}
+	}
+	// Push-to-talk: wire the unified PTT callback to the engine ONCE, then bind the
+	// saved combo through it. Using OnPTT + SetPTT (rather than RegisterPTT with
+	// ad-hoc closures) means App.SetPTTHotkey can re-bind the key LIVE from the UI
+	// through this same engine wiring — no restart needed.
+	hk.OnPTT(func(down bool) { engine.SetPTTDown(down) })
+	if combo := settings.Processing.PTTHotkey; combo != "" {
+		if err := hk.SetPTT(combo); err != nil {
+			log.Printf("PTT hotkey %q: %v", combo, err)
+		} else {
+			log.Printf("push-to-talk bound to %q (used in \"ptt\" mic mode)", combo)
+		}
+	}
+	hk.Run()
+	b.hotkeys = hk
+
+	return b
+}
+
+// close runs the real cleanup ONCE: stop hotkeys, stop the engine, restore the
+// hijacked default mic, save settings, and free the audio context. Order mirrors
+// the Fyne main()'s deferred teardown. closeOnce guarantees it runs exactly once.
+//
+// Each step logs a line AFTER it returns, carrying its own elapsed ms, so a
+// shutdown that wedges is localised straight from the log with no rebuild: the
+// step that hung is the one AFTER the last line printed (the order is the order
+// below), and the "teardown: begin" line alone means it hung on the very first.
+// Timings also make a slow step obvious — these are normally sub-millisecond,
+// so a regression reads as seconds.
+func (b *Backend) close() {
+	b.closeOnce.Do(func() {
+		start := time.Now()
+		log.Printf("teardown: begin")
+		step := func(what string, fn func()) {
+			t := time.Now()
+			fn()
+			log.Printf("teardown: %s (%dms)", what, time.Since(t).Milliseconds())
+		}
+
+		if b.hotkeys != nil {
+			step("hotkeys closed", b.hotkeys.Close)
+		}
+		if b.engine != nil {
+			step("engine stopped", func() { _ = b.engine.Stop() })
+		}
+		if b.setup != nil {
+			step("default mic restored", b.setup.Restore)
+		}
+		if b.settings != nil {
+			step("settings saved", func() {
+				if err := b.settings.Save(); err != nil {
+					log.Printf("save settings: %v", err)
+				}
+			})
+		}
+		if b.ctx != nil {
+			step("audio context uninit", func() { _ = b.ctx.Uninit() })
+			step("audio context freed", func() { b.ctx.Free(); b.ctx = nil })
+		}
+		log.Printf("teardown: complete (%dms total)", time.Since(start).Milliseconds())
+	})
+}
+
+// initLogging mirrors the Fyne main()'s log setup: route diagnostics to the
+// per-user config-dir log file AND mirror to stderr. Returns a closer for the
+// file handle, or a no-op if the log file could not be opened.
+func initLogging() (closeLog func()) {
+	if logPath, err := config.LogPath(); err == nil {
+		if f, ferr := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); ferr == nil {
+			// NOTE: io.MultiWriter aborts on the FIRST writer that errors, so in the
+			// shipping -H=windowsgui build (no console => os.Stderr is an invalid
+			// handle) a failing stderr write silently suppressed the log FILE too.
+			// bestEffortWriter isolates each writer so the file always gets written.
+			log.SetOutput(bestEffortWriter{os.Stderr, f})
+			return func() { _ = f.Close() }
+		}
+	}
+	return func() {}
+}
+
+// bestEffortWriter writes to every underlying writer and never reports an error,
+// so one dead sink (stderr with no console) cannot suppress the others.
+type bestEffortWriter []io.Writer
+
+func (w bestEffortWriter) Write(p []byte) (int, error) {
+	for _, dst := range w {
+		_, _ = dst.Write(p)
+	}
+	return len(p), nil
+}
+
+// ---------------------------------------------------------------------------
+// routingController — the Wails twin of the Fyne build's setupController. It
+// adapts internal/setup to the App: it tracks whether routing is ENGAGED (not
+// just whether the cable is present), captures the restore closure EngageRouting
+// returns, and maps that state to the {state,detail,canEngage} the UI binds.
+// ---------------------------------------------------------------------------
+
+type routingController struct {
+	mu      sync.Mutex
+	status  setup.Status
+	engaged bool
+	restore func() // reverts the default mic; nil until Engage succeeds
+
+	// audioUnavailable means the audio backend itself failed (malgo context init
+	// or device enumeration), so we do not KNOW whether VB-CABLE is present. It is
+	// reported as its own state rather than collapsing to "absent": telling a user
+	// with a working cable to install it sends them into a reinstall loop that
+	// cannot fix an audio-stack problem.
+	audioUnavailable bool
+}
+
+// snapshot maps the live routing state to the binding contract's RoutingStatus.
+// state is "engaged" once the Windows default mic points at CABLE Output;
+// "present" when both cable endpoints exist but routing is not engaged; "absent"
+// otherwise. canEngage mirrors setup.Status.CanEngage (both endpoints present).
+func (r *routingController) snapshot() RoutingStatus {
+	r.mu.Lock()
+	engaged := r.engaged
+	// A non-nil restore closure means THIS session changed the default mic; nil
+	// means it was already pointing at the cable and we left it alone.
+	changedByUs := r.restore != nil
+	st := r.status
+	audioDown := r.audioUnavailable
+	r.mu.Unlock()
+
+	// An audio-stack failure is NOT evidence that VB-CABLE is missing, so it gets
+	// its own state and never offers the installer.
+	if audioDown {
+		return RoutingStatus{State: "unavailable", Detail: "SoundBoard could not start Windows audio, so it cannot tell whether VB-CABLE is installed. Re-check after making sure no other app has exclusive control of your audio devices.", CanEngage: false}
+	}
+
+	// These strings describe only what this process did or can observe locally.
+	//
+	// They deliberately say NOTHING about whether Discord hears the soundboard.
+	// The only fact available here is which device Windows has as the DEFAULT
+	// recording device. Discord keeps its own input-device selection, which may
+	// be pinned to a specific microphone rather than following the default, and
+	// its noise-suppression / gain settings are not readable from outside the
+	// app. Inferring "Discord hears the soundboard" from the default device was
+	// wrong in both directions: it claimed success for a state it could not see,
+	// and it told users no Discord changes were needed when several are (see the
+	// checklist in the Mic & Audio view).
+	switch {
+	case engaged && changedByUs:
+		return RoutingStatus{State: "engaged", Detail: "Default mic set to CABLE Output for this session — restored when you quit.", CanEngage: st.CanEngage}
+	case engaged:
+		return RoutingStatus{State: "engaged", Detail: "CABLE Output is already your default mic — left as it is.", CanEngage: st.CanEngage}
+	case st.CanEngage:
+		return RoutingStatus{State: "present", Detail: "VB-CABLE found — engage routing to point your default mic at it.", CanEngage: true}
+	case st.CableInputPresent:
+		return RoutingStatus{State: "present", Detail: "VB-CABLE Input found, but CABLE Output is missing.", CanEngage: false}
+	default:
+		return RoutingStatus{State: "absent", Detail: "VB-CABLE not detected — install it to route the soundboard into your mic.", CanEngage: false}
+	}
+}
+
+// CanEngage reports whether both cable endpoints are present.
+func (r *routingController) CanEngage() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.status.CanEngage
+}
+
+// Engaged reports whether routing is currently engaged.
+func (r *routingController) Engaged() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.engaged
+}
+
+// Install downloads and runs the VB-CABLE silent installer ELEVATED. It blocks
+// until the installer exits, so the App calls it from a goroutine.
+func (r *routingController) Install() error { return setup.InstallCable(nil) }
+
+// Engage points the Windows default mic at CABLE Output and STORES the restore
+// closure so close() can revert it on quit.
+func (r *routingController) Engage() error {
+	restore, err := setup.EngageRouting()
+	if err != nil {
+		return err
+	}
+	r.mu.Lock()
+	r.restore = restore
+	r.engaged = true
+	r.mu.Unlock()
+	return nil
+}
+
+// Redetect re-enumerates the cable endpoints (e.g. after an install completes)
+// and updates the cached status so snapshot() reflects the new reality. A
+// successful re-enumeration also clears audioUnavailable, since it proves the
+// audio backend is answering again.
+func (r *routingController) Redetect(playback, capture []devices.Device) {
+	status := setup.DetectSystem(playback, capture)
+	r.mu.Lock()
+	r.status = status
+	r.audioUnavailable = false
+	r.mu.Unlock()
+}
+
+// redetect re-enumerates audio devices and refreshes the cached routing status,
+// returning the fresh snapshot. Without this the status cached at process start
+// is the ONLY one a session ever has: "absent" was terminal for the run, so a
+// cable that appeared mid-session (the whole point of installing one) stayed
+// invisible until the user restarted the app, and a single transient enumeration
+// failure at boot poisoned the entire session into "install VB-CABLE".
+func (b *Backend) redetect() RoutingStatus {
+	if b.ctx == nil {
+		return b.setup.snapshot()
+	}
+	playback, capture, err := devices.Enumerate(b.ctx)
+	if err != nil {
+		log.Printf("redetect: enumerate devices: %v", err)
+		return b.setup.snapshot()
+	}
+	b.setup.Redetect(playback, capture)
+	st := b.setup.snapshot()
+	if !st.CanEngage {
+		log.Printf("redetect: VB-CABLE still not usable (state %q)", st.State)
+		logDeviceInventory(playback, capture)
+	}
+	return st
+}
+
+// logDeviceInventory writes the full enumerated device list to soundboard.log.
+// It runs only when the cable is missing — precisely when a remote user's log is
+// the only evidence available, and when the bare "VB-CABLE not detected" line
+// cannot distinguish a genuinely absent driver from an endpoint that was
+// renamed, disabled, or enumerated under an unexpected name.
+func logDeviceInventory(playback, capture []devices.Device) {
+	log.Printf("device inventory: %d playback, %d capture (endpoints DISABLED in Windows Sound settings do not appear here)", len(playback), len(capture))
+	for _, d := range playback {
+		log.Printf("  playback: %q%s", d.Name, defaultSuffix(d.IsDefault))
+	}
+	for _, d := range capture {
+		log.Printf("  capture : %q%s", d.Name, defaultSuffix(d.IsDefault))
+	}
+}
+
+func defaultSuffix(isDefault bool) string {
+	if isDefault {
+		return " [default]"
+	}
+	return ""
+}
+
+// alreadyDefaultRouted reports whether the Windows default capture endpoint is
+// ALREADY "CABLE Output" — the one non-error outcome of Engage() that actually
+// means routing is live (Discord hears the board) even though EngageRouting
+// returned an error because there was nothing to hijack. Uses the same public
+// winaudio API setup itself uses, comparing the current default-capture id to
+// the CABLE Output endpoint id; any lookup failure is reported as "not routed"
+// so the caller falls back to the plain not-engaged banner.
+func (r *routingController) alreadyDefaultRouted() bool {
+	defID, err := winaudio.DefaultCaptureID()
+	if err != nil {
+		return false
+	}
+	cableID, err := winaudio.FindCaptureEndpointID("CABLE Output")
+	if err != nil {
+		return false
+	}
+	return defID != "" && defID == cableID
+}
+
+// markEngagedNoRestore flags routing as engaged WITHOUT a restore closure. Used
+// only for the already-default case above: routing is effectively engaged, but
+// because we did not change the default ourselves we deliberately leave restore
+// nil so quit does not revert a default the user/previous session established.
+func (r *routingController) markEngagedNoRestore() {
+	r.mu.Lock()
+	r.engaged = true
+	r.restore = nil
+	r.mu.Unlock()
+}
+
+// Restore reverts the default-mic hijack if routing was engaged. Safe to call
+// when not engaged (no-op).
+func (r *routingController) Restore() {
+	r.mu.Lock()
+	restore := r.restore
+	r.restore = nil
+	r.engaged = false
+	r.mu.Unlock()
+	if restore != nil {
+		restore()
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Bootstrap helpers — the Wails twins of main.go's resolve/apply functions (the
+// fyne build keeps its own copies behind the fyne tag). The trailing "W"
+// disambiguates them from the fyne-tagged originals so the two never collide.
+// ---------------------------------------------------------------------------
+
+func applyVolumesW(engine *audio.Engine, s *config.Settings) {
+	engine.SetMicGain(s.Volumes.MicGain())
+	engine.SetMasterGain(s.Volumes.MasterGain())
+	engine.SetMonitorGain(s.Volumes.MonitorGain())
+}
+
+func applyProcessingW(engine *audio.Engine, s *config.Settings) {
+	engine.SetMicMode(s.Processing.MicMode)
+	engine.SetGateSensitivity(s.Processing.GateSensitivity)
+	// Noise suppression is the TIER now (none/standard/high/strong); the legacy
+	// SetNoiseSuppression bool path is superseded.
+	engine.SetNoiseSuppressionTier(s.Processing.NoiseSuppressionTier)
+	engine.SetEchoCancellation(s.Processing.EchoCancellation)
+	// Advanced VAD + auto-sensitivity default ON; read through the accessors so an
+	// unset (nil) pointer seeds the engine ON rather than OFF.
+	engine.SetAdvancedVoiceActivity(s.Processing.AdvancedVAD())
+	engine.SetAutoSensitivity(s.Processing.AutoSens())
+	engine.SetAttenuationAmount(s.Processing.AttenuationAmount)
+	engine.SetAGC(s.Processing.AGC)
+	engine.SetDucking(s.Processing.Ducking)
+	engine.SetForceThrough(s.Processing.ForceThrough)
+	engine.SetMonitorSource(s.Processing.MonitorSource)
+}
+
+func clipGainW(s *config.Settings, id string) float32 {
+	if s.Volumes.PerClip != nil {
+		if g, ok := s.Volumes.PerClip[id]; ok {
+			return g
+		}
+	}
+	return 1
+}
+
+func isCableNameW(name string) bool {
+	return strings.Contains(strings.ToUpper(name), "CABLE")
+}
+
+func resolveMicW(capture []devices.Device, name string) (devices.Device, bool) {
+	if name != "" && !isCableNameW(name) {
+		if d, ok := devices.FindByName(capture, name); ok {
+			return d, true
+		}
+	}
+	if d, ok := setup.PreviousDefaultMic(); ok && !isCableNameW(d.Name) {
+		return d, true
+	}
+	if d, ok := devices.DefaultMic(capture); ok && !isCableNameW(d.Name) {
+		return d, true
+	}
+	for _, d := range capture {
+		if !isCableNameW(d.Name) {
+			return d, true
+		}
+	}
+	return devices.Device{}, false
+}
+
+func resolveCableW(playback []devices.Device, name string) (devices.Device, bool) {
+	if name != "" {
+		if d, ok := devices.FindByName(playback, name); ok {
+			return d, true
+		}
+	}
+	// Name needles first, then the cable's adapter-property identity — so the
+	// engine finds a renamed cable endpoint the same way detection does.
+	return setup.ResolveCableDevice(playback)
+}
+
+func resolveSpeakersW(playback []devices.Device) (devices.Device, bool) {
+	var fallback devices.Device
+	var haveFallback bool
+	for _, d := range playback {
+		if isCableNameW(d.Name) {
+			continue
+		}
+		if !haveFallback {
+			fallback, haveFallback = d, true
+		}
+		if d.IsDefault {
+			return d, true
+		}
+	}
+	return fallback, haveFallback
+}
+
