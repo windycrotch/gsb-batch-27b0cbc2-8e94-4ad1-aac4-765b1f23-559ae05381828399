@@ -666,7 +666,12 @@ func (s *RTMPSession) HandlePlay(cmd *RTMPCommand, packet *RTMPPacket) bool {
 
 	s.playStreamId = packet.header.stream_id
 
-	if s.isIdling || s.isPlaying {
+	// Read the player state under the server mutex: the publisher goroutine
+	// flips these flags concurrently when streams end.
+	s.server.mutex.Lock()
+	alreadyPlaying := s.isIdling || s.isPlaying
+	s.server.mutex.Unlock()
+	if alreadyPlaying {
 		s.SendStatusMessage(s.playStreamId, "error", "NetStream.Play.BadConnection", "Connection already playing")
 		return true
 	}
@@ -705,13 +710,19 @@ func (s *RTMPSession) HandlePlay(cmd *RTMPCommand, packet *RTMPPacket) bool {
 // Handles a pause command
 // cmd - The command
 func (s *RTMPSession) HandlePause(cmd *RTMPCommand) bool {
-	if !s.isPlaying {
+	s.server.mutex.Lock()
+	playing := s.isPlaying
+	s.server.mutex.Unlock()
+	if !playing {
 		return true
 	}
 
+	s.server.mutex.Lock()
 	s.isPause = cmd.GetArg("pause").GetBool()
+	paused := s.isPause
+	s.server.mutex.Unlock()
 
-	if s.isPause {
+	if paused {
 		s.SendStreamStatus(STREAM_EOF, s.playStreamId)
 		s.SendStatusMessage(s.playStreamId, "status", "NetStream.Pause.Notify", "Paused live")
 		LogRequest(s.id, s.ip, "PAUSE '"+s.channel+"'")
@@ -741,13 +752,12 @@ func (s *RTMPSession) HandleDeleteStream(cmd *RTMPCommand) bool {
 		// Close play
 		LogRequest(s.id, s.ip, "PLAY STOP '"+s.channel+"'")
 
+		// RemovePlayer resets isPlaying/isIdling under the server mutex.
 		s.server.RemovePlayer(s.channel, s.key, s)
 
 		s.SendStatusMessage(s.playStreamId, "status", "NetStream.Play.Stop", "Stopped playing stream.")
 
 		s.playStreamId = 0
-		s.isPlaying = false
-		s.isIdling = false
 	}
 
 	if streamId == s.publishStreamId {
@@ -771,11 +781,10 @@ func (s *RTMPSession) DeleteStream(streamId uint32) {
 		// Close play
 		LogDebugSession(s.id, s.ip, "Close play stream: "+strconv.Itoa(int(streamId)))
 
+		// RemovePlayer resets isPlaying/isIdling under the server mutex.
 		s.server.RemovePlayer(s.channel, s.key, s)
 
 		s.playStreamId = 0
-		s.isPlaying = false
-		s.isIdling = false
 	}
 
 	if streamId == s.publishStreamId {
@@ -849,7 +858,10 @@ func (s *RTMPSession) HandleAudioPacket(packet *RTMPPacket) bool {
 	players := s.server.GetPlayers(s.channel)
 
 	for i := 0; i < len(players); i++ {
-		if players[i].isPlaying && !players[i].isPause && players[i].receive_audio {
+		players[i].server.mutex.Lock()
+		canReceive := players[i].isPlaying && !players[i].isPause && players[i].receive_audio
+		players[i].server.mutex.Unlock()
+		if canReceive {
 			players[i].SendCachePacket(&cachePacket)
 		}
 	}
@@ -910,7 +922,10 @@ func (s *RTMPSession) HandleVideoPacket(packet *RTMPPacket) bool {
 	players := s.server.GetPlayers(s.channel)
 
 	for i := 0; i < len(players); i++ {
-		if players[i].isPlaying && !players[i].isPause && players[i].receive_video {
+		players[i].server.mutex.Lock()
+		canReceive := players[i].isPlaying && !players[i].isPause && players[i].receive_video
+		players[i].server.mutex.Unlock()
+		if canReceive {
 			players[i].SendCachePacket(&cachePacket)
 		}
 	}

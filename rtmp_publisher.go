@@ -36,8 +36,9 @@ func (s *RTMPSession) StartIdlePlayers() {
 				}
 			}
 
-			player.isPlaying = true
-			player.isIdling = false
+			// Player state flags are always mutated under the server mutex so
+			// concurrent end/leave operations cannot interleave with them.
+			s.server.setPlayerPlaying(player)
 
 			if player.gopPlayClear {
 				s.rtmpGopCache = list.New()
@@ -47,7 +48,12 @@ func (s *RTMPSession) StartIdlePlayers() {
 		} else {
 			LogRequest(idlePlayers[i].id, idlePlayers[i].ip, "Error: Invalid stream key provided")
 			idlePlayers[i].SendStatusMessage(s.playStreamId, "error", "NetStream.Play.BadName", "Invalid stream key provided")
-			idlePlayers[i].Kill()
+			// Detach before closing: a killed session must never remain
+			// referenced by the channel, and its slot must be released so the
+			// channel can later be cleaned up correctly.
+			badPlayer := idlePlayers[i]
+			s.server.RemovePlayer(s.channel, badPlayer.key, badPlayer)
+			badPlayer.Kill()
 		}
 
 	}
@@ -61,8 +67,7 @@ func (s *RTMPSession) StartPlayer(player *RTMPSession) {
 	defer s.publish_mutex.Unlock()
 
 	if !s.isPublishing {
-		player.isPlaying = false
-		player.isIdling = true
+		s.server.setPlayerIdle(player)
 		LogRequest(player.id, player.ip, "PLAY IDLE '"+player.channel+"'")
 		return
 	}
@@ -83,8 +88,7 @@ func (s *RTMPSession) StartPlayer(player *RTMPSession) {
 		}
 	}
 
-	player.isPlaying = true
-	player.isIdling = false
+	s.server.setPlayerPlaying(player)
 
 	if player.gopPlayClear {
 		s.rtmpGopCache = list.New()
@@ -107,47 +111,56 @@ func (s *RTMPSession) ResumePlayer(player *RTMPSession) {
 // Finishes a publishing session
 // Call only for publishers
 // isClose - True if it was closed due to a disconnection
+//
+// Exactly-once: the whole teardown (publisher removal, player -> idle
+// transition and end notifications) runs only while s.isPublishing is true
+// and is cleared inside the same guarded section. A duplicate invocation
+// (e.g. deleteStream followed by connection close) performs nothing, so
+// viewers receive a single end notification and the channel state is never
+// rewritten a second time.
 func (s *RTMPSession) EndPublish(isClose bool) {
 	s.publish_mutex.Lock()
 	defer s.publish_mutex.Unlock()
 
-	if s.isPublishing {
+	if !s.isPublishing {
+		return
+	}
 
-		LogRequest(s.id, s.ip, "PUBLISH END '"+s.channel+"'")
+	LogRequest(s.id, s.ip, "PUBLISH END '"+s.channel+"'")
 
-		if !isClose {
-			s.SendStatusMessage(s.publishStreamId, "status", "NetStream.Unpublish.Success", s.GetStreamPath()+" is now unpublished.")
-		}
+	if !isClose {
+		s.SendStatusMessage(s.publishStreamId, "status", "NetStream.Unpublish.Success", s.GetStreamPath()+" is now unpublished.")
+	}
 
-		players := s.server.GetPlayers(s.channel)
+	// Atomically clear the publisher and move every active player back to
+	// idle. The snapshot only contains players that were actually playing, so
+	// the end notification is sent exactly once per viewer.
+	players := s.server.EndPublisher(s.channel)
 
-		for i := 0; i < len(players); i++ {
-			players[i].isIdling = true
-			players[i].isPlaying = false
-			LogRequest(players[i].id, players[i].ip, "PLAY IDLE '"+players[i].channel+"'")
-			players[i].SendStatusMessage(players[i].playStreamId, "status", "NetStream.Play.UnpublishNotify", "stream is now unpublished.")
-			players[i].SendStreamStatus(STREAM_EOF, players[i].playStreamId)
-		}
+	for i := 0; i < len(players); i++ {
+		LogRequest(players[i].id, players[i].ip, "PLAY IDLE '"+players[i].channel+"'")
+		players[i].SendStatusMessage(players[i].playStreamId, "status", "NetStream.Play.UnpublishNotify", "stream is now unpublished.")
+		players[i].SendStreamStatus(STREAM_EOF, players[i].playStreamId)
+	}
 
-		s.server.RemovePublisher(s.channel)
+	s.rtmpGopCache = list.New()
 
-		s.rtmpGopCache = list.New()
+	// Mark the session as no longer publishing inside the same guarded section
+	// so a concurrent re-entry observes the finished state.
+	s.isPublishing = false
 
-		s.isPublishing = false
-
-		// Send event
-		if s.server.websocketControlConnection != nil {
-			if s.server.websocketControlConnection.PublishEnd(s.channel, s.stream_id) {
-				LogDebugSession(s.id, s.ip, "Stop event sent")
-			} else {
-				LogDebugSession(s.id, s.ip, "Could not send stop event")
-			}
+	// Send event
+	if s.server.websocketControlConnection != nil {
+		if s.server.websocketControlConnection.PublishEnd(s.channel, s.stream_id) {
+			LogDebugSession(s.id, s.ip, "Stop event sent")
 		} else {
-			if s.SendStopCallback() {
-				LogDebugSession(s.id, s.ip, "Stop event sent")
-			} else {
-				LogDebugSession(s.id, s.ip, "Could not send stop event")
-			}
+			LogDebugSession(s.id, s.ip, "Could not send stop event")
+		}
+	} else {
+		if s.SendStopCallback() {
+			LogDebugSession(s.id, s.ip, "Stop event sent")
+		} else {
+			LogDebugSession(s.id, s.ip, "Could not send stop event")
 		}
 	}
 }

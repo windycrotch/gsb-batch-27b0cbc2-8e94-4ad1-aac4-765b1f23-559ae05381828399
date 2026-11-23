@@ -21,6 +21,13 @@ type RTMPChannel struct {
 	channel string // The channel ID
 	key     string // The channel key
 
+	// True when the key field holds the key of a publisher (active or the most
+	// recent one). While true, joining players must present a matching key,
+	// even if the channel is temporarily idle between two publishing sessions.
+	// Reset to false only when the channel record is deleted, so an idle
+	// channel created solely by waiting players does not enforce a stale key.
+	hasPublisherKey bool
+
 	is_publishing bool   // True if there is an stream being published
 	publisher     uint64 // The ID of the session that is publishing
 
@@ -345,16 +352,18 @@ func (server *RTMPServer) SetPublisher(channel string, key string, stream_id str
 
 	if server.channels[channel] == nil {
 		c := RTMPChannel{
-			channel:       channel,
-			key:           key,
-			stream_id:     stream_id,
-			is_publishing: true,
-			publisher:     s.id,
-			players:       make(map[uint64]bool),
+			channel:         channel,
+			key:             key,
+			hasPublisherKey: true,
+			stream_id:       stream_id,
+			is_publishing:   true,
+			publisher:       s.id,
+			players:         make(map[uint64]bool),
 		}
 		server.channels[channel] = &c
 	} else {
 		server.channels[channel].key = key
+		server.channels[channel].hasPublisherKey = true
 		server.channels[channel].stream_id = stream_id
 		server.channels[channel].is_publishing = true
 		server.channels[channel].publisher = s.id
@@ -363,32 +372,51 @@ func (server *RTMPServer) SetPublisher(channel string, key string, stream_id str
 	return true
 }
 
-// Removes the current publisher for a given channel
-// channel - The channel ID
-func (server *RTMPServer) RemovePublisher(channel string) {
+// EndPublisher tears down the active publisher of a channel.
+// Idempotent: a repeated invocation while no publisher is active is a no-op
+// and returns an empty snapshot, so a duplicated end event can neither rewrite
+// the channel state nor move the players back to idle a second time.
+//
+// All state changes (channel flags and each player's isIdling/isPlaying flags)
+// happen atomically under server.mutex. It returns the snapshot of players
+// that were actively playing, so the caller can send end notifications outside
+// the lock without risking a deadlock against the connection mutex.
+func (server *RTMPServer) EndPublisher(channel string) []*RTMPSession {
 	server.mutex.Lock()
 	defer server.mutex.Unlock()
 
-	if server.channels[channel] == nil {
-		return
+	c := server.channels[channel]
+	if c == nil || !c.is_publishing {
+		return make([]*RTMPSession, 0)
 	}
 
-	server.channels[channel].publisher = 0
-	server.channels[channel].is_publishing = false
+	activePlayers := make([]*RTMPSession, 0)
 
-	players := server.channels[channel].players
-
-	for sid := range players {
+	// Every player returns to the waiting state. They stay registered on the
+	// channel so the next publisher can pick them up (key permitting).
+	for sid := range c.players {
 		player := server.sessions[sid]
-		if player != nil {
-			player.isIdling = true
-			player.isPlaying = false
+		if player == nil {
+			continue
 		}
+		if player.isPlaying {
+			activePlayers = append(activePlayers, player)
+		}
+		player.isIdling = true
+		player.isPlaying = false
 	}
 
-	if !server.channels[channel].is_publishing && len(server.channels[channel].players) == 0 {
+	c.publisher = 0
+	c.is_publishing = false
+
+	// The authoritative key is retained (hasPublisherKey stays true) while
+	// idle players remain, so wrong-key joiners are still rejected. Only when
+	// nobody is left do we drop the whole channel record.
+	if len(c.players) == 0 {
 		delete(server.channels, channel)
 	}
+
+	return activePlayers
 }
 
 // Obtains the list of idle players for a given channel
@@ -441,6 +469,27 @@ func (server *RTMPServer) GetPlayers(channel string) []*RTMPSession {
 	return playersToStart
 }
 
+// Marks a player session as receiving the stream.
+// All isPlaying/isIdling transitions go through here under server.mutex so
+// publishers (other goroutines) and the player's own session never race on
+// these flags.
+func (server *RTMPServer) setPlayerPlaying(s *RTMPSession) {
+	server.mutex.Lock()
+	defer server.mutex.Unlock()
+
+	s.isPlaying = true
+	s.isIdling = false
+}
+
+// Marks a player session as waiting for the stream.
+func (server *RTMPServer) setPlayerIdle(s *RTMPSession) {
+	server.mutex.Lock()
+	defer server.mutex.Unlock()
+
+	s.isPlaying = false
+	s.isIdling = true
+}
+
 // Adds a player to a given channel
 // channel - The channel ID
 // key - The channel key used by the player
@@ -455,27 +504,34 @@ func (server *RTMPServer) AddPlayer(channel string, key string, s *RTMPSession) 
 
 	if server.channels[channel] == nil {
 		c := RTMPChannel{
-			channel:       channel,
-			key:           key,
-			stream_id:     "",
-			is_publishing: false,
-			publisher:     0,
-			players:       make(map[uint64]bool),
+			channel:         channel,
+			key:             key,
+			hasPublisherKey: false, // Created by waiting players: no authoritative key yet
+			stream_id:       "",
+			is_publishing:   false,
+			publisher:       0,
+			players:         make(map[uint64]bool),
 		}
 		server.channels[channel] = &c
 	}
 
-	if server.channels[channel].is_publishing {
-		if subtle.ConstantTimeCompare([]byte(key), []byte(server.channels[channel].key)) == 1 {
-			s.isIdling = false
-		} else {
-			return false, errors.New("invalid key")
-		}
+	c := server.channels[channel]
+
+	// A channel keeps the key of its (last) publisher while it is idle between
+	// publishing sessions. A joining viewer must match it, otherwise it is
+	// refused immediately instead of slipping into the waiting state.
+	if c.hasPublisherKey && subtle.ConstantTimeCompare([]byte(key), []byte(c.key)) != 1 {
+		return false, errors.New("invalid key")
+	}
+
+	if c.is_publishing {
+		// Key was already validated above.
+		s.isIdling = false
 	} else {
 		s.isIdling = true
 	}
 
-	server.channels[channel].players[s.id] = true
+	c.players[s.id] = true
 
 	return s.isIdling, nil
 }
@@ -484,16 +540,27 @@ func (server *RTMPServer) AddPlayer(channel string, key string, s *RTMPSession) 
 // channel - The channel ID
 // s - The session
 func (server *RTMPServer) RemovePlayer(channel string, key string, s *RTMPSession) {
-	if server.channels[channel] == nil {
+	server.mutex.Lock()
+	defer server.mutex.Unlock()
+
+	c := server.channels[channel]
+	if c == nil {
+		// The channel may already have been cleaned up after the publisher and
+		// the rest of the players left. Just reset the local session state.
+		s.isIdling = false
+		s.isPlaying = false
 		return
 	}
 
-	delete(server.channels[channel].players, s.id)
+	delete(c.players, s.id)
 
 	s.isIdling = false
 	s.isPlaying = false
 
-	if !server.channels[channel].is_publishing && len(server.channels[channel].players) == 0 {
+	// Once nobody is publishing and nobody is waiting, the record must not
+	// linger, otherwise the next publisher would be rejected as "already
+	// publishing".
+	if !c.is_publishing && len(c.players) == 0 {
 		delete(server.channels, channel)
 	}
 }
