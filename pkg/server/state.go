@@ -28,4 +28,5 @@ type Clock interface {
 	Join(*game.Player)
 	Spawned(*game.Player)
 	Leave(*game.Player)
+	Disconnect(*game.Player)
 }

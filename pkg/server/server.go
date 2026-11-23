@@ -214,8 +214,10 @@ func (s *Server) ConfirmSpawn(client *Client, lifeSequence, _weapon int32) {
 func (s *Server) Disconnect(client *Client, reason disconnectreason.ID) {
 	if client.State != playerstate.Spectator {
 		s.GameMode.Leave(&client.Player)
-		s.Clock.Leave(&client.Player)
 	}
+	// always notify the clock, even for spectators: a spectator may hold a
+	// manual pause, and no holder referencing a gone player may survive
+	s.Clock.Disconnect(&client.Player)
 	s.relay.RemoveClient(client.CN)
 	s.Clients.Disconnect(client, reason)
 	// s.Clients.ForEach(func(c *Client) { log.Printf("%#v\n", c) })
