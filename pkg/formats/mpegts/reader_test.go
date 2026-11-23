@@ -2665,6 +2665,274 @@ func TestReaderMPEG4AudioAcrossPES(t *testing.T) {
 	}, recv)
 }
 
+func testMPEG4AudioFrame(t *testing.T, fill byte, auLen int) []byte {
+	frame, err := mpeg4audio.ADTSPackets{{
+		Type:          mpeg4audio.ObjectTypeAACLC,
+		SampleRate:    48000,
+		ChannelConfig: 2,
+		AU:            bytes.Repeat([]byte{fill}, auLen),
+	}}.Marshal()
+	require.NoError(t, err)
+	return frame
+}
+
+type testMPEG4AudioPES struct {
+	pid  uint16
+	pts  int64
+	data []byte
+}
+
+func testMPEG4AudioStream(t *testing.T, pids []uint16, pess []testMPEG4AudioPES) []byte {
+	var buf bytes.Buffer
+	mux := astits.NewMuxer(context.Background(), &buf)
+
+	for _, pid := range pids {
+		err := mux.AddElementaryStream(astits.PMTElementaryStream{
+			ElementaryPID: pid,
+			StreamType:    astits.StreamTypeAACAudio,
+		})
+		require.NoError(t, err)
+	}
+
+	mux.SetPCRPID(pids[0])
+
+	for _, pes := range pess {
+		_, err := mux.WriteData(&astits.MuxerData{
+			PID: pes.pid,
+			PES: &astits.PESData{
+				Header: &astits.PESHeader{
+					OptionalHeader: &astits.PESOptionalHeader{
+						MarkerBits:      2,
+						PTSDTSIndicator: astits.PTSDTSIndicatorOnlyPTS,
+						PTS:             &astits.ClockReference{Base: pes.pts},
+					},
+					StreamID: 192,
+				},
+				Data: pes.data,
+			},
+		})
+		require.NoError(t, err)
+	}
+
+	return buf.Bytes()
+}
+
+func testReadAll(t *testing.T, r *mpegts.Reader) {
+	for {
+		err := r.Read()
+		if err != nil {
+			require.ErrorIs(t, io.EOF, err)
+			break
+		}
+	}
+}
+
+func TestReaderMPEG4AudioInvalidDataRecovery(t *testing.T) {
+	frame0 := testMPEG4AudioFrame(t, 1, 20)
+	frame1 := testMPEG4AudioFrame(t, 2, 20)
+	frame2 := testMPEG4AudioFrame(t, 3, 15)
+	frame3 := testMPEG4AudioFrame(t, 4, 15)
+
+	// 1920 is the duration of an access unit at 48khz.
+	byts := testMPEG4AudioStream(t, []uint16{123}, []testMPEG4AudioPES{
+		{123, 90000, bytes.Join([][]byte{frame0, frame1[:10]}, nil)},
+		// garbage that completes frame1's declared length with invalid
+		// content: the residual must be reported and discarded.
+		{123, 90000 + 1920, bytes.Repeat([]byte{0x00}, 20)},
+		// the following PES packets must be parsed normally,
+		// with PTS values that are not polluted by the garbage.
+		{123, 90000 + 3*1920, frame2},
+		{123, 90000 + 4*1920, frame3[:10]},
+		{123, 90000 + 5*1920, frame3[10:]},
+	})
+
+	r, err := mpegts.NewReader(bytes.NewReader(byts))
+	require.NoError(t, err)
+
+	type sample struct {
+		pts int64
+		aus [][]byte
+	}
+	var recv []sample
+
+	r.OnDataMPEG4Audio(r.Tracks()[0], func(pts int64, aus [][]byte) error {
+		recv = append(recv, sample{pts, aus})
+		return nil
+	})
+
+	var decErrs []string
+
+	r.OnDecodeError(func(err error) {
+		decErrs = append(decErrs, err.Error())
+	})
+
+	testReadAll(t, r)
+
+	require.Equal(t, []string{"invalid ADTS: invalid length"}, decErrs)
+
+	require.Equal(t, []sample{
+		{90000, [][]byte{frame0[7:]}},
+		{90000 + 3*1920, [][]byte{frame2[7:]}},
+		{90000 + 4*1920, [][]byte{frame3[7:]}},
+	}, recv)
+}
+
+func TestReaderMPEG4AudioReinitialize(t *testing.T) {
+	frame0 := testMPEG4AudioFrame(t, 1, 20)
+	frame1 := testMPEG4AudioFrame(t, 2, 20)
+	frame2 := testMPEG4AudioFrame(t, 3, 15)
+
+	// the first stream ends with an incomplete frame.
+	stream1 := testMPEG4AudioStream(t, []uint16{123}, []testMPEG4AudioPES{
+		{123, 90000, bytes.Join([][]byte{frame0, frame1[:10]}, nil)},
+	})
+
+	stream2 := testMPEG4AudioStream(t, []uint16{123}, []testMPEG4AudioPES{
+		{123, 45000, frame2},
+	})
+
+	r := &mpegts.Reader{R: bytes.NewReader(stream1)}
+	err := r.Initialize()
+	require.NoError(t, err)
+
+	type sample struct {
+		pts int64
+		aus [][]byte
+	}
+	var recv []sample
+
+	r.OnDataMPEG4Audio(r.Tracks()[0], func(pts int64, aus [][]byte) error {
+		recv = append(recv, sample{pts, aus})
+		return nil
+	})
+
+	r.OnDecodeError(func(err error) {
+		t.Errorf("unexpected decode error: %v", err)
+	})
+
+	testReadAll(t, r)
+
+	require.Equal(t, []sample{
+		{90000, [][]byte{frame0[7:]}},
+	}, recv)
+
+	// re-initialize on a new stream: the residual half-frame and its PTS
+	// must not leak into the new stream.
+	r.R = bytes.NewReader(stream2)
+	err = r.Initialize()
+	require.NoError(t, err)
+
+	r.OnDataMPEG4Audio(r.Tracks()[0], func(pts int64, aus [][]byte) error {
+		recv = append(recv, sample{pts, aus})
+		return nil
+	})
+
+	r.OnDecodeError(func(err error) {
+		t.Errorf("unexpected decode error: %v", err)
+	})
+
+	testReadAll(t, r)
+
+	require.Equal(t, []sample{
+		{90000, [][]byte{frame0[7:]}},
+		{45000, [][]byte{frame2[7:]}},
+	}, recv)
+}
+
+func TestReaderMPEG4AudioReRegister(t *testing.T) {
+	frame0 := testMPEG4AudioFrame(t, 1, 20)
+	frame1 := testMPEG4AudioFrame(t, 2, 20)
+	frame2 := testMPEG4AudioFrame(t, 3, 15)
+
+	byts := testMPEG4AudioStream(t, []uint16{123}, []testMPEG4AudioPES{
+		{123, 90000, bytes.Join([][]byte{frame0, frame1[:10]}, nil)},
+		{123, 90000 + 2*1920, frame2},
+	})
+
+	r, err := mpegts.NewReader(bytes.NewReader(byts))
+	require.NoError(t, err)
+
+	type sample struct {
+		pts int64
+		aus [][]byte
+	}
+	var recv []sample
+
+	r.OnDataMPEG4Audio(r.Tracks()[0], func(pts int64, aus [][]byte) error {
+		recv = append(recv, sample{pts, aus})
+
+		// re-registering the callback must discard the residual
+		// half-frame (frame1[:10]) and its PTS.
+		r.OnDataMPEG4Audio(r.Tracks()[0], func(pts2 int64, aus2 [][]byte) error {
+			recv = append(recv, sample{pts2, aus2})
+			return nil
+		})
+
+		return nil
+	})
+
+	r.OnDecodeError(func(err error) {
+		t.Errorf("unexpected decode error: %v", err)
+	})
+
+	testReadAll(t, r)
+
+	require.Equal(t, []sample{
+		{90000, [][]byte{frame0[7:]}},
+		{90000 + 2*1920, [][]byte{frame2[7:]}},
+	}, recv)
+}
+
+func TestReaderMPEG4AudioMultipleTracks(t *testing.T) {
+	frameA0 := testMPEG4AudioFrame(t, 1, 20)
+	frameA1 := testMPEG4AudioFrame(t, 2, 20)
+	frameB0 := testMPEG4AudioFrame(t, 3, 15)
+
+	byts := testMPEG4AudioStream(t, []uint16{123, 124}, []testMPEG4AudioPES{
+		{123, 90000, bytes.Join([][]byte{frameA0, frameA1[:10]}, nil)},
+		{124, 70000, frameB0},
+		{123, 90000 + 2*1920, frameA1[10:]},
+	})
+
+	r, err := mpegts.NewReader(bytes.NewReader(byts))
+	require.NoError(t, err)
+	require.Len(t, r.Tracks(), 2)
+
+	type sample struct {
+		pts int64
+		aus [][]byte
+	}
+	var recvA []sample
+	var recvB []sample
+
+	r.OnDataMPEG4Audio(r.Tracks()[0], func(pts int64, aus [][]byte) error {
+		recvA = append(recvA, sample{pts, aus})
+		return nil
+	})
+
+	r.OnDataMPEG4Audio(r.Tracks()[1], func(pts int64, aus [][]byte) error {
+		recvB = append(recvB, sample{pts, aus})
+		return nil
+	})
+
+	r.OnDecodeError(func(err error) {
+		t.Errorf("unexpected decode error: %v", err)
+	})
+
+	testReadAll(t, r)
+
+	// the residual half-frame of track A must not leak into track B,
+	// and track A must resume it with its own PTS.
+	require.Equal(t, []sample{
+		{90000, [][]byte{frameA0[7:]}},
+		{90000 + 1920, [][]byte{frameA1[7:]}},
+	}, recvA)
+
+	require.Equal(t, []sample{
+		{70000, [][]byte{frameB0[7:]}},
+	}, recvB)
+}
+
 func TestReaderAC3MultipleFramesPerPES(t *testing.T) {
 	newFrame := func(fill byte) []byte {
 		// fscod = 0 (48khz), frmsizecod = 0 (128 bytes)

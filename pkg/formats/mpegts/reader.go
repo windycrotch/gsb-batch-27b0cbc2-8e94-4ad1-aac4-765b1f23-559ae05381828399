@@ -203,16 +203,28 @@ func splitEAC3Frames(data []byte) ([][]byte, error) {
 	return append(frames, data[start:]), nil
 }
 
+// mpeg4AudioState is the state needed to reassemble MPEG-4 Audio frames
+// that are split across PES packets.
+// It is bound to the Reader lifecycle: it is created when a callback is
+// registered with OnDataMPEG4Audio and discarded when the Reader is
+// initialized or when the callback is registered again.
+type mpeg4AudioState struct {
+	// start of a frame that ends in one of the next PES packets, and its PTS.
+	partial    []byte
+	partialPTS int64
+}
+
 // Reader is a MPEG-TS reader.
 type Reader struct {
 	R io.Reader
 
-	tracks        []*Track
-	tracksByPID   map[uint16]*Track
-	preDem        *preDemuxer
-	dem           *robustDemuxer
-	onDecodeError ReaderOnDecodeErrorFunc
-	onData        map[uint16]func(int64, int64, []byte) error
+	tracks           []*Track
+	tracksByPID      map[uint16]*Track
+	preDem           *preDemuxer
+	dem              *robustDemuxer
+	onDecodeError    ReaderOnDecodeErrorFunc
+	onData           map[uint16]func(int64, int64, []byte) error
+	mpeg4AudioStates map[uint16]*mpeg4AudioState
 }
 
 // Initialize initializes a Reader.
@@ -251,6 +263,7 @@ func (r *Reader) Initialize() error {
 
 	r.onDecodeError = func(_ error) {}
 	r.onData = make(map[uint16]func(int64, int64, []byte) error)
+	r.mpeg4AudioStates = make(map[uint16]*mpeg4AudioState)
 
 	return nil
 }
@@ -413,9 +426,11 @@ func (r *Reader) OnDataOpus(track *Track, cb ReaderOnDataOpusFunc) {
 
 // OnDataMPEG4Audio sets a callback that is called when data from an MPEG-4 Audio track is received.
 func (r *Reader) OnDataMPEG4Audio(track *Track, cb ReaderOnDataMPEG4AudioFunc) {
-	// start of a frame that ends in one of the next PES packets, and its PTS.
-	var partial []byte
-	var partialPTS int64
+	// the reassembly state is bound to the Reader lifecycle:
+	// it starts empty here and is discarded by Initialize
+	// or by the next registration on the same track.
+	state := &mpeg4AudioState{}
+	r.mpeg4AudioStates[track.PID] = state
 
 	r.onData[track.PID] = func(pts int64, dts int64, data []byte) error {
 		if pts != dts {
@@ -425,10 +440,10 @@ func (r *Reader) OnDataMPEG4Audio(track *Track, cb ReaderOnDataMPEG4AudioFunc) {
 
 		// the PTS of a PES packet is the one of the first frame that starts in it
 		// (ISO 13818-1, 2.4.3.7), so a frame that started before keeps its own PTS.
-		resumed := len(partial) != 0
+		resumed := len(state.partial) != 0
 		if resumed {
-			joined := make([]byte, len(partial)+len(data))
-			n := copy(joined, partial)
+			joined := make([]byte, len(state.partial)+len(data))
+			n := copy(joined, state.partial)
 			copy(joined[n:], data)
 			data = joined
 		}
@@ -436,16 +451,17 @@ func (r *Reader) OnDataMPEG4Audio(track *Track, cb ReaderOnDataMPEG4AudioFunc) {
 		n := adtsWholeFramesLen(data)
 		if n == 0 {
 			if !resumed {
-				partialPTS = pts
+				state.partialPTS = pts
 			}
-			partial = data
+			state.partial = data
 			return nil
 		}
 
 		var pkts mpeg4audio.ADTSPackets
 		err := pkts.Unmarshal(data[:n])
 		if err != nil {
-			partial = nil
+			// discard the residual: it must not pollute the next frame or its PTS.
+			state.partial = nil
 			r.onDecodeError(fmt.Errorf("invalid ADTS: %w", err))
 			return nil
 		}
@@ -460,11 +476,11 @@ func (r *Reader) OnDataMPEG4Audio(track *Track, cb ReaderOnDataMPEG4AudioFunc) {
 		groupPTS := pts
 		if resumed {
 			started--
-			groupPTS = partialPTS
+			groupPTS = state.partialPTS
 		}
 
-		partial = data[n:]
-		partialPTS = pts + int64(started)*mpeg4audio.SamplesPerAccessUnit*90000/int64(pkts[0].SampleRate)
+		state.partial = data[n:]
+		state.partialPTS = pts + int64(started)*mpeg4audio.SamplesPerAccessUnit*90000/int64(pkts[0].SampleRate)
 
 		return cb(groupPTS, aus)
 	}
