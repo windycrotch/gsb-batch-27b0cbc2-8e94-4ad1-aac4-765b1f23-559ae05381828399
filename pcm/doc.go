@@ -35,9 +35,22 @@
 //
 // Encoder.Reset rebinds an existing encoder to a new sink and Config,
 // reusing all internal buffers (about 650 KiB), so a producer that encodes
-// many independent clips can pool encoders. EncodeInterleaved is the
-// one-shot helper for a complete in-memory buffer; it draws from an
-// internal pool and is safe for concurrent use:
+// many independent clips can pool encoders. A successful Reset gives the new
+// stream a clean boundary: buffered PCM, the latched error and the frame
+// counter are all cleared, and its first frames are byte-identical to a
+// freshly constructed encoder's, no matter whether the previous stream ended
+// in a clean Close, a mid-write sink failure or a Close that rejected an
+// incomplete tail. A rejected Reset leaves the encoder unusable (every
+// method returns aac.ErrEncoderClosed) and holding neither the old sink nor
+// either stream's error, until a later Reset succeeds.
+//
+// When a Write or Close fails, Encoder.StreamState (and
+// FrameEncoder.StreamState) reports the pipeline phase that failed
+// (StageWrite or StageFlush), the number of complete frames the sink already
+// holds, and the terminal error; the caller discards that partial stream and
+// restarts the clip. EncodeInterleaved is the one-shot helper for a complete
+// in-memory buffer; it draws from an internal pool and is safe for
+// concurrent use:
 //
 //	err := aacpcm.EncodeInterleaved(w, cfg, pcmBytes)
 //
@@ -123,8 +136,15 @@
 // # Concurrency
 //
 // An Encoder is not safe for concurrent use; use one per goroutine, and the
-// same holds for a FrameEncoder, a FrameDecoder and a Decoder. The package-level
-// EncodeInterleaved function is safe for concurrent use.
+// same holds for a FrameEncoder, a FrameDecoder and a Decoder. Sharing one
+// encoder across goroutines is detected: the mutating methods (Reset, Write,
+// Close on an Encoder; Reset, EncodeInterleaved, Flush on a FrameEncoder)
+// take a non-blocking guard, and the call that loses the race returns
+// ErrConcurrentUse without touching the stream, so interleaved bytes can
+// never reach a sink. StreamState is the single exception: it reads atomics
+// and may be called alongside an in-flight encode. Separate instances are
+// fully independent. The package-level EncodeInterleaved function is safe
+// for concurrent use.
 //
 // # SIMD kernels
 //

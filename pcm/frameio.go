@@ -40,7 +40,11 @@ var errNilEmit = errors.New("go-aac/pcm: nil emit callback")
 //
 // A FrameEncoder is not safe for concurrent use, and must not be copied after
 // first use: a copy shares the codec state and the scratch buffers with the
-// original.
+// original. Calling any mutating method (Reset, EncodeInterleaved, Flush)
+// while another call is in flight is detected and rejected with
+// ErrConcurrentUse instead of interleaving the two streams' bytes; use one
+// FrameEncoder per goroutine. StreamState is the one method safe to read
+// concurrently.
 type FrameEncoder struct {
 	cfg Config
 
@@ -62,6 +66,14 @@ type FrameEncoder struct {
 	configured bool
 	flushed    bool
 	err        error // latched on the first failure; returned until Reset
+
+	// status is the externally visible stream boundary: the phase reached,
+	// the count of frames the sink actually accepted and the terminal error.
+	// It is separate from err above because it survives into the snapshot
+	// callers read after the failure, and because its atomics let that read
+	// run concurrently with an encode. Its lock is the concurrent-misuse
+	// guard shared with the Encoder wrapper.
+	status streamStatus
 }
 
 // NewFrameEncoder validates cfg and returns a FrameEncoder ready to encode.
@@ -79,9 +91,25 @@ func NewFrameEncoder(cfg Config) (*FrameEncoder, error) {
 // state, and is the way to re-arm an encoder after a latched error or a
 // Flush. It re-validates cfg, discards buffered input and resets all
 // per-stream state. After a successful Reset the encoder is ready to encode
-// as if freshly constructed; on error it is left unconfigured, and every
-// method reports that until a later Reset succeeds.
+// as if freshly constructed: StreamState is back at StageNone with zero
+// frames and no error, and the first access units are byte-identical to a
+// NewFrameEncoder's. On error it is left unconfigured, and every method
+// reports that until a later Reset succeeds; the error that broke the
+// previous stream never carries over, since disarm clears it before
+// validation. A concurrent call while another method is in flight returns
+// ErrConcurrentUse.
 func (e *FrameEncoder) Reset(cfg Config) error {
+	if !e.status.begin() {
+		return ErrConcurrentUse
+	}
+	defer e.status.end()
+	return e.reset(cfg)
+}
+
+// reset is the lock-free body of Reset. The Encoder wrapper calls it under
+// its own guard so the two encoders share one lock per concrete encoder
+// rather than taking two nested ones.
+func (e *FrameEncoder) reset(cfg Config) error {
 	e.disarm()
 	if err := cfg.validate(); err != nil {
 		return err
@@ -105,6 +133,9 @@ func (e *FrameEncoder) Reset(cfg Config) error {
 	}
 	e.flushed = false
 	e.configured = true
+	// Publish the fresh boundary record only once configuration succeeded:
+	// a rejected Reset keeps the disarmed StageNone/zero state above.
+	e.status.resetFor()
 	return nil
 }
 
@@ -120,11 +151,15 @@ const maxAUBytes = 6144 / 8 * 2
 
 // disarm marks the encoder unconfigured and clears any latched error, so a
 // zero value and a partially reset encoder both refuse to encode until a
-// Reset completes.
+// Reset completes. The boundary record goes back to StageNone with no frames
+// and no error, which is the state a failed Reset must present: the previous
+// stream's failure cannot be queried as if it belonged to the stream that
+// never started.
 func (e *FrameEncoder) disarm() {
 	e.configured = false
 	e.flushed = true
 	e.err = nil
+	e.status.resetFor()
 }
 
 // EncodeInterleaved consumes interleaved little-endian PCM in arbitrary chunk
@@ -145,15 +180,22 @@ func (e *FrameEncoder) disarm() {
 // The encoder delays output by one frame (priming), so the first complete
 // frame emits nothing; Flush drains it. An error from emit is returned
 // unchanged and latched: no further access unit is emitted and every later
-// call returns it until Reset.
+// call returns it until Reset. StreamState then reports StageWrite and the
+// number of whole frames delivered before the failure.
 func (e *FrameEncoder) EncodeInterleaved(pcm []byte, emit func(au []byte, samples int) error) error {
+	if !e.status.begin() {
+		return ErrConcurrentUse
+	}
+	defer e.status.end()
 	_, err := e.encode(pcm, emit)
 	return err
 }
 
 // encode is the shared core behind EncodeInterleaved and Encoder.Write. It
 // returns the number of bytes of p durably consumed, which Encoder.Write needs
-// to honour the io.Writer contract on a mid-write sink error.
+// to honour the io.Writer contract on a mid-write sink error. On an emit
+// failure it records StageWrite with the accepted-frame count, so the caller
+// can discard the partial stream and restart.
 func (e *FrameEncoder) encode(p []byte, emit emitFunc) (int, error) {
 	if e.err != nil {
 		return 0, e.err
@@ -175,7 +217,7 @@ func (e *FrameEncoder) encode(p []byte, emit emitFunc) (int, error) {
 		}
 		e.carry = append(e.carry, p[:need]...)
 		if err := e.encodeFrameBytes(e.carry, emit); err != nil {
-			return 0, e.fail(err)
+			return 0, e.breakStream(StageWrite, err)
 		}
 		e.carry = e.carry[:0]
 		p = p[need:]
@@ -184,7 +226,7 @@ func (e *FrameEncoder) encode(p []byte, emit emitFunc) (int, error) {
 	// 2. Encode whole frames straight from p, no copy.
 	for len(p) >= e.frameBytes {
 		if err := e.encodeFrameBytes(p[:e.frameBytes], emit); err != nil {
-			return total - len(p), e.fail(err)
+			return total - len(p), e.breakStream(StageWrite, err)
 		}
 		p = p[e.frameBytes:]
 	}
@@ -193,6 +235,18 @@ func (e *FrameEncoder) encode(p []byte, emit emitFunc) (int, error) {
 	// the input is byte-oriented) for next time.
 	e.carry = append(e.carry, p...)
 	return total, nil
+}
+
+// breakStream latches err both on the legacy per-stream err field (which
+// every later call re-reports until Reset) and on the externally readable
+// boundary record, naming the phase that failed. It returns the latched error
+// for the caller to hand back unchanged.
+func (e *FrameEncoder) breakStream(stage EncodeStage, err error) error {
+	if e.err == nil {
+		e.err = err
+	}
+	e.status.fail(stage, e.err)
+	return e.err
 }
 
 // Flush encodes the trailing partial frame (zero-padded to a whole frame by
@@ -207,8 +261,19 @@ func (e *FrameEncoder) encode(p []byte, emit emitFunc) (int, error) {
 // trailing bytes are not a whole number of inter-channel samples, and reports
 // aac.ErrEncoderClosed on a zero value or after a failed Reset. A nil emit
 // callback is rejected without ending the stream, so the buffered tail
-// survives for a Flush that supplies a real one.
+// survives for a Flush that supplies a real one. A concurrent call while
+// another method is in flight returns ErrConcurrentUse.
 func (e *FrameEncoder) Flush(emit func(au []byte, samples int) error) error {
+	if !e.status.begin() {
+		return ErrConcurrentUse
+	}
+	defer e.status.end()
+	return e.flush(emit)
+}
+
+// flush is the lock-free body of Flush, called by FrameEncoder.Flush and by
+// Encoder.Close under their shared guard.
+func (e *FrameEncoder) flush(emit emitFunc) error {
 	if !e.configured {
 		return aac.ErrEncoderClosed // a zero value, or a Reset that failed
 	}
@@ -229,8 +294,16 @@ func (e *FrameEncoder) Flush(emit func(au []byte, samples int) error) error {
 		return errNilEmit
 	}
 	e.flushed = true
-	e.err = e.finish(emit)
-	return e.err
+	if err := e.finish(emit); err != nil {
+		// StageFlush covers both ways finish can fail: an incomplete trailing
+		// sample (the error returns before any frame is emitted) and an emit
+		// rejection on the tail frame or the drain.
+		e.err = err
+		e.status.fail(StageFlush, err)
+		return e.err
+	}
+	e.status.done()
+	return nil
 }
 
 // finish flushes the trailing partial frame and drains the encoder delay. It
@@ -263,17 +336,6 @@ func (e *FrameEncoder) finish(emit emitFunc) error {
 		}
 	}
 	return nil
-}
-
-// fail latches err as the encoder's terminal error. encodeFrameBytes advances
-// the codec state before emit can fail, so the failed access unit cannot be
-// recovered by re-feeding PCM: every later call returns this error until Reset
-// re-arms the encoder. Returns the latched error for convenience.
-func (e *FrameEncoder) fail(err error) error {
-	if e.err == nil {
-		e.err = err
-	}
-	return e.err
 }
 
 // encodeFrameBytes converts one full frame of interleaved PCM bytes to planar
@@ -340,12 +402,18 @@ func (e *FrameEncoder) convert(chunk []byte, n int) {
 // emitAU hands the pending access unit to emit. An empty access unit (the
 // priming frame, or an exhausted drain) reports nothing. Every access unit
 // carries aac.FrameSize samples per channel: a short final frame is zero-padded
-// before encoding, so the unit still decodes to a full frame.
+// before encoding, so the unit still decodes to a full frame. Only a frame
+// emit accepted is counted in StreamState.Frames: a rejected frame is not
+// delivered, so the count always matches what the caller's sink holds.
 func (e *FrameEncoder) emitAU(emit emitFunc) error {
 	if len(e.au) == 0 {
 		return nil
 	}
-	return emit(e.au, aac.FrameSize)
+	if err := emit(e.au, aac.FrameSize); err != nil {
+		return err
+	}
+	e.status.frameDelivered()
+	return nil
 }
 
 // AudioSpecificConfig returns the MPEG-4 AudioSpecificConfig for this stream
@@ -386,4 +454,17 @@ func (e *FrameEncoder) Stats() aac.Stats {
 		return aac.Stats{}
 	}
 	return e.enc.Stats()
+}
+
+// StreamState returns the boundary record of the current stream: which
+// pipeline phase it last reached, how many whole access units emit accepted,
+// and the terminal error if there was one. It is the recovery handle after a
+// failed Write or Flush: Frames is exactly the count of complete units the
+// muxer received, so a caller restarting the clip discards them and starts a
+// new stream from the same input offset. A successful Reset returns the
+// record to StageNone with zero frames and a nil error. The read uses
+// atomics and is safe concurrently with an in-flight encode, unlike the
+// encoder's other methods.
+func (e *FrameEncoder) StreamState() StreamState {
+	return e.status.snapshot()
 }

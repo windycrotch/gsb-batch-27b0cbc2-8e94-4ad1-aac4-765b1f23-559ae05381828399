@@ -58,6 +58,36 @@ muxer's per-unit path is shared between the two codecs; the lifecycle differs,
 since AAC-LC needs a `Flush` to drain the priming frame where the FLAC frame
 encoder is one-shot.
 
+### Pooling encoders and recovering from failures
+
+A producer encoding many short clips keeps one `Encoder` (or `FrameEncoder`)
+and calls `Reset` between streams instead of allocating a new ~650 KiB codec
+state per clip. A successful `Reset` is a hard stream boundary: the carry
+buffer, the latched error and every counter are cleared, and the new stream's
+first frames are byte-identical to what a freshly constructed encoder
+produces — regardless of how the previous stream ended. A `Reset` that
+rejects its arguments leaves the encoder unusable and detached from both
+sinks until a later `Reset` succeeds.
+
+Frames already written to a failed stream's sink cannot be withdrawn, so the
+encoder reports the boundary instead. After a `Write` or `Close` error,
+`StreamState()` gives the phase (`StageWrite` vs `StageFlush`), the count of
+complete frames the sink actually holds, and the terminal error:
+
+```go
+if _, err := e.Write(pcm); err != nil {
+    st := e.StreamState()
+    // st.Frames complete ADTS frames are already in w; discard them (or
+    // truncate w back to st.Frames frames), then restart the clip:
+    _ = e.Reset(w, cfg)
+}
+```
+
+Sharing one encoder across goroutines is a misuse and is rejected with
+`ErrConcurrentUse` rather than producing interleaved frames; give each
+goroutine its own encoder. `StreamState` is the one method safe to call
+concurrently with an in-flight encode.
+
 Decoding mirrors go-flac's `pcm.Decoder`: an AAC-LC stream in via `io.Reader`,
 interleaved little-endian S16 PCM out.
 

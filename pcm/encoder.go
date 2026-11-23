@@ -27,7 +27,10 @@ var _ io.WriteCloser = (*Encoder)(nil)
 //
 // An Encoder is not safe for concurrent use, and must not be copied after
 // first use: a copy shares the codec state and the scratch buffers with the
-// original.
+// original. Calling Reset, Write or Close while another call is in flight is
+// detected and rejected with ErrConcurrentUse rather than writing interleaved
+// frames to the sink; use one Encoder per goroutine. StreamState is the one
+// method safe to read concurrently.
 type Encoder struct {
 	// fe holds the whole encoding pipeline: carry buffer, integer to
 	// float32 conversion, framing, priming and drain. Encoder adds only
@@ -55,10 +58,26 @@ func NewEncoder(w io.Writer, cfg Config) (*Encoder, error) {
 // re-allocating; this is the pooling path for the many-short-clips
 // workload. It re-validates cfg, discards buffered input and resets all
 // per-stream state. After a successful Reset the encoder is ready for
-// Write/Close as if freshly constructed; on error it must not be used.
-// Reset may be called on a closed encoder, which is the usual pooling
-// pattern (Reset, Write, Close, repeat).
+// Write/Close as if freshly constructed, and produces byte-identical ADTS
+// output to a NewEncoder with the same Config, whether the previous stream
+// ended in a clean Close, a mid-write failure or a Close that rejected an
+// incomplete tail. On error it must not be used: the encoder is left
+// disarmed, holds no reference to either the old or the new sink, and
+// carries neither stream's error into a later successful Reset. Reset may
+// be called on a closed encoder, which is the usual pooling pattern
+// (Reset, Write, Close, repeat). A concurrent call while another method is
+// in flight returns ErrConcurrentUse.
 func (e *Encoder) Reset(w io.Writer, cfg Config) error {
+	if !e.fe.status.begin() {
+		return ErrConcurrentUse
+	}
+	defer e.fe.status.end()
+	return e.reset(w, cfg)
+}
+
+// reset is the lock-free body of Reset. The one-shot pool helper and the
+// package's own teardown paths reach it without retaking the guard.
+func (e *Encoder) reset(w io.Writer, cfg Config) error {
 	// Detach from the previous stream before rebinding, so every failure path
 	// below leaves the encoder unconfigured AND holding no reference to the
 	// sink it was replacing, rather than pinning it until the next success.
@@ -66,7 +85,7 @@ func (e *Encoder) Reset(w io.Writer, cfg Config) error {
 	if w == nil {
 		return fmt.Errorf("go-aac/pcm: nil writer")
 	}
-	if err := e.fe.Reset(cfg); err != nil { // Reset disarms again before validating
+	if err := e.fe.reset(cfg); err != nil { // reset disarms again before validating
 		return err
 	}
 	e.w = w
@@ -87,8 +106,15 @@ const adtsHeaderLen = 7
 // The produced stream depends only on the byte sequence, never on how it
 // was chunked. Write returns len(p) on success; on a mid-write sink error
 // it returns the number of bytes of p that were durably consumed
-// (io.Writer contract).
+// (io.Writer contract), and StreamState reports StageWrite together with
+// the number of complete ADTS frames already in the sink. A concurrent
+// call while another method is in flight returns ErrConcurrentUse and
+// consumes nothing.
 func (e *Encoder) Write(p []byte) (int, error) {
+	if !e.fe.status.begin() {
+		return 0, ErrConcurrentUse
+	}
+	defer e.fe.status.end()
 	return e.fe.encode(p, e.writeAU)
 }
 
@@ -115,11 +141,20 @@ func (e *Encoder) writeAU(au []byte, _ int) error {
 // Close encodes the final partial frame (zero-padded to a whole frame by
 // the encoder), drains the one-frame encoder delay and flushes the last
 // access units. The stream needs no finalization beyond this: ADTS has no
-// stream-level state. Close is idempotent; Write after Close returns
+// stream-level state. Close is idempotent: a repeat call writes no further
+// frames and re-reports the first Close's outcome, so a clean stream stays
+// clean and a failed drain keeps failing. Write after Close returns
 // ErrEncoderClosed. It errors if buffered trailing bytes are not a whole
-// number of inter-channel samples.
+// number of inter-channel samples; in that case, and on a sink error,
+// StreamState reports StageFlush with the count of complete frames the
+// sink holds. A concurrent call while another method is in flight returns
+// ErrConcurrentUse.
 func (e *Encoder) Close() error {
-	return e.fe.Flush(e.writeAU)
+	if !e.fe.status.begin() {
+		return ErrConcurrentUse
+	}
+	defer e.fe.status.end()
+	return e.fe.flush(e.writeAU)
 }
 
 // AudioSpecificConfig returns the MPEG-4 AudioSpecificConfig for this
@@ -154,4 +189,19 @@ func (e *Encoder) Delay() int {
 // Reset clears it.
 func (e *Encoder) Stats() aac.Stats {
 	return e.fe.Stats()
+}
+
+// StreamState returns the boundary record of the current stream: which
+// pipeline phase it last reached, how many complete ADTS frames the sink
+// accepted, and the terminal error if the stream failed. The frame count is
+// the recovery boundary: bytes for exactly that many self-framed ADTS
+// frames are already in the writer, every one of them independently
+// decodable, so a caller discards them (or truncates the writer back to that
+// many frames when it supports it) and restarts the clip through a Reset.
+// A successful Reset returns the record to StageNone with zero frames and a
+// nil error, so the previous stream's failure can never be mistaken for the
+// next one's. The read uses atomics and is safe concurrently with an
+// in-flight Write or Close, unlike the encoder's other methods.
+func (e *Encoder) StreamState() StreamState {
+	return e.fe.StreamState()
 }
