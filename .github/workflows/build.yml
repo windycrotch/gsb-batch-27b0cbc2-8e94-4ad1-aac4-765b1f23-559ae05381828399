@@ -1,0 +1,26 @@
+on: [push, pull_request]
+name: Build
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Install Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: stable
+    - name: Checkout code
+      uses: actions/checkout@v4
+    - name: Vet
+      run: go vet ./...
+    - name: Test
+      run: go test -v ./...
+    - name: Cross-compile
+      run: |
+        for target in \
+          linux/386 linux/amd64 linux/arm linux/arm64 \
+          linux/loong64 linux/riscv64 linux/s390x \
+          linux/ppc64 linux/ppc64le linux/mips linux/mipsle linux/mips64 linux/mips64le \
+          freebsd/386 freebsd/amd64 freebsd/arm freebsd/arm64; do
+          echo "== $target =="
+          GOOS=${target%/*} GOARCH=${target#*/} go build ./...
+        done
