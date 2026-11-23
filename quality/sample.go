@@ -71,18 +71,32 @@ func sample(
 	var out sampleOutcome
 
 	for {
-		out.rounds++
+		if err := ctx.Err(); err != nil {
+			return out, err
+		}
 
-		results, err := score(ctx, pendingClips(strata), out.rounds)
+		// A round only counts once it has scored every one of its clips: a
+		// failed or cancelled round leaves out.rounds at the completed ones.
+		round := out.rounds + 1
+
+		results, err := score(ctx, pendingClips(strata), round)
 		if err != nil {
 			return out, err
 		}
+
+		out.rounds = round
 
 		out.record(results)
 		out.est = estimateMean(strata, opts.Confidence)
 
 		if onRound != nil {
 			onRound(out.est, out.rounds)
+		}
+
+		// A round that completed is complete, but a cancelled measurement
+		// must not go on to plan another one.
+		if err := ctx.Err(); err != nil {
+			return out, err
 		}
 
 		if out.est.halfWidth <= opts.Precision || out.rounds == maxRounds {

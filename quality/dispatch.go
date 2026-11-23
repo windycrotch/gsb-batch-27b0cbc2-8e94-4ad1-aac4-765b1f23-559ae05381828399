@@ -209,7 +209,12 @@ func (d *dispatcher) dispatch(
 			return fmt.Errorf("queue clip at frame %d: %w", d.jobs[d.next].warmFrom, ctx.Err())
 		}
 
-		d.queue <- d.jobs[d.next]
+		select {
+		case d.queue <- d.jobs[d.next]:
+		case <-ctx.Done():
+			return fmt.Errorf("queue clip at frame %d: %w", d.jobs[d.next].warmFrom, ctx.Err())
+		}
+
 		d.active = append(d.active, d.jobs[d.next])
 		d.next++
 	}

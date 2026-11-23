@@ -40,6 +40,14 @@ var (
 	// errShortDecode is returned when fewer frames than expected were
 	// decoded for a clip, e.g. when a file has fewer frames than packets.
 	errShortDecode = errors.New("too few frames decoded")
+	// errMissingSegments is returned when an exact measurement would merge
+	// fewer segments than it planned: a mean is never reported over missing
+	// frames.
+	errMissingSegments = errors.New("segments missing from the merge")
+	// errIncompleteRound is returned when a scoring round would hand back
+	// fewer results than clips: a cancelled worker or plan must not let the
+	// round count a part of its clips.
+	errIncompleteRound = errors.New("scoring round incomplete")
 )
 
 // Modes.
@@ -122,7 +130,8 @@ type Options struct {
 	// reference, as the ladder's probes do: they only shape the curves.
 	SkipHDRMetrics bool
 	// Progress, when set, is called after each scored clip. Calls never
-	// overlap.
+	// overlap, and none starts once the Measure context is done: a call in
+	// progress is allowed to finish, and FramesScored never goes backwards.
 	Progress func(Progress)
 }
 
@@ -197,6 +206,13 @@ type clipResult struct {
 }
 
 // Measure computes VMAF of dist against ref.
+//
+// Cancelling ctx stops the measurement as soon as the work in flight winds
+// down: the calls return an error wrapping ctx.Err() (context.Canceled or
+// context.DeadlineExceeded) instead of a Result, no sampled round counts a
+// part of its clips, no new Progress callback starts, and the workers'
+// scorers, models and frames are released before the return. A Meter stays
+// usable after a cancelled measurement.
 func (m *Meter) Measure(
 	ctx context.Context,
 	ref, dist Input,
@@ -209,6 +225,12 @@ func (m *Meter) Measure(
 		return nil, fmt.Errorf("quality: %w", err)
 	}
 
+	r.ctx = ctx
+
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("quality: %w", err)
+	}
+
 	var res *Result
 	if r.opts.Exact {
 		res, err = r.exact(ctx)
@@ -217,6 +239,17 @@ func (m *Meter) Measure(
 	}
 
 	if err != nil {
+		r.waitReports()
+
+		return nil, fmt.Errorf("quality: %w", err)
+	}
+
+	// A measurement cancelled once all its scoring completed would still
+	// report a Result: prefer the cancellation, and let no callback run
+	// after the return.
+	if err := ctx.Err(); err != nil {
+		r.waitReports()
+
 		return nil, fmt.Errorf("quality: %w", err)
 	}
 
@@ -399,12 +432,18 @@ type run struct {
 	// scored in segments (see exactPlan).
 	decoders int
 	segments bool
+	// ctx is the measurement's context, set once by Measure before any
+	// worker starts: no Progress callback starts once it is done.
+	ctx context.Context
 
 	mu sync.Mutex
-	// reporting serialises the Progress callback (see notify).
+	// reporting serialises the Progress callback, and keeps FramesScored
+	// from going backwards when workers report out of order (see notify).
 	reporting sync.Mutex
-	scored    int
-	decoded   int
+	// reported is the last FramesScored given to the callback.
+	reported int
+	scored   int
+	decoded  int
 	// plans counts the decoding plans used, for reporting.
 	plans map[string]int
 	// sourceCAMBI is CAMBI on the reference at the banded frames, by frame
@@ -435,6 +474,19 @@ func (r *run) exact(
 		return nil, err
 	}
 
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	// A mean over a missing segment would look like a complete measurement:
+	// segments must join their neighbours, cover every frame once, and score
+	// every frame of the video.
+	if len(clips) > 1 {
+		if err := checkSegments(clips, results, r.n); err != nil {
+			return nil, err
+		}
+	}
+
 	if err := r.devicePasses(ctx, results, workers, threads); err != nil {
 		return nil, err
 	}
@@ -444,6 +496,10 @@ func (r *run) exact(
 	}
 
 	if err := r.sourceBandingPass(ctx, results, workers, threads); err != nil {
+		return nil, err
+	}
+
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 
@@ -460,6 +516,39 @@ func (r *run) exact(
 	return res, nil
 }
 
+// checkSegments fails when results are not one complete clip per planned
+// clip, contiguously covering [0, n): merging them then would report a mean
+// over missing frames.
+func checkSegments(
+	clips []clip,
+	results []clipResult,
+	n int,
+) error {
+	if len(results) != len(clips) {
+		return fmt.Errorf("%w: %d of %d segments", errMissingSegments, len(results), len(clips))
+	}
+
+	next := 0
+
+	for i, cr := range results {
+		if cr.clip.from != next || cr.clip.to <= cr.clip.from {
+			return fmt.Errorf("%w: segment %d covers %d-%d, want from %d", errMissingSegments, i, cr.clip.from, cr.clip.to, next)
+		}
+
+		if got, want := len(cr.scores), cr.clip.to-cr.clip.from; got != want {
+			return fmt.Errorf("%w: segment %d scored %d of %d frames", errMissingSegments, i, got, want)
+		}
+
+		next = cr.clip.to
+	}
+
+	if next != n {
+		return fmt.Errorf("%w: segments end at frame %d, want %d", errMissingSegments, next, n)
+	}
+
+	return nil
+}
+
 // sampled runs the sampling loop, or spends the fixed budget, and falls back
 // to exact scoring when the precision would cost more than MaxShare of the
 // frames.
@@ -474,6 +563,10 @@ func (r *run) sampled(
 
 	strata, out, err := sampling(ctx, r.n, r.ref.Bitstream.PTS, r.dist.Bitstream.Keyframes, r.opts, scoreClips, r.roundDone)
 	if err != nil {
+		return nil, err
+	}
+
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 
@@ -497,6 +590,10 @@ func (r *run) sampled(
 	}
 
 	if err := r.sourceBandingPass(ctx, out.results, workers, threads); err != nil {
+		return nil, err
+	}
+
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 
@@ -605,7 +702,10 @@ func (r *run) report(
 
 // notify reports progress, one report at a time: clips are scored by
 // several workers, and a callback collecting what it is told must not be
-// entered twice at once.
+// entered twice at once. No callback starts once the measurement is
+// cancelled (one already running is allowed to finish), and FramesScored
+// never goes backwards, even when a worker that counted fewer frames gets
+// the report to the callback after one that counted more.
 func (r *run) notify(
 	p Progress,
 ) {
@@ -616,7 +716,29 @@ func (r *run) notify(
 	r.reporting.Lock()
 	defer r.reporting.Unlock()
 
+	if r.ctx != nil && r.ctx.Err() != nil {
+		return
+	}
+
+	if p.FramesScored < r.reported {
+		p.FramesScored = r.reported
+	}
+
+	r.reported = p.FramesScored
+
 	r.opts.Progress(p)
+}
+
+// waitReports waits for a Progress callback in progress to return. Once it
+// has, and the measurement is cancelled, no further callback starts: the
+// caller may return to the user without a callback still running.
+func (r *run) waitReports() {
+	if r.opts.Progress == nil {
+		return
+	}
+
+	r.reporting.Lock()
+	defer r.reporting.Unlock()
 }
 
 // mode is the reported measurement mode. The caller holds r.mu.

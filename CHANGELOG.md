@@ -9,6 +9,20 @@ The release notes of each GitHub release are taken from its section here
 
 ## [Unreleased]
 
+### Fixed
+
+- **A cancelled VMAF measurement returns promptly instead of at the end of
+  its sampling.** `quality.Meter.Measure` now stops on its context in
+  sampled mode (precision-driven and fixed `--sample` budgets) and in exact
+  mode: it returns an error wrapping `context.Canceled` /
+  `context.DeadlineExceeded` instead of a `Result`, no new `Options.Progress`
+  callback starts (one in progress finishes, `FramesScored` never goes
+  backwards), and the scorers, models and frames in flight are released
+  before it returns. No round counts a part of its clips, and a cancelled
+  fixed budget never stands for a spent one; exact measurements score their
+  segments concurrently and no longer merge a mean over a missing one. A
+  `Meter` remains usable after a cancelled measurement.
+
 ## [1.4.1] - 2026-10-29
 
 ### Fixed

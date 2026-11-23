@@ -341,6 +341,10 @@ func sampleBudget(
 		return out, err
 	}
 
+	if err := ctx.Err(); err != nil {
+		return out, err
+	}
+
 	out.record(results)
 	out.est = budgetEstimate(strata, opts)
 

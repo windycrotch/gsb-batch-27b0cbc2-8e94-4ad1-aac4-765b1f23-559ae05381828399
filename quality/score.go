@@ -22,7 +22,9 @@ import (
 // split into concurrent runs, and the segments of an exact measurement are
 // each decoded by their own run (see plan). Every clip gets warm-up frames
 // on each side so temporal features see real neighbours. Results are
-// returned in the order of clips.
+// returned in the order of clips, one per clip: a run that ends without
+// scoring one of its clips fails, so that a caller never records a partial
+// round.
 func (r *run) score(
 	ctx context.Context,
 	clips []clip,
@@ -30,6 +32,10 @@ func (r *run) score(
 ) ([]clipResult, error) {
 	if len(clips) == 0 {
 		return nil, nil
+	}
+
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
 	jobs := r.newJobs(clips)
@@ -48,7 +54,17 @@ func (r *run) score(
 		err = r.sweep(ctx, jobs, window{to: r.n}, workers, threads, collect)
 	}
 
+	// A cancellation surfaces as the error the caller knows, whatever
+	// symptom the stopped decoders and workers reported first.
+	if cerr := ctx.Err(); cerr != nil {
+		return nil, cerr
+	}
+
 	if err != nil {
+		return nil, err
+	}
+
+	if err := checkScored(clips, results); err != nil {
 		return nil, err
 	}
 
@@ -57,6 +73,22 @@ func (r *run) score(
 	r.mu.Unlock()
 
 	return results, nil
+}
+
+// checkScored fails unless every clip got its own result, in order: a
+// cancelled worker or a plan that dropped a clip must not let a caller
+// record a round over a part of its clips.
+func checkScored(
+	clips []clip,
+	results []clipResult,
+) error {
+	for i, cr := range results {
+		if cr.clip.stratum != clips[i].stratum || cr.clip.from != clips[i].from || cr.clip.to != clips[i].to {
+			return fmt.Errorf("%w: clip %d-%d", errIncompleteRound, clips[i].from, clips[i].to)
+		}
+	}
+
+	return nil
 }
 
 // seekRuns decodes and scores runs in parallel. Few runs share the workers;
@@ -116,6 +148,12 @@ func (r *run) work(
 	}
 
 	for job := range queue {
+		if err := ctx.Err(); err != nil {
+			// The remaining pair channels are closed and drained by the
+			// sweep once its goroutines return (see sweep).
+			return err
+		}
+
 		cr, err := score(job)
 		<-slots
 
