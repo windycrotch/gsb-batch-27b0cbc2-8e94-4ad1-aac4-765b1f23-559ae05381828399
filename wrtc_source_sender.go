@@ -5,6 +5,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"sync"
 
 	"github.com/pion/webrtc/v4"
@@ -26,10 +27,10 @@ type WRTC_Source_Sender struct {
 	statusMutex *sync.Mutex // Mutex to control access to the struct
 
 	hasAudio        bool
-	localTrackAudio *webrtc.TrackLocalStaticRTP // Audio track
+	localTrackAudio mediaTrack // Audio track
 
 	hasVideo        bool
-	localTrackVideo *webrtc.TrackLocalStaticRTP // Video track
+	localTrackVideo mediaTrack // Video track
 }
 
 // Initialize
@@ -39,7 +40,7 @@ func (sender *WRTC_Source_Sender) init() {
 }
 
 // Receive the tracks from local source
-func (sender *WRTC_Source_Sender) onTracksReady(localTrackVideo *webrtc.TrackLocalStaticRTP, localTrackAudio *webrtc.TrackLocalStaticRTP) {
+func (sender *WRTC_Source_Sender) onTracksReady(localTrackVideo mediaTrack, localTrackAudio mediaTrack) {
 	sender.statusMutex.Lock()
 	defer sender.statusMutex.Unlock()
 
@@ -60,8 +61,9 @@ func (sender *WRTC_Source_Sender) onTracksReady(localTrackVideo *webrtc.TrackLoc
 
 	sender.peerConnection = nil
 
-	// Run the connection process
-	go sender.runAfterTracksReady()
+	// Run the connection process synchronously. Node-level callers notify the
+	// sender after releasing the node lock, so only the sender lock is held.
+	sender.runAfterTracksReady()
 }
 
 // Starts the peer connection, generates the offer and sets up the event handlers
@@ -113,7 +115,13 @@ func (sender *WRTC_Source_Sender) runAfterTracksReady() {
 
 	// Include the audio track
 	if sender.hasAudio {
-		audioSender, err := peerConnection.AddTrack(sender.localTrackAudio)
+		audioTrack, ok := sender.localTrackAudio.(*webrtc.TrackLocalStaticRTP)
+		if !ok || audioTrack == nil {
+			LogError(fmt.Errorf("invalid audio track type for sender %s", sender.sid))
+			return
+		}
+
+		audioSender, err := peerConnection.AddTrack(audioTrack)
 		if err != nil {
 			LogError(err)
 			return
@@ -124,7 +132,13 @@ func (sender *WRTC_Source_Sender) runAfterTracksReady() {
 
 	// Include the video track
 	if sender.hasVideo {
-		videoSender, err := peerConnection.AddTrack(sender.localTrackVideo)
+		videoTrack, ok := sender.localTrackVideo.(*webrtc.TrackLocalStaticRTP)
+		if !ok || videoTrack == nil {
+			LogError(fmt.Errorf("invalid video track type for sender %s", sender.sid))
+			return
+		}
+
+		videoSender, err := peerConnection.AddTrack(videoTrack)
 		if err != nil {
 			LogError(err)
 			return

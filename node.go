@@ -49,6 +49,12 @@ type WebRTC_CDN_Node struct {
 
 	sinks   map[string]map[uint64]*WRTC_Sink
 	senders map[string]map[string]*WRTC_Source_Sender
+
+	// Peer transport factories. Default to the pion implementations in init();
+	// tests replace them with in-memory fakes so no external WebRTC peer is
+	// required to drive the signaling entry point.
+	newSourcePeer sourcePeerFactory
+	newSinkPeer   sinkPeerFactory
 }
 
 func (node *WebRTC_CDN_Node) init() {
@@ -67,6 +73,14 @@ func (node *WebRTC_CDN_Node) init() {
 	node.relays = make(map[string]*WRTC_Relay)
 	node.sinks = make(map[string]map[uint64]*WRTC_Sink)
 	node.senders = make(map[string]map[string]*WRTC_Source_Sender)
+
+	// Peer transport factories (production defaults; tests may override)
+	if node.newSourcePeer == nil {
+		node.newSourcePeer = newPionSourcePeer
+	}
+	if node.newSinkPeer == nil {
+		node.newSinkPeer = newPionSinkPeer
+	}
 
 	// Config
 	node.ipLimit = 4

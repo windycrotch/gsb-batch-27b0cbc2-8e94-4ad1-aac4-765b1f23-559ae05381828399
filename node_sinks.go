@@ -15,7 +15,6 @@ func (node *WebRTC_CDN_Node) getSinkID() uint64 {
 // Registers a sink
 func (node *WebRTC_CDN_Node) registerSink(sink *WRTC_Sink) {
 	node.mutexStatus.Lock()
-	defer node.mutexStatus.Unlock()
 
 	if node.sinks[sink.sid] == nil {
 		node.sinks[sink.sid] = make(map[uint64]*WRTC_Sink)
@@ -23,15 +22,27 @@ func (node *WebRTC_CDN_Node) registerSink(sink *WRTC_Sink) {
 
 	node.sinks[sink.sid][sink.sinkId] = sink
 
-	// Is there a ready source for it?
+	// Capture the tracks (if any are already available) while holding the
+	// node lock; notify the sink outside the lock so the sink can take its own
+	// lock and start its peer transport without nested locking.
+	var video mediaTrack
+	var audio mediaTrack
+	notify := false
+
 	if node.sources[sink.sid] != nil && node.sources[sink.sid].ready {
-		sink.onTracksReady(node.sources[sink.sid].localTrackVideo, node.sources[sink.sid].localTrackAudio)
-		return
+		video = node.sources[sink.sid].localTrackVideo
+		audio = node.sources[sink.sid].localTrackAudio
+		notify = true
+	} else if node.relays[sink.sid] != nil && node.relays[sink.sid].ready {
+		video = node.relays[sink.sid].localTrackVideo
+		audio = node.relays[sink.sid].localTrackAudio
+		notify = true
 	}
 
-	// Is there a relay for it?
-	if node.relays[sink.sid] != nil && node.relays[sink.sid].ready {
-		sink.onTracksReady(node.relays[sink.sid].localTrackVideo, node.relays[sink.sid].localTrackAudio)
+	node.mutexStatus.Unlock()
+
+	if notify {
+		sink.onTracksReady(video, audio)
 		return
 	}
 
@@ -43,26 +54,29 @@ func (node *WebRTC_CDN_Node) registerSink(sink *WRTC_Sink) {
 // Removes a sink
 func (node *WebRTC_CDN_Node) removeSink(sink *WRTC_Sink) {
 	node.mutexStatus.Lock()
-	defer node.mutexStatus.Unlock()
 
-	if node.sinks[sink.sid] == nil {
-		return
-	}
-
-	if node.sinks[sink.sid][sink.sinkId] == nil {
+	if node.sinks[sink.sid] == nil || node.sinks[sink.sid][sink.sinkId] == nil {
+		node.mutexStatus.Unlock()
 		return
 	}
 
 	delete(node.sinks[sink.sid], sink.sinkId)
 
+	var relayToClose *WRTC_Relay
 	if len(node.sinks[sink.sid]) == 0 {
 		delete(node.sinks, sink.sid)
 
 		// No more sinks for that stream means there is no need for relays
-		// Remove it
 		if node.relays[sink.sid] != nil {
-			node.relays[sink.sid].close()
+			relayToClose = node.relays[sink.sid]
 			delete(node.relays, sink.sid)
 		}
+	}
+
+	node.mutexStatus.Unlock()
+
+	// Close the relay outside the node lock.
+	if relayToClose != nil {
+		relayToClose.close()
 	}
 }

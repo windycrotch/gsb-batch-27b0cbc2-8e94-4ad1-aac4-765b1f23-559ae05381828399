@@ -5,6 +5,7 @@ package main
 import (
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -26,12 +27,18 @@ type Connection_Handler struct {
 	id uint64 // Connection ID
 	ip string // Client IP address
 
+	port string // Client port (used to map test clients to their handler)
+
 	node       *WebRTC_CDN_Node // Reference to the node
 	connection *websocket.Conn  // Reference to the websocket connection
 
 	lastHeartbeat int64 // Timestamp: Last time a HEARTBEAT message was received
 
-	closed bool // True if the connection is closed
+	closed atomic.Bool // True if the connection is closed
+
+	// ipCounted is true when this connection successfully took a per-IP
+	// concurrency slot, so the slot is released exactly once on teardown.
+	ipCounted bool
 
 	sendingMutex *sync.Mutex // Mutex to control sending messages
 	statusMutex  *sync.Mutex // Mutex to control access to the status data
@@ -45,7 +52,6 @@ type Connection_Handler struct {
 
 // Initialize
 func (h *Connection_Handler) init() {
-	h.closed = false
 	h.sendingMutex = &sync.Mutex{}
 	h.statusMutex = &sync.Mutex{}
 	h.requestCount = 0
@@ -69,12 +75,13 @@ func (h *Connection_Handler) run() {
 			}
 		}
 		h.log("Connection closed.")
-		// Ensure connection is closed
+		// Ensure the socket is closed
 		h.connection.Close()
-		h.closed = true
-		// Release resources
+		// Release all request resources (idempotent: safe even if individual
+		// CLOSE messages already released some of them)
 		h.onClose()
-		// Remove connection
+		// Release the per-IP quota slot and unregister the connection
+		// (idempotent: a concurrent cleanup is a no-op)
 		h.node.onConnectionClose(h.id, h.ip)
 	}()
 
@@ -117,6 +124,50 @@ func (h *Connection_Handler) run() {
 	}
 }
 
+// reserveRequestLocked reserves a request-id on this socket.
+// Must be called with h.statusMutex held.
+// Returns an error code string, or "" on success. On failure no counter is
+// touched, so rejected requests never leak or alter the quota.
+func (h *Connection_Handler) reserveRequestLocked(requestId string, reqType int) string {
+	if h.requests[requestId] != 0 {
+		return "PROTOCOL_ERROR"
+	}
+
+	if h.requestCount >= h.node.requestLimit {
+		return "LIMIT_REQUESTS"
+	}
+
+	h.requestCount++
+	h.requests[requestId] = reqType
+
+	return ""
+}
+
+// detachRequestLocked removes the bookkeeping of a request and returns the
+// source/sink bound to it so the caller can close them outside the lock.
+// Must be called with h.statusMutex held. Idempotent: an unknown request-id
+// yields zero values and changes nothing, so requestCount can never go below
+// zero and no other connection's quota can be affected.
+func (h *Connection_Handler) detachRequestLocked(requestId string) (reqType int, source *WRTC_Source, sink *WRTC_Sink) {
+	reqType = h.requests[requestId]
+	if reqType == 0 {
+		return 0, nil, nil
+	}
+
+	delete(h.requests, requestId)
+	h.requestCount--
+
+	if reqType == REQUEST_TYPE_PUBLISH {
+		source = h.sources[requestId]
+		delete(h.sources, requestId)
+	} else if reqType == REQUEST_TYPE_PLAY {
+		sink = h.sinks[requestId]
+		delete(h.sinks, requestId)
+	}
+
+	return reqType, source, sink
+}
+
 // Called when a HEARTBEAT message is received from the client
 func (h *Connection_Handler) receiveHeartbeat() {
 	h.statusMutex.Lock()
@@ -133,7 +184,7 @@ func (h *Connection_Handler) checkHeartbeat() {
 	now := time.Now().UnixMilli()
 	mustClose := (now - h.lastHeartbeat) >= HEARTBEAT_TIMEOUT_MS
 
-	defer h.statusMutex.Unlock()
+	h.statusMutex.Unlock()
 
 	if mustClose {
 		h.connection.Close()
@@ -145,7 +196,7 @@ func (h *Connection_Handler) sendHeartbeatMessages() {
 	for {
 		time.Sleep(HEARTBEAT_MSG_PERIOD_SECONDS * time.Second)
 
-		if h.closed {
+		if h.closed.Load() {
 			return // Closed
 		}
 
@@ -195,8 +246,22 @@ func (h *Connection_Handler) receivePublishMessage(msg SignalingMessage) {
 		hasAudio = false
 	}
 
+	// Reserve the request-id before any resource is created. A rejection leaves
+	// every counter untouched.
+	h.statusMutex.Lock()
+	errorCode := h.reserveRequestLocked(requestId, REQUEST_TYPE_PUBLISH)
+	if errorCode != "" {
+		h.statusMutex.Unlock()
+		if errorCode == "LIMIT_REQUESTS" {
+			h.sendErrorMessage(errorCode, "Too many requests on the same socket.", requestId)
+		} else {
+			h.sendErrorMessage(errorCode, "You reused the same request ID for 2 different requests.", requestId)
+		}
+		return
+	}
+
 	// Create source
-	source := WRTC_Source{
+	source := &WRTC_Source{
 		requestId:  requestId,
 		sid:        streamId,
 		node:       h.node,
@@ -207,31 +272,17 @@ func (h *Connection_Handler) receivePublishMessage(msg SignalingMessage) {
 
 	source.init()
 
-	// Register the source
-	func() {
-		h.statusMutex.Lock()
-		defer h.statusMutex.Unlock()
+	h.sources[requestId] = source
+	h.statusMutex.Unlock()
 
-		if h.requests[requestId] != 0 {
-			h.sendErrorMessage("PROTOCOL_ERROR", "You reused the same request ID for 2 different requests.", requestId)
-			return
-		}
+	h.sendOkMessage(requestId)
 
-		if h.requestCount > h.node.requestLimit {
-			h.sendErrorMessage("LIMIT_REQUESTS", "Too many requests on the same socket.", requestId)
-			return
-		}
+	// Registration (which may close/replace a previous source) and starting
+	// the peer transport happen outside the handler lock to avoid holding two
+	// locks at once.
+	h.node.registerSource(source) // Register source
 
-		h.requestCount++
-		h.requests[requestId] = REQUEST_TYPE_PUBLISH
-		h.sources[requestId] = &source
-
-		h.sendOkMessage(requestId)
-
-		h.node.registerSource(&source) // Register source
-
-		go source.run() // Run source
-	}()
+	go source.run() // Run source
 }
 
 // Called when a PLAY message is received from the client
@@ -257,10 +308,23 @@ func (h *Connection_Handler) receivePlayMessage(msg SignalingMessage) {
 		return
 	}
 
+	// Reserve the request-id before any resource is created.
+	h.statusMutex.Lock()
+	errorCode := h.reserveRequestLocked(requestId, REQUEST_TYPE_PLAY)
+	if errorCode != "" {
+		h.statusMutex.Unlock()
+		if errorCode == "LIMIT_REQUESTS" {
+			h.sendErrorMessage(errorCode, "Too many requests on the same socket.", requestId)
+		} else {
+			h.sendErrorMessage(errorCode, "You reused the same request ID for 2 different requests.", requestId)
+		}
+		return
+	}
+
 	sinkId := h.node.getSinkID()
 
 	// Create sink
-	sink := WRTC_Sink{
+	sink := &WRTC_Sink{
 		sinkId:     sinkId,
 		requestId:  requestId,
 		sid:        streamId,
@@ -270,97 +334,75 @@ func (h *Connection_Handler) receivePlayMessage(msg SignalingMessage) {
 
 	sink.init()
 
-	// Register the sink
-	func() {
-		h.statusMutex.Lock()
-		defer h.statusMutex.Unlock()
+	h.sinks[requestId] = sink
+	h.statusMutex.Unlock()
 
-		if h.requests[requestId] != 0 {
-			h.sendErrorMessage("PROTOCOL_ERROR", "You reused the same request ID for 2 different requests.", requestId)
-			return
-		}
+	h.sendOkMessage(requestId)
 
-		if h.requestCount > h.node.requestLimit {
-			h.sendErrorMessage("LIMIT_REQUESTS", "Too many requests on the same socket.", requestId)
-			return
-		}
+	h.sendStandbyMessage(requestId)
 
-		h.requestCount++
-		h.requests[requestId] = REQUEST_TYPE_PLAY
-		h.sinks[requestId] = &sink
-
-		h.sendOkMessage(requestId)
-
-		h.sendStandbyMessage(requestId)
-
-		h.node.registerSink(&sink) // Register sink
-	}()
+	h.node.registerSink(sink) // Register sink
 }
 
 // Called when an ANSWER message is received from the client
 func (h *Connection_Handler) receiveAnswerMessage(msg SignalingMessage) {
 	requestId := msg.params["request-id"]
 
-	func() {
-		h.statusMutex.Lock()
-		defer h.statusMutex.Unlock()
+	h.statusMutex.Lock()
+	reqType := h.requests[requestId]
+	source := h.sources[requestId]
+	sink := h.sinks[requestId]
+	h.statusMutex.Unlock()
 
-		if h.requests[requestId] == 0 {
-			return // IGNORE
-		} else if h.requests[requestId] == REQUEST_TYPE_PUBLISH && h.sources[requestId] != nil {
-			h.sources[requestId].onAnswer(msg.body)
-		} else if h.requests[requestId] == REQUEST_TYPE_PLAY && h.sinks[requestId] != nil {
-			h.sinks[requestId].onAnswer(msg.body)
-		}
-	}()
+	if reqType == REQUEST_TYPE_PUBLISH && source != nil {
+		source.onAnswer(msg.body)
+	} else if reqType == REQUEST_TYPE_PLAY && sink != nil {
+		sink.onAnswer(msg.body)
+	}
 }
 
 // Called when a CANDIDATE message is received from the client
 func (h *Connection_Handler) receiveCandidateMessage(msg SignalingMessage) {
 	requestId := msg.params["request-id"]
 
-	func() {
-		h.statusMutex.Lock()
-		defer h.statusMutex.Unlock()
+	h.statusMutex.Lock()
+	reqType := h.requests[requestId]
+	source := h.sources[requestId]
+	sink := h.sinks[requestId]
+	h.statusMutex.Unlock()
 
-		if h.requests[requestId] == 0 {
-			return // IGNORE
-		} else if h.requests[requestId] == REQUEST_TYPE_PUBLISH {
-			h.sources[requestId].onICECandidate(msg.body)
-		} else if h.requests[requestId] == REQUEST_TYPE_PLAY {
-			h.sinks[requestId].onICECandidate(msg.body)
-		}
-	}()
+	if reqType == REQUEST_TYPE_PUBLISH && source != nil {
+		source.onICECandidate(msg.body)
+	} else if reqType == REQUEST_TYPE_PLAY && sink != nil {
+		sink.onICECandidate(msg.body)
+	}
 }
 
 // Called when a CLOSE message is received from the client
 func (h *Connection_Handler) receiveCloseMessage(msg SignalingMessage) {
 	requestId := msg.params["request-id"]
 
-	func() {
-		h.statusMutex.Lock()
-		defer h.statusMutex.Unlock()
+	// Detach the bookkeeping under the lock, then close the resource outside.
+	h.statusMutex.Lock()
+	_, source, sink := h.detachRequestLocked(requestId)
+	h.statusMutex.Unlock()
 
-		if h.requests[requestId] == 0 {
-			return // IGNORE
-		} else if h.requests[requestId] == REQUEST_TYPE_PUBLISH {
-			h.sources[requestId].close(false, true)
-
-			delete(h.sources, requestId)
-			delete(h.requests, requestId)
-			h.requestCount--
-		} else if h.requests[requestId] == REQUEST_TYPE_PLAY {
-			h.sinks[requestId].close()
-
-			delete(h.sinks, requestId)
-			delete(h.requests, requestId)
-			h.requestCount--
-		}
-	}()
+	if source != nil {
+		// The client explicitly asked for the close: do not send another
+		// CLOSE message back, but deregister from the node.
+		source.close(false, true)
+	} else if sink != nil {
+		sink.close()
+	}
 }
 
-// Sends a message to the client
+// Sends a message to the client. Best effort: a write on a socket that is
+// being torn down must never crash the goroutine reporting the event.
 func (h *Connection_Handler) send(msg SignalingMessage) {
+	defer func() {
+		_ = recover()
+	}()
+
 	h.sendingMutex.Lock()
 	defer h.sendingMutex.Unlock()
 
@@ -436,14 +478,22 @@ func (h *Connection_Handler) sendICECandidate(reqId string, sid string, candidat
 	h.send(msg)
 }
 
-// Removes a source and send a message to the client
-func (h *Connection_Handler) sendSourceClose(reqId string, sid string) {
+// notifySourceClosed is called when a source closes on its own (transport
+// failure, or because a new publisher replaced it). It releases the request
+// bookkeeping, but only if the request is still bound to this source, and
+// sends a CLOSE signaling message so the client may reuse the request-id.
+// Identity checking makes it safe against the explicit-CLOSE and socket
+// teardown paths racing with it.
+func (h *Connection_Handler) notifySourceClosed(source *WRTC_Source) {
 	h.statusMutex.Lock()
-	defer h.statusMutex.Unlock()
 
-	delete(h.sources, reqId)
-	delete(h.requests, reqId)
-	h.requestCount--
+	if h.requests[source.requestId] == REQUEST_TYPE_PUBLISH && h.sources[source.requestId] == source {
+		delete(h.sources, source.requestId)
+		delete(h.requests, source.requestId)
+		h.requestCount--
+	}
+
+	h.statusMutex.Unlock()
 
 	msg := SignalingMessage{
 		method: "CLOSE",
@@ -451,8 +501,8 @@ func (h *Connection_Handler) sendSourceClose(reqId string, sid string) {
 		body:   "",
 	}
 
-	msg.params["Request-ID"] = reqId
-	msg.params["Stream-ID"] = sid
+	msg.params["Request-ID"] = source.requestId
+	msg.params["Stream-ID"] = source.sid
 
 	h.send(msg)
 }
@@ -467,26 +517,42 @@ func (h *Connection_Handler) logDebug(msg string) {
 	LogDebugSession(h.id, h.ip, msg)
 }
 
-// Called when connection is closed to release resources
+// onClose releases every request still bound to the connection. It is invoked
+// when the socket goes away and is fully idempotent: an explicit CLOSE may
+// already have released individual requests, and a concurrent/duplicate call
+// finds nothing left to do. All resource teardown happens outside the lock.
 func (h *Connection_Handler) onClose() {
 	h.statusMutex.Lock()
-	defer h.statusMutex.Unlock()
+
+	if h.closed.Load() {
+		h.statusMutex.Unlock()
+		return
+	}
+
+	h.closed.Store(true)
+
+	type detachedResource struct {
+		source *WRTC_Source
+		sink   *WRTC_Sink
+	}
+
+	resources := make([]detachedResource, 0, len(h.requests))
 
 	for requestId := range h.requests {
-		if h.requests[requestId] == 0 {
-			return // IGNORE
-		} else if h.requests[requestId] == REQUEST_TYPE_PUBLISH {
-			h.sources[requestId].close(false, true)
+		_, source, sink := h.detachRequestLocked(requestId)
+		resources = append(resources, detachedResource{source: source, sink: sink})
+	}
 
-			delete(h.sources, requestId)
-			delete(h.requests, requestId)
-			h.requestCount--
-		} else if h.requests[requestId] == REQUEST_TYPE_PLAY {
-			h.sinks[requestId].close()
+	h.statusMutex.Unlock()
 
-			delete(h.sinks, requestId)
-			delete(h.requests, requestId)
-			h.requestCount--
+	for _, resource := range resources {
+		if resource.source != nil {
+			// The socket is gone: no CLOSE message, but still deregister.
+			resource.source.close(false, true)
+		}
+
+		if resource.sink != nil {
+			resource.sink.close()
 		}
 	}
 }

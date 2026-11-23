@@ -139,35 +139,55 @@ func (node *WebRTC_CDN_Node) receiveOfferMessage(sid string, data string, hasVid
 // This means the tracks are available
 func (node *WebRTC_CDN_Node) onRelayReady(relay *WRTC_Relay) {
 	node.mutexStatus.Lock()
-	defer node.mutexStatus.Unlock()
 
 	relay.ready = true
 
-	// Notify sinks
+	// Snapshot the sinks so they can be notified outside the node lock.
+	var affectedSinks []*WRTC_Sink
 	if node.sinks[relay.sid] != nil {
 		for _, sink := range node.sinks[relay.sid] {
-			sink.onTracksReady(relay.localTrackVideo, relay.localTrackAudio)
+			affectedSinks = append(affectedSinks, sink)
 		}
+	}
+
+	video := relay.localTrackVideo
+	audio := relay.localTrackAudio
+
+	node.mutexStatus.Unlock()
+
+	for _, sink := range affectedSinks {
+		sink.onTracksReady(video, audio)
 	}
 }
 
 // Called when a relay is closed
 func (node *WebRTC_CDN_Node) onRelayClosed(relay *WRTC_Relay) {
 	node.mutexStatus.Lock()
-	defer node.mutexStatus.Unlock()
 
 	delete(node.relays, relay.sid)
 
-	// Any sinks waiting, tell them the tracks are closed
+	// Snapshot waiting sinks and whether we must re-resolve the stream.
+	var affectedSinks []*WRTC_Sink
 	if node.sinks[relay.sid] != nil {
 		for _, sink := range node.sinks[relay.sid] {
-			sink.onTracksClosed(relay.localTrackVideo, relay.localTrackAudio)
+			affectedSinks = append(affectedSinks, sink)
 		}
+	}
+
+	hasSinks := len(affectedSinks) > 0
+	video := relay.localTrackVideo
+	audio := relay.localTrackAudio
+
+	node.mutexStatus.Unlock()
+
+	// Any sinks waiting, tell them the tracks are closed
+	for _, sink := range affectedSinks {
+		sink.onTracksClosed(video, audio)
 	}
 
 	// If there are sinks for that stream ID
 	// and there are no source, try resolving it
-	if node.sinks[relay.sid] != nil && len(node.sinks[relay.sid]) > 0 {
+	if hasSinks {
 		node.sendResolveMessage(relay.sid)
 	}
 }

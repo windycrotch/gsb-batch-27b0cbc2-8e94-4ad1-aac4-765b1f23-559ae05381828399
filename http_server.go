@@ -78,12 +78,20 @@ func (node *WebRTC_CDN_Node) isIPExempted(ipStr string) bool {
 	return false
 }
 
-// Removes an IP from the list
+// Removes an IP from the list.
+// Idempotent and underflow-safe: if the IP has no recorded slot (it was never
+// counted, or the slot was already released), this is a no-op, so a duplicate
+// close can never drive the counter negative or delete another connection's
+// quota.
 func (node *WebRTC_CDN_Node) RemoveIP(ip string) {
 	node.mutexIpCount.Lock()
 	defer node.mutexIpCount.Unlock()
 
 	c := node.ipCount[ip]
+
+	if c == 0 {
+		return // Nothing to release
+	}
 
 	if c <= 1 {
 		delete(node.ipCount, ip)
@@ -199,7 +207,7 @@ func (node *WebRTC_CDN_Node) runHTTPServer(wg *sync.WaitGroup) {
 func (node *WebRTC_CDN_Node) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	reqId := node.getRequestID()
 
-	ip, _, err := net.SplitHostPort(req.RemoteAddr)
+	ip, remotePort, err := net.SplitHostPort(req.RemoteAddr)
 
 	if err != nil {
 		LogError(err)
@@ -212,6 +220,7 @@ func (node *WebRTC_CDN_Node) ServeHTTP(w http.ResponseWriter, req *http.Request)
 
 	if req.URL.Path == "/ws" {
 		// Websocket signaling connection
+		ipCounted := false
 		if !node.isIPExempted(ip) {
 			if !node.AddIP(ip) {
 				w.WriteHeader(429)
@@ -219,11 +228,17 @@ func (node *WebRTC_CDN_Node) ServeHTTP(w http.ResponseWriter, req *http.Request)
 				LogRequest(reqId, ip, "Connection rejected: Too many requests")
 				return
 			}
+			ipCounted = true
 		}
 
 		c, err := node.upgrader.Upgrade(w, req, nil)
 		if err != nil {
 			LogError(err)
+			// The upgrade failed before any handler took ownership of the
+			// slot: release it here so the quota does not leak.
+			if ipCounted {
+				node.RemoveIP(ip)
+			}
 			return
 		}
 
@@ -232,8 +247,10 @@ func (node *WebRTC_CDN_Node) ServeHTTP(w http.ResponseWriter, req *http.Request)
 		handler := Connection_Handler{
 			id:         reqId,
 			ip:         ip,
+			port:       remotePort,
 			node:       node,
 			connection: c,
+			ipCounted:  ipCounted,
 		}
 
 		handler.init()
@@ -251,12 +268,26 @@ func (node *WebRTC_CDN_Node) ServeHTTP(w http.ResponseWriter, req *http.Request)
 	}
 }
 
-// Called after a connection is closed
+// onConnectionClose unregisters the connection and releases its per-IP
+// concurrency slot. It is idempotent: only the first invocation acts, so an
+// abnormal disconnect and an explicit cleanup racing each other produce the
+// same final state and the quota is released exactly once.
 func (node *WebRTC_CDN_Node) onConnectionClose(id uint64, ip string) {
 	node.mutexConnections.Lock()
-	defer node.mutexConnections.Unlock()
 
-	node.RemoveIP(ip) // Remove ip count
+	handler, exists := node.connections[id]
+	if !exists {
+		// Already cleaned up (duplicate/concurrent teardown): do nothing,
+		// otherwise the shared per-IP counter would be decremented twice.
+		node.mutexConnections.Unlock()
+		return
+	}
 
 	delete(node.connections, id)
+
+	node.mutexConnections.Unlock()
+
+	if handler.ipCounted {
+		node.RemoveIP(ip) // Release the per-IP slot exactly once
+	}
 }
