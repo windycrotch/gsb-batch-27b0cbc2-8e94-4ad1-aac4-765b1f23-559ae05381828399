@@ -1,0 +1,192 @@
+// Copyright ©2022 Evolution. All rights reserved.
+// Use of this source code is governed by a MIT-style
+// license that can be found in the LICENSE file.
+
+package tools
+
+import (
+	"os"
+	"path"
+	"strings"
+	"testing"
+
+	"github.com/evolution-gaming/ease/internal/it"
+	"github.com/evolution-gaming/ease/internal/video"
+)
+
+func Test_Path(t *testing.T) {
+	type testCase struct {
+		pathFunc func() (string, error)
+		exeName  string
+	}
+
+	tests := map[string]testCase{
+		"FfprobePath()": {
+			pathFunc: FfprobePath,
+			exeName:  "ffprobe",
+		},
+		"FfmpegPath()": {
+			pathFunc: FfmpegPath,
+			exeName:  "ffmpeg",
+		},
+	}
+
+	run := func(t *testing.T, tc testCase) {
+		// Create a fake binary and put it on PATH
+		fakeBinDir := t.TempDir()
+		wantPath := path.Join(fakeBinDir, tc.exeName)
+		f, err := os.OpenFile(wantPath, os.O_CREATE, 0o755)
+		it.Must(t, err == nil, "Unexpected error: got = %v, want = nil", err)
+		f.Close()
+		sysPath := os.Getenv("PATH")
+		t.Setenv("PATH", fakeBinDir+":"+sysPath)
+
+		gotPath, err := tc.pathFunc()
+		it.Should(t, err == nil, "Unexpected error: got = %v, want = nil", err)
+
+		it.Should(t, gotPath == wantPath, "got = %v, want = %v", gotPath, wantPath)
+		_, statErr := os.Stat(gotPath)
+		it.Should(t, statErr == nil, "expected file to exist: %v (err: %v)", gotPath, statErr)
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			run(t, tc)
+		})
+	}
+}
+
+func Test_Path_Negative(t *testing.T) {
+	type testCase struct {
+		pathFunc func() (string, error)
+	}
+
+	tests := map[string]testCase{
+		"FfprobePath()": {
+			pathFunc: FfprobePath,
+		},
+		"FfmpegPath()": {
+			pathFunc: FfmpegPath,
+		},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			// Wipe PATH so that no binary can be located.
+			t.Setenv("PATH", "")
+
+			s, err := tc.pathFunc()
+			it.Should(t, err != nil, "Expected error since binary is not on PATH")
+			it.Should(t, s == "", "Expected empty string as path: got = %v", s)
+		})
+	}
+}
+
+func Test_FfprobeExtractMetadata(t *testing.T) {
+	type testCase struct {
+		videoFile    string
+		wantMetadata video.Metadata
+	}
+
+	tests := map[string]testCase{
+		"h264 mp4 small": {
+			videoFile: "../../testdata/video/testsrc01.mp4",
+			wantMetadata: video.Metadata{
+				Duration:   1,
+				Width:      320,
+				Height:     240,
+				BitRate:    56112,
+				FrameCount: 10,
+				CodecName:  "h264",
+				FrameRate:  "10/1",
+			},
+		},
+		"h264 mp4 large": {
+			videoFile: "../../testdata/video/testsrc02.mp4",
+			wantMetadata: video.Metadata{
+				Duration:   10,
+				Width:      1280,
+				Height:     720,
+				BitRate:    86740,
+				FrameCount: 240,
+				CodecName:  "h264",
+				FrameRate:  "24/1",
+			},
+		},
+		"av1 ivf": {
+			videoFile: "../../testdata/video/testsrc03.ivf",
+			wantMetadata: video.Metadata{
+				Duration:   1,
+				Width:      1920,
+				Height:     1080,
+				BitRate:    114648,
+				FrameCount: 24,
+				CodecName:  "av1",
+				FrameRate:  "24/1",
+			},
+		},
+		"av1 mp4": {
+			videoFile: "../../testdata/video/testsrc04.mp4",
+			wantMetadata: video.Metadata{
+				Duration:   1,
+				Width:      1920,
+				Height:     1080,
+				BitRate:    111704,
+				FrameCount: 24,
+				CodecName:  "av1",
+				FrameRate:  "24/1",
+			},
+		},
+		"h264 mkv": {
+			videoFile: "../../testdata/video/testsrc05.mkv",
+			wantMetadata: video.Metadata{
+				Duration:   1,
+				Width:      320,
+				Height:     240,
+				BitRate:    62648,
+				FrameCount: 10,
+				CodecName:  "h264",
+				FrameRate:  "10/1",
+			},
+		},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			gotMetadata, err := FfprobeExtractMetadata(tc.videoFile)
+			it.Should(t, err == nil, "Unexpected error: got = %v, want = nil", err)
+			it.Should(t, gotMetadata == tc.wantMetadata, "got = %v, want = %v", gotMetadata, tc.wantMetadata)
+		})
+	}
+}
+
+func Test_FfprobeExtractMetadata_Negative(t *testing.T) {
+	type testCase struct {
+		badVideoFile  string
+		wantErrString string
+	}
+
+	tests := map[string]testCase{
+		"non-existent media file": {
+			badVideoFile:  "/non/existent/path/to/file",
+			wantErrString: "no such file or directory",
+		},
+		"non-media file": {
+			badVideoFile:  os.Args[0], // this is a binary file
+			wantErrString: "exec error",
+		},
+		"no media file": {
+			badVideoFile:  "",
+			wantErrString: "video file path cannot be empty",
+		},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			gotMetadata, err := FfprobeExtractMetadata(tc.badVideoFile)
+			it.Must(t, err != nil, "Should have error")
+			it.Should(t, strings.Contains(err.Error(), tc.wantErrString), "got = %v, want to contain %v", err, tc.wantErrString)
+			it.Should(t, gotMetadata == video.Metadata{}, "got = %v, want = %v", gotMetadata, video.Metadata{})
+		})
+	}
+}

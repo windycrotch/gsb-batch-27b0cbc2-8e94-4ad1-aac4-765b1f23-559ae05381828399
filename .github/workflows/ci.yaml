@@ -1,0 +1,117 @@
+name: "ci"
+
+on:
+  push:
+    branches:
+      - 'main'
+    tags:
+      - 'v*'
+  pull_request:
+    types:
+      - opened
+      - reopened
+      - synchronize
+    branches:
+      - 'main'
+
+permissions:
+  contents: write
+
+jobs:
+  lint:
+    name: Static code analysis
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source tree
+        uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: 'go.mod'
+          cache: false
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          # golangci-lint-action v7+ only supports golangci-lint v2, which
+          # requires the .golangci.yaml v2 config format (already migrated).
+          version: v2.12.2
+
+  build:
+    name: Build and test
+    runs-on: ubuntu-latest
+    env:
+      FFMPEG_DEST_DIR: /opt/ffmpeg-static
+      # Pinned by tag + digest for reproducibility: https://hub.docker.com/r/mwader/static-ffmpeg
+      FFMPEG_IMAGE: mwader/static-ffmpeg:8.1.2@sha256:33f770f812cbfc3de96c547157fc9faf8bd95a36481753439ffa761045167585
+    steps:
+      - name: Checkout source tree
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      # Cache for expensive static ffmpeg binary installation
+      - name: Cache for static ffmpeg
+        uses: actions/cache@v6
+        id: cache-ffmpeg
+        with:
+          path: ${{ env.FFMPEG_DEST_DIR }}
+          key: ${{ runner.os }}-static-ffmpeg-${{ env.FFMPEG_IMAGE }}
+
+      # Only run this expensive step if we have a cache miss
+      - if: steps.cache-ffmpeg.outputs.cache-hit != 'true'
+        name: Install static ffmpeg
+        run: |
+          mkdir -p "$FFMPEG_DEST_DIR"
+          container_id=$(docker create "$FFMPEG_IMAGE")
+          docker cp "$container_id":/ffmpeg "$FFMPEG_DEST_DIR/ffmpeg"
+          docker cp "$container_id":/ffprobe "$FFMPEG_DEST_DIR/ffprobe"
+          docker rm "$container_id"
+          chmod +x "$FFMPEG_DEST_DIR"/ffmpeg "$FFMPEG_DEST_DIR"/ffprobe
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: 'go.mod'
+          cache: false
+
+      - name: Save Go cache paths
+        id: go-cache-paths
+        run: |
+          echo "go_mod_cache=$(go env GOMODCACHE)" >> $GITHUB_OUTPUT
+          echo "go_cache=$(go env GOCACHE)" >> $GITHUB_OUTPUT
+
+      - name: Create Go module cache
+        uses: actions/cache@v6
+        with:
+          path: ${{ steps.go-cache-paths.outputs.go_mod_cache }}
+          key: ${{ runner.os }}-go_mod_cache-${{ hashFiles('go.sum') }}
+
+      - name: Create Go cache
+        uses: actions/cache@v6
+        with:
+          path: ${{ steps.go-cache-paths.outputs.go_cache }}
+          key: ${{ runner.os }}-go_cache-${{ hashFiles('go.sum') }}
+
+      - name: Verify module dependencies
+        run: go mod verify
+
+      - name: Test
+        run: |
+          export PATH="$FFMPEG_DEST_DIR":$PATH
+          ffmpeg -version
+          bash -x ./build.sh clean
+          bash -x ./build.sh test
+
+      - name: Build
+        id: build
+        run: |
+          export PATH="$FFMPEG_DEST_DIR":$PATH
+          bash -x ./build.sh clean
+          bash -x ./build.sh build
+
+      - name: Save build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ease-${{ github.run_number }}
+          path: ${{ steps.build.outputs.artifact_path }}
