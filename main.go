@@ -26,6 +26,17 @@ var (
 	profileDir = flag.String("p", "./profile", "Profile directory.")
 )
 
+// Indirection so tests can substitute fake endpoints without a real RTMP
+// server or filesystem.
+var (
+	dialRemoteEndpoint = func(h *Handler, host, p, key string) (Endpoint, error) {
+		return DialRemote(h, host, p, key)
+	}
+	createFlvFileEndpoint = func(baseDir, filename string) (Endpoint, error) {
+		return CreateFlvFile(baseDir, filename)
+	}
+)
+
 func main() {
 	flag.Parse()
 
@@ -125,6 +136,10 @@ func handleConn(h *Handler) error {
 		err = fmt.Errorf("unexpected route mode: /%s", sp[1])
 	}
 	if err != nil {
+		// Startup failed: tear down every endpoint established so far
+		// (each exactly once, hooks at most once) and report the failure
+		// to the client instead of entering the "Streaming started" state.
+		h.Close()
 		return err
 	}
 
@@ -133,23 +148,26 @@ func handleConn(h *Handler) error {
 	return nil
 }
 
-func handleDirect(h *Handler, host, path string) error {
+func handleDirect(h *Handler, host, p string) error {
 
 	h.Logln("Endpoint connecting:", host)
 
-	ep, err := DialRemote(h, host, path, h.PubMsg.PublishingName)
+	ep, err := dialRemoteEndpoint(h, host, p, h.PubMsg.PublishingName)
 	if err != nil {
 		return err
 	}
-
-	flvFile, err := CreateFlvFile(*outDir, fmt.Sprint(h.Time))
-	if err != nil {
+	if err := h.AddEndpoint(ep); err != nil {
 		return err
 	}
 
-	h.Endpoints = []Endpoint{
-		flvFile,
-		ep,
+	flvFile, err := createFlvFileEndpoint(*outDir, fmt.Sprint(h.Time))
+	if err != nil {
+		// Close the remote established above so it cannot dangle.
+		h.Close()
+		return err
+	}
+	if err := h.AddEndpoint(flvFile); err != nil {
+		return err
 	}
 
 	return nil
@@ -157,13 +175,12 @@ func handleDirect(h *Handler, host, path string) error {
 
 func handleRecord(h *Handler) error {
 
-	flvFile, err := CreateFlvFile(*outDir, fmt.Sprint(h.Time))
+	flvFile, err := createFlvFileEndpoint(*outDir, fmt.Sprint(h.Time))
 	if err != nil {
 		return err
 	}
-
-	h.Endpoints = []Endpoint{
-		flvFile,
+	if err := h.AddEndpoint(flvFile); err != nil {
+		return err
 	}
 
 	return nil
@@ -196,30 +213,38 @@ func handleProfile(h *Handler, profileDir, profileName string) error {
 		}
 	}
 
-	var endpoints []Endpoint
-
+	// Remotes and the recording file are established one by one. On any
+	// failure every endpoint already handed to the Handler is closed by
+	// h.Close() below, so a half-built profile never leaves dangling
+	// connections or half-written files behind.
 	for i, remote := range profile.Remotes {
 		h.Logln("Endpoint", i, "connecting:", remote.Host)
 
-		ep, err := DialRemote(h, remote.Host, remote.Path, remote.Key)
+		ep, err := dialRemoteEndpoint(h, remote.Host, remote.Path, remote.Key)
 		if err != nil {
+			h.Close()
 			return err
 		}
-
-		endpoints = append(endpoints, ep)
+		if err := h.AddEndpoint(ep); err != nil {
+			h.Close()
+			return err
+		}
 	}
 
 	if profile.Recording {
-		flvFile, err := CreateFlvFile(*outDir, fmt.Sprint(h.Time))
+		flvFile, err := createFlvFileEndpoint(*outDir, fmt.Sprint(h.Time))
 		if err != nil {
+			h.Close()
 			return err
 		}
-		endpoints = append(endpoints, flvFile)
+		if err := h.AddEndpoint(flvFile); err != nil {
+			h.Close()
+			return err
+		}
 	}
 
-	h.Endpoints = endpoints
-
 	for i, webhook := range profile.Webhooks["afterClose"] {
+		i, webhook := i, webhook
 		h.HooksOnClose = append(h.HooksOnClose, func() {
 			h.Logln("Webhook afterClose - requesting index", i, "url:", webhook.URL)
 			err := DoWebhook(h, webhook)
@@ -234,6 +259,8 @@ func handleProfile(h *Handler, profileDir, profileName string) error {
 		err := DoWebhook(h, webhook)
 		if err != nil {
 			h.Logln("Webhook afterStart - failed:", err)
+			// Startup failed after endpoints were established: clean them up.
+			h.Close()
 			return err
 		}
 	}
