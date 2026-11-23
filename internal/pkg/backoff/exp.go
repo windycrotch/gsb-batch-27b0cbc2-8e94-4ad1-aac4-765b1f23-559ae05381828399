@@ -33,6 +33,7 @@ var (
 	WithNotify         = backoff.WithNotify
 	WithMaxTries       = backoff.WithMaxTries
 	WithMaxElapsedTime = backoff.WithMaxElapsedTime
+	Permanent          = backoff.Permanent
 )
 
 func RetryFunc(ctx context.Context, f Func, opts ...backoff.RetryOption) error {

@@ -39,7 +39,20 @@ import (
 	nbmpv2 "github.com/nagare-media/models.go/iso/nbmp/v2"
 )
 
-const CloseTimeout = 1 * time.Minute
+const (
+	// CloseTimeout is the default inactivity timeout after which a port is
+	// closed automatically.
+	CloseTimeout = 1 * time.Minute
+
+	// MaxRetries is the default maximum number of attempts (including the
+	// initial one) for client-side requests before giving up and failing the
+	// port.
+	MaxRetries = 5
+)
+
+// ErrPortClosed is returned when an operation is attempted on a port that has
+// already been closed. A closed port is never revived.
+var ErrPortClosed = errors.New("http: port closed")
 
 type port struct {
 	mtx sync.Mutex
@@ -55,7 +68,15 @@ type port struct {
 	pr     *io.PipeReader
 	pw     *io.PipeWriter
 
+	// closeTimeout is the inactivity timeout after which the port is closed
+	// automatically.
+	closeTimeout time.Duration
+	// maxTries is the maximum number of attempts (including the initial one)
+	// for client-side requests.
+	maxTries uint
+
 	closeTimer *time.Timer
+	closed     bool
 }
 
 var (
@@ -65,6 +86,12 @@ var (
 )
 
 func (p *port) Start(ctx context.Context) error {
+	// Release all port resources (pipe, close timer, underlying connections)
+	// when the function terminates. Close is idempotent, so this is safe even
+	// if the port was already closed before.
+	stop := context.AfterFunc(ctx, func() { _ = p.Close() })
+	defer stop()
+
 	switch {
 	case p.pt == engineio.InputPortType && p.d == enginev1.PushMediaDirection:
 		//                  input (push)
@@ -87,7 +114,15 @@ func (p *port) Start(ctx context.Context) error {
 			_, err := p.con.ReadFrom(p.pr)
 			return err
 		})
-		get := starter.Func(p.getRequest)
+		get := starter.Func(func(ctx context.Context) error {
+			err := p.getRequest(ctx)
+			if err != nil {
+				// Unblock the send side so the function can terminate
+				// with this (diagnosable) error.
+				_ = p.Close()
+			}
+			return err
+		})
 		return starter.Manage(send, get).WaitForAllToTerminate().Start(ctx)
 
 	case p.pt == engineio.OutputPortType && p.d == enginev1.PushMediaDirection:
@@ -126,8 +161,37 @@ func (p *port) Read(b []byte) (int, error) {
 	return p.pr.Read(b)
 }
 
+// Close closes the port. It stops a potentially scheduled close timer, closes
+// the underlying pipe and releases idle client connections. Close is
+// idempotent: calling it multiple times neither panics nor leaks resources. A
+// closed port is never revived; subsequent requests are rejected.
 func (p *port) Close() error {
-	return p.pw.Close()
+	p.mtx.Lock()
+	defer p.mtx.Unlock()
+	p.closeLocked()
+	return nil
+}
+
+// closeLocked implements the actual close logic. It assumes p.mtx is locked.
+func (p *port) closeLocked() {
+	if p.closed {
+		return
+	}
+	p.closed = true
+	if p.closeTimer != nil {
+		p.closeTimer.Stop()
+		p.closeTimer = nil
+	}
+	_ = p.pw.Close()
+	if p.client != nil {
+		p.client.CloseIdleConnections()
+	}
+}
+
+func (p *port) isClosed() bool {
+	p.mtx.Lock()
+	defer p.mtx.Unlock()
+	return p.closed
 }
 
 func (p *port) Name() string {
@@ -174,14 +238,20 @@ func (p *port) MountTo(srv engineio.Server) error {
 func (p *port) getRequest(ctx context.Context) error {
 	// input (pull)
 
-	// only one request at a time
-	p.mtx.Lock()
-	defer p.mtx.Unlock()
-
 	l := log.FromContext(ctx, "port", p.Name())
 	ctx = log.IntoContext(ctx, l)
 
 	op := func() error {
+		if err := ctx.Err(); err != nil {
+			return backoff.Permanent(err)
+		}
+
+		// A closed port must not be revived by a retry; fail permanently
+		// instead.
+		if p.isClosed() {
+			return backoff.Permanent(fmt.Errorf("http: input (pull) port %s: %w", p.Name(), ErrPortClosed))
+		}
+
 		req := fasthttp.AcquireRequest()
 		defer fasthttp.ReleaseRequest(req)
 		req.Header.SetMethod(fasthttp.MethodGet)
@@ -201,16 +271,22 @@ func (p *port) getRequest(ctx context.Context) error {
 			return fmt.Errorf("event: unexpected HTTP status code in response: %d", resp.StatusCode())
 		}
 
-		// At this point we will at least try to read from the response once. We will therefore defer closing this port with
-		// the closing timeout. In case of a retry, closing the port will be aborted.
+		// At this point we will at least try to read from the response once.
+		// We will therefore abort a scheduled close of this port. If the close
+		// already took effect in the meantime, we must not revive the port and
+		// fail permanently instead.
 		if !p.abortCloseTimer(ctx) {
-			return errors.New("already closing")
+			return backoff.Permanent(fmt.Errorf("http: input (pull) port %s: %w", p.Name(), ErrPortClosed))
 		}
-		defer p.initCloseTimer(ctx)
 
 		n, err := p.ReadFrom(resp.BodyStream())
 		// TODO: deal with "n > 0"
 		_ = n
+
+		// Restart the inactivity timer. A successful retry will abort it
+		// again; if it fires before that, the port is closed for good.
+		p.initCloseTimer(ctx)
+
 		if err != nil {
 			return err
 		}
@@ -222,20 +298,26 @@ func (p *port) getRequest(ctx context.Context) error {
 		l.Error(err, fmt.Sprintf("failed; retrying after %s", t))
 	}
 
-	return backoff.RetryFunc(ctx, op, backoff.WithNotify(no))
+	return backoff.RetryFunc(ctx, op, backoff.WithNotify(no), backoff.WithMaxTries(p.maxTries))
 }
 
 func (p *port) postRequest(ctx context.Context) error {
 	// output (push)
 
-	// only one request at a time
-	p.mtx.Lock()
-	defer p.mtx.Unlock()
-
 	l := log.FromContext(ctx, "port", p.Name())
 	ctx = log.IntoContext(ctx, l)
 
 	op := func() error {
+		if err := ctx.Err(); err != nil {
+			return backoff.Permanent(err)
+		}
+
+		// A closed port must not be revived by a retry; fail permanently
+		// instead.
+		if p.isClosed() {
+			return backoff.Permanent(fmt.Errorf("http: output (push) port %s: %w", p.Name(), ErrPortClosed))
+		}
+
 		req := fasthttp.AcquireRequest()
 		defer fasthttp.ReleaseRequest(req)
 		req.Header.SetMethod(fasthttp.MethodPost)
@@ -263,15 +345,20 @@ func (p *port) postRequest(ctx context.Context) error {
 		l.Error(err, fmt.Sprintf("failed; retrying after %s", t))
 	}
 
-	return backoff.RetryFunc(ctx, op, backoff.WithNotify(no))
+	return backoff.RetryFunc(ctx, op, backoff.WithNotify(no), backoff.WithMaxTries(p.maxTries))
 }
 
 func (p *port) handleGet(c *fiber.Ctx) error {
 	// output (pull)
 
-	// only one request at a time
-	p.mtx.Lock()
-	defer p.mtx.Unlock()
+	ctx := http.ContextFromFiberCtx(c)
+	ctx = log.IntoContext(ctx, log.FromContext(ctx, "port", p.Name()))
+
+	// A new request aborts a scheduled close. If the close already took
+	// effect, the request is rejected: a closed port is never revived.
+	if !p.abortCloseTimer(ctx) {
+		return fiber.ErrGone
+	}
 
 	// TODO: allow other content-types
 	c.Response().Header.SetContentType("video/mp2t")
@@ -280,8 +367,13 @@ func (p *port) handleGet(c *fiber.Ctx) error {
 	// flush headers for chunked transfer encoding
 	c.Response().ImmediateHeaderFlush = true
 
-	// [Close] is called by fiber
-	c.Response().SetBodyStream(io.NopCloser(p), -1)
+	// [Close] is called by fiber. Once the stream terminates (e.g. because
+	// the client disconnected), the close timer is started: if no new request
+	// arrives before the timeout, the port is closed.
+	c.Response().SetBodyStream(&closeNotifyingReadCloser{
+		Reader: p,
+		done:   func() { p.initCloseTimer(ctx) },
+	}, -1)
 
 	c.Status(fiber.StatusOK)
 	return nil
@@ -290,15 +382,17 @@ func (p *port) handleGet(c *fiber.Ctx) error {
 func (p *port) handlePost(c *fiber.Ctx) error {
 	// input (push)
 
-	// only one request at a time
+	// Only one request at a time: two requests must never write to the same
+	// pipe concurrently.
 	p.mtx.Lock()
 	defer p.mtx.Unlock()
 
 	ctx := http.ContextFromFiberCtx(c)
 	ctx = log.IntoContext(ctx, log.FromContext(ctx, "port", p.Name()))
 
-	// check if we started a close timer
-	if !p.abortCloseTimer(ctx) {
+	// A new request aborts a scheduled close. If the close already took
+	// effect, the request is rejected: a closed port is never revived.
+	if !p.abortCloseTimerLocked(ctx) {
 		return fiber.ErrGone
 	}
 
@@ -317,34 +411,87 @@ func (p *port) handlePost(c *fiber.Ctx) error {
 	}
 
 	// start timer to close port
-	p.initCloseTimer(ctx)
+	p.initCloseTimerLocked(ctx)
 
 	c.Status(fiber.StatusCreated)
 	return nil
 }
 
+// abortCloseTimer aborts a scheduled close of the port. It returns false if
+// the port is already closed.
 func (p *port) abortCloseTimer(ctx context.Context) bool {
-	// assumes p.mtx is locked
+	p.mtx.Lock()
+	defer p.mtx.Unlock()
+	return p.abortCloseTimerLocked(ctx)
+}
 
+// abortCloseTimerLocked implements the actual abort logic. It assumes p.mtx
+// is locked.
+func (p *port) abortCloseTimerLocked(ctx context.Context) bool {
 	l := log.FromContext(ctx)
+	if p.closed {
+		return false
+	}
 	if p.closeTimer == nil {
 		return true
 	}
 	l.Info("aborting timer to close port")
-	return p.closeTimer.Stop()
+	p.closeTimer.Stop()
+	p.closeTimer = nil
+	return true
 }
 
+// initCloseTimer (re)starts the inactivity timer after which the port is
+// closed. It is a no-op if the port is already closed.
 func (p *port) initCloseTimer(ctx context.Context) {
-	// assumes p.mtx is locked
+	p.mtx.Lock()
+	defer p.mtx.Unlock()
+	p.initCloseTimerLocked(ctx)
+}
+
+// initCloseTimerLocked implements the actual timer logic. It assumes p.mtx is
+// locked.
+func (p *port) initCloseTimerLocked(ctx context.Context) {
+	if p.closed {
+		return
+	}
 
 	l := log.FromContext(ctx)
 	l.Info("stopped receiving data")
 	l.Info("starting timer to close port")
-	// TODO: make timeout configurable
-	p.closeTimer = time.AfterFunc(CloseTimeout, func() {
-		p.Close()
-		l.Info("port closed")
+	if p.closeTimer != nil {
+		p.closeTimer.Stop()
+	}
+	p.closeTimer = time.AfterFunc(p.closeTimeout, func() {
+		p.mtx.Lock()
+		defer p.mtx.Unlock()
+		if p.closed {
+			return
+		}
+		l.Info("close timeout reached; closing port")
+		p.closeLocked()
 	})
+}
+
+// closeNotifyingReadCloser wraps an io.Reader and invokes done exactly once
+// when the stream is exhausted or closed.
+type closeNotifyingReadCloser struct {
+	io.Reader
+	done func()
+	once sync.Once
+}
+
+func (r *closeNotifyingReadCloser) Read(b []byte) (int, error) {
+	n, err := r.Reader.Read(b)
+	if err == io.EOF {
+		r.once.Do(r.done)
+	}
+	return n, err
+}
+
+func (r *closeNotifyingReadCloser) Close() error {
+	r.once.Do(r.done)
+	return nil
 }
 
 func NewInputPortFor(p nbmpv2.Port, mp nbmpv2.MediaOrMetadataParameter) (engineio.InputPort, error) {
@@ -403,13 +550,15 @@ func newPortFor(p nbmpv2.Port, mp nbmpv2.MediaOrMetadataParameter) (*port, error
 
 	pr, pw := engineio.Pipe()
 	port := &port{
-		name:   p.PortName,
-		d:      d,
-		url:    u,
-		number: pn,
-		client: &fasthttp.Client{},
-		pr:     pr,
-		pw:     pw,
+		name:         p.PortName,
+		d:            d,
+		url:          u,
+		number:       pn,
+		client:       &fasthttp.Client{},
+		pr:           pr,
+		pw:           pw,
+		closeTimeout: CloseTimeout,
+		maxTries:     MaxRetries,
 	}
 
 	return port, nil
