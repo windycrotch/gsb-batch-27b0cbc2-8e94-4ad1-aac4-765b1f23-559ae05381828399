@@ -1,0 +1,25 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: workflow-manager
+  namespace: system
+spec:
+  template:
+    spec:
+      securityContext:
+        runAsNonRoot: false
+      containers:
+        - name: workflow-manager
+          args:
+            - "--config=/config/workflow-manager.yaml"
+            - "--zap-devel"
+            - "--zap-stacktrace-level=panic"
+            - "--zap-log-level=info"
+          livenessProbe:
+            $patch: delete
+          readinessProbe:
+            $patch: delete
+          resources:
+            limits:
+              cpu: 4
+              memory: 4Gi

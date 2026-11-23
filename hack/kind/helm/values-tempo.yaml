@@ -1,0 +1,12 @@
+replicas: 1
+
+tempo:
+  reportingEnabled: false
+  retention: 72h
+  storage:
+    trace:
+      backend: local
+
+persistence:
+  enabled: true
+  storageClassName: standard

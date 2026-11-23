@@ -1,0 +1,25 @@
+namespace: nagare-media-engine-system
+
+resources:
+  - ../output-all
+  - gateway-nbmp_ingress.yaml
+
+patches:
+  - path: patches/gateway-nbmp.yaml
+  - path: patches/workflow-manager.yaml
+  # comment out if you want to test admission webhooks
+  - path: patches/mutating-webhook-configuration.yaml
+  - path: patches/validating-webhook-configuration.yaml
+
+generatorOptions:
+  disableNameSuffixHash: true
+
+secretGenerator:
+  - name: gateway-nbmp-config
+    behavior: replace
+    files:
+      - gateway-nbmp.yaml=gateway-nbmp_config.yaml
+  - name: workflow-manager-config
+    behavior: replace
+    files:
+      - workflow-manager.yaml=workflow-manager_config.yaml

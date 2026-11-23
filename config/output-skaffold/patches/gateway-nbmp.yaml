@@ -1,0 +1,25 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gateway-nbmp
+  namespace: system
+spec:
+  template:
+    spec:
+      securityContext:
+        runAsNonRoot: false
+      containers:
+        - name: gateway-nbmp
+          args:
+            - "--config=/config/gateway-nbmp.yaml"
+            - "--zap-devel"
+            - "--zap-stacktrace-level=panic"
+            - "--zap-log-level=info"
+          livenessProbe:
+            $patch: delete
+          readinessProbe:
+            $patch: delete
+          resources:
+            limits:
+              cpu: 4
+              memory: 4Gi

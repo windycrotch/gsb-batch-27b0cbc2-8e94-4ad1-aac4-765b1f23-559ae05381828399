@@ -1,0 +1,15 @@
+apiVersion: engine.nagare.media/v1alpha1
+kind: GatewayNBMPConfig
+metadata:
+  labels:
+    app.kubernetes.io/name: gatewaynbmpconfig
+    app.kubernetes.io/instance: gateway-nbmp-config
+    app.kubernetes.io/component: gateway-nbmp
+    app.kubernetes.io/created-by: nagare-media-engine
+    app.kubernetes.io/part-of: nagare-media-engine
+    app.kubernetes.io/managed-by: kustomize
+webserver:
+  publicBaseURL: http://engine.nagare.localtest.me
+workflow:
+  kubernetes:
+    namespace: default

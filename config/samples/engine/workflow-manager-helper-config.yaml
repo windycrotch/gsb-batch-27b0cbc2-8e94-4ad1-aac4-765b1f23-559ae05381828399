@@ -1,0 +1,6 @@
+apiVersion: engine.nagare.media/v1alpha1
+kind: WorkflowManagerHelperConfig
+task:
+  # assume task is a sidecar
+  taskAPI: http://127.0.0.1:8888/v2/tasks
+# TODO: add all options with defaults

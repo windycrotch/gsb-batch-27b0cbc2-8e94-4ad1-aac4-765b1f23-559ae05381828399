@@ -1,0 +1,110 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: workflow-manager
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - configmaps
+  - secrets
+  - services
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  verbs:
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - batch
+  resources:
+  - jobs
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - coordination.k8s.io
+  resources:
+  - leases
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - engine.nagare.media
+  resources:
+  - clusterfunctions
+  - clustermedialocations
+  - clustertasktemplates
+  - clusterworkflows
+  - functions
+  - medialocations
+  - tasktemplates
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - engine.nagare.media
+  resources:
+  - clustermediaprocessingentities
+  - mediaprocessingentities
+  - tasks
+  - workflows
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - engine.nagare.media
+  resources:
+  - clustermediaprocessingentities/finalizers
+  - mediaprocessingentities/finalizers
+  - tasks/finalizers
+  - workflows/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - engine.nagare.media
+  resources:
+  - clustermediaprocessingentities/status
+  - mediaprocessingentities/status
+  - tasks/status
+  - workflows/status
+  verbs:
+  - get
+  - patch
+  - update

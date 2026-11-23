@@ -1,0 +1,13 @@
+bin/
+out/
+tmp/
+
+.git/
+.github/
+.dockerignore
+.gitignore
+build/
+config/
+docs/
+README.md
+skaffold.yaml

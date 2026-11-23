@@ -1,0 +1,19 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  labels:
+    app.kubernetes.io/name: clusterrolebinding
+    app.kubernetes.io/instance: workflow-manager-rolebinding
+    app.kubernetes.io/component: rbac
+    app.kubernetes.io/created-by: nagare-media-engine
+    app.kubernetes.io/part-of: nagare-media-engine
+    app.kubernetes.io/managed-by: kustomize
+  name: workflow-manager-rolebinding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: workflow-manager
+subjects:
+- kind: ServiceAccount
+  name: workflow-manager
+  namespace: system

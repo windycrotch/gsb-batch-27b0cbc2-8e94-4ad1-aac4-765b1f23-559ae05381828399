@@ -1,0 +1,10 @@
+resources:
+# workflow-manager
+- service_account-workflow-manager.yaml
+- role-workflow-manager.yaml
+- role_binding-workflow-manager.yaml
+
+# gateway-nbmp
+- service_account-gateway-nbmp.yaml
+- role-gateway-nbmp.yaml
+- role_binding-gateway-nbmp.yaml

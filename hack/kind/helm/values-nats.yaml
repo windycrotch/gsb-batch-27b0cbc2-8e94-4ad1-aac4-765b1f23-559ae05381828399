@@ -1,0 +1,20 @@
+config:
+  jetstream:
+    enabled: true
+    memStorage:
+      enabled: true
+      size: 512Mi
+    fileStorage:
+      enabled: true
+      size: 10Gi
+      storageClassName: standard
+      accessModes:
+        - ReadWriteOnce
+
+natsbox:
+  enabled: true
+
+promExporter:
+  enabled: true
+  podMonitor:
+    enabled: true
