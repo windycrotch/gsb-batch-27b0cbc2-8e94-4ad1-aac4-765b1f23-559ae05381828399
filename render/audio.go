@@ -44,13 +44,12 @@ func renderAudio(ctx context.Context, v video.VideoClip, out string, opts Export
 	_ = tmp.Close()
 	cleanup := func() { _ = os.Remove(path) }
 
-	// Reap every decoder opened during this render. The mixed sidecar of a
-	// composite/concat is a transient graph whose leaf decoders are held by no
-	// node the caller can Close, so a child read to exactly its end (no EOF) would
-	// otherwise leave a stray FFmpeg process behind. Reaping here is also correct
-	// for a plain file's own audio decoder: nothing reads audio after this (the
-	// video render never touches the sidecar), and the owning node's later Close
-	// is an idempotent no-op.
+	// Reap every decoder opened during this render. RenderToTemp installs its
+	// own innermost reaper and closes it on return (cancel path included), so
+	// this outer reaper is a backstop that normally stays empty; it exists so
+	// the mixed sidecar of a composite/concat — a transient graph whose leaf
+	// decoders are held by no node the caller can Close — can never leak a
+	// stray FFmpeg process even if the render wiring changes.
 	reaper := &audioio.Reaper{}
 	rctx := audioio.WithReaper(ctx, reaper)
 	if err := audio.RenderToTemp(rctx, a, path, codec, opts.AudioBitrate, dur); err != nil {

@@ -271,15 +271,19 @@ track. The render uses 65 536-frame chunks (~1.5 s at 44.1 kHz).
 
 ## Thread safety
 
-A single `AudioClip` node instance is **not** safe for concurrent `SamplesInto`
-calls. Nodes that own mutable scratch buffers (`AudioMixNode`, `shiftNode`,
-`speedNode`, `loopNode`, `reverseNode`, `remapNode`) reuse those buffers
-across calls.
+A single `AudioClip` node instance **is** safe for concurrent `SamplesInto`
+calls. Nodes keep no per-call mutable state: the scratch buffers used to decode
+child runs (`AudioMixNode`, `shiftNode`, `speedNode`, `loopNode`,
+`reverseNode`, `remapNode`) are checked out of a pool per call and returned on
+every path, including a canceled pull. Two renders — say, a preview and the
+final export — can therefore pull the same graph from two goroutines and each
+see the complete, correct sample sequence.
 
-The design relies on each `With*` mutator returning a new node with its own
-scratch, and on each branch of the graph having its own node instance. The
-audio render drives the graph from a single goroutine, so this constraint is
-met automatically in normal use.
+Cancellation is a clean interrupt: a canceled pull drops the child source's
+decoder (killing its FFmpeg process and releasing its buffers) on the error
+path itself, and `RenderToTemp` reaps every decoder opened during the render
+when it returns. Retrying over the same nodes afterwards is sample-identical
+to a render that was never canceled.
 
 ---
 

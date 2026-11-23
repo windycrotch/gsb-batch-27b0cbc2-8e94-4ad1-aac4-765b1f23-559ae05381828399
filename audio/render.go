@@ -38,6 +38,15 @@ func RenderToTemp(ctx context.Context, root AudioClip, out, codec, bitrate strin
 		return clip.Wrap("render audio", clip.ErrNoDuration)
 	}
 
+	// Reap every decoder opened during this render — on the cancel path too —
+	// so a canceled export never leaves a child source's FFmpeg process or
+	// decode buffers alive until some later pull. A caller that installed its
+	// own reaper is unaffected: decoders register with this innermost one and
+	// are closed here; the outer reaper simply stays empty.
+	reaper := &audioio.Reaper{}
+	ctx = audioio.WithReaper(ctx, reaper)
+	defer func() { _ = reaper.CloseAll() }()
+
 	enc, err := audioio.OpenEncoder(ctx, out, audioio.EncoderOptions{
 		SampleRate: sr,
 		Channels:   ch,

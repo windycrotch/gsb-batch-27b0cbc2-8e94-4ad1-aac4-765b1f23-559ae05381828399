@@ -22,7 +22,7 @@ func TimeRemap(inner AudioClip, mapT func(clip.Time) clip.Time, dur clip.Time) A
 	if inner == nil || mapT == nil {
 		return inner
 	}
-	return &remapNode{inner: inner, mapT: mapT, dur: dur, hasDur: clip.Finite(dur), scratch: &clip.AudioBuffer{}}
+	return &remapNode{inner: inner, mapT: mapT, dur: dur, hasDur: clip.Finite(dur), scratch: newScratchPool()}
 }
 
 type remapNode struct {
@@ -31,8 +31,7 @@ type remapNode struct {
 	dur     clip.Time
 	hasDur  bool
 	start   clip.Time
-	scratch *clip.AudioBuffer
-	posBuf  []float64
+	scratch *scratchPool
 }
 
 func (n *remapNode) Start() clip.Time    { return n.start }
@@ -42,16 +41,12 @@ func (n *remapNode) End() clip.Time      { return clip.EndOr(n.start, n.dur, n.h
 func (n *remapNode) WithStart(t clip.Time) clip.Clip {
 	c := *n
 	c.start = t
-	c.scratch = &clip.AudioBuffer{}
-	c.posBuf = nil
 	return &c
 }
 
 func (n *remapNode) WithDuration(d clip.Time) clip.Clip {
 	c := *n
 	c.dur, c.hasDur = d, true
-	c.scratch = &clip.AudioBuffer{}
-	c.posBuf = nil
 	return &c
 }
 
@@ -62,8 +57,6 @@ func (n *remapNode) WithEnd(end clip.Time, changeDuration bool) clip.Clip {
 	} else if c.hasDur {
 		c.start = end - c.dur
 	}
-	c.scratch = &clip.AudioBuffer{}
-	c.posBuf = nil
 	return &c
 }
 
@@ -89,10 +82,9 @@ func (n *remapNode) SamplesInto(ctx context.Context, start clip.Time, count int,
 	// First pass: map each in-window output frame to a fractional source-sample
 	// position, recording the span we must pull. Out-of-window frames stay silent
 	// (NaN marks them) so a single pull covers exactly the source range touched.
-	if cap(n.posBuf) < count {
-		n.posBuf = make([]float64, count)
-	}
-	pos := n.posBuf[:count]
+	// The position table is call-local: a node serves concurrent renders, so no
+	// per-call state may live on the node itself.
+	pos := make([]float64, count)
 	have := false
 	var lo, hi float64
 	for j := 0; j < count; j++ {
@@ -126,7 +118,9 @@ func (n *remapNode) SamplesInto(ctx context.Context, start clip.Time, count int,
 	if srcCount < 1 {
 		srcCount = 1
 	}
-	if err := n.inner.SamplesInto(ctx, clip.SampleTime(srcLo, rate), srcCount, n.scratch); err != nil {
+	scratch := n.scratch.get()
+	defer n.scratch.put(scratch)
+	if err := n.inner.SamplesInto(ctx, clip.SampleTime(srcLo, rate), srcCount, scratch); err != nil {
 		return err
 	}
 
@@ -150,7 +144,7 @@ func (n *remapNode) SamplesInto(ctx context.Context, start clip.Time, count int,
 		}
 		b0, b1, dBase := k*ch, k2*ch, j*ch
 		for c := 0; c < ch; c++ {
-			dst.Samples[dBase+c] = n.scratch.Samples[b0+c]*(1-frac) + n.scratch.Samples[b1+c]*frac
+			dst.Samples[dBase+c] = scratch.Samples[b0+c]*(1-frac) + scratch.Samples[b1+c]*frac
 		}
 	}
 	return nil

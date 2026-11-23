@@ -15,10 +15,12 @@ import (
 // are left un-clamped here — clamping happens once, at the quantization output
 // boundary (the encoder).
 //
-// SamplesInto reuses a per-node scratch buffer, so a single node is NOT safe for
-// concurrent SamplesInto calls; the audio render drives one mixer from one
-// goroutine. Each With* variant gets its own scratch, and a nested mixer child
-// has its own, so the single-goroutine constraint is per node, not global.
+// SamplesInto checks a scratch buffer out of a per-node pool for each call and
+// returns it on every path — including a canceled pull — so a single node IS
+// safe for concurrent SamplesInto calls: a preview and an export can pull the
+// same mixer from two goroutines, and each render sees only its own complete,
+// correct sample sequence. With* variants share the pool (buffers are
+// interchangeable), and a nested mixer child has its own.
 type AudioMixNode struct {
 	children   []AudioClip
 	sampleRate int
@@ -27,7 +29,7 @@ type AudioMixNode struct {
 	hasDur     bool
 	start      clip.Time
 
-	scratch *clip.AudioBuffer // reused per-child pull buffer (single-render use)
+	scratch *scratchPool // per-call pull buffers, safe for concurrent renders
 }
 
 // Mix builds a mixer from children. The output rate/channels are the max across
@@ -35,7 +37,7 @@ type AudioMixNode struct {
 func Mix(children ...AudioClip) *AudioMixNode {
 	n := &AudioMixNode{
 		children: append([]AudioClip(nil), children...),
-		scratch:  &clip.AudioBuffer{},
+		scratch:  newScratchPool(),
 	}
 	for _, c := range children {
 		if r := c.SampleRate(); r > n.sampleRate {
@@ -78,14 +80,12 @@ func (n *AudioMixNode) End() clip.Time { return clip.EndOr(n.start, n.dur, n.has
 func (n *AudioMixNode) WithStart(t clip.Time) clip.Clip {
 	c := *n
 	c.start = t
-	c.scratch = &clip.AudioBuffer{}
 	return &c
 }
 
 func (n *AudioMixNode) WithDuration(d clip.Time) clip.Clip {
 	c := *n
 	c.dur, c.hasDur = d, true
-	c.scratch = &clip.AudioBuffer{}
 	return &c
 }
 
@@ -96,7 +96,6 @@ func (n *AudioMixNode) WithEnd(end clip.Time, changeDuration bool) clip.Clip {
 	} else if c.hasDur {
 		c.start = end - c.dur
 	}
-	c.scratch = &clip.AudioBuffer{}
 	return &c
 }
 
@@ -117,6 +116,10 @@ func (n *AudioMixNode) SamplesInto(ctx context.Context, start clip.Time, count i
 	if count == 0 {
 		return nil
 	}
+	// Check out this call's own pull buffer; the defer returns it to the pool
+	// on the cancel path too, so no partial child data escapes this call.
+	scratch := n.scratch.get()
+	defer n.scratch.put(scratch)
 	chunkSpan := clip.SampleTime(count, n.sampleRate)
 	for _, c := range n.children {
 		cs := c.Start()
@@ -127,7 +130,7 @@ func (n *AudioMixNode) SamplesInto(ctx context.Context, start clip.Time, count i
 		if cend := c.End(); clip.Finite(cend) && start >= cend {
 			continue
 		}
-		if err := n.addChild(ctx, c, start, count, dst); err != nil {
+		if err := n.addChild(ctx, c, start, count, dst, scratch); err != nil {
 			return err
 		}
 	}
@@ -137,7 +140,7 @@ func (n *AudioMixNode) SamplesInto(ctx context.Context, start clip.Time, count i
 // addChild pulls one child for the chunk and adds its gated, remixed samples
 // into dst. The child is pulled at its child-local time; its own SamplesInto
 // zero-pads outside the file, and the [start, end) window is enforced here.
-func (n *AudioMixNode) addChild(ctx context.Context, c AudioClip, start clip.Time, count int, dst *clip.AudioBuffer) error {
+func (n *AudioMixNode) addChild(ctx context.Context, c AudioClip, start clip.Time, count int, dst, scratch *clip.AudioBuffer) error {
 	cs := c.Start()
 	local := start - cs
 	childRate := c.SampleRate()
@@ -159,10 +162,10 @@ func (n *AudioMixNode) addChild(ctx context.Context, c AudioClip, start clip.Tim
 		// 1:1 alignment: pull only the in-window run [lo, hi) so leading/trailing
 		// frames outside the child's window are never decoded. idxOf is offset by lo
 		// because scratch[0] corresponds to output frame lo.
-		if err := c.SamplesInto(ctx, local+clip.SampleTime(lo, n.sampleRate), hi-lo, n.scratch); err != nil {
+		if err := c.SamplesInto(ctx, local+clip.SampleTime(lo, n.sampleRate), hi-lo, scratch); err != nil {
 			return err
 		}
-		addWindow(dst, n.scratch, lo, hi, n.channels, childCh, func(j int) int { return j - lo })
+		addWindow(dst, scratch, lo, hi, n.channels, childCh, func(j int) int { return j - lo })
 		return nil
 	}
 
@@ -183,7 +186,7 @@ func (n *AudioMixNode) addChild(ctx context.Context, c AudioClip, start clip.Tim
 	if childCount < 1 {
 		childCount = 1
 	}
-	if err := c.SamplesInto(ctx, clip.SampleTime(childLo, childRate), childCount, n.scratch); err != nil {
+	if err := c.SamplesInto(ctx, clip.SampleTime(childLo, childRate), childCount, scratch); err != nil {
 		return err
 	}
 	// posOf returns the scratch-relative fractional child position for output
@@ -197,7 +200,7 @@ func (n *AudioMixNode) addChild(ctx context.Context, c AudioClip, start clip.Tim
 		whole := math.Floor(pos)
 		return int(whole), float32(pos - whole)
 	}
-	addWindowLerp(dst, n.scratch, lo, hi, n.channels, childCh, posOf)
+	addWindowLerp(dst, scratch, lo, hi, n.channels, childCh, posOf)
 	return nil
 }
 

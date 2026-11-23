@@ -20,14 +20,14 @@ func Reverse(inner AudioClip) AudioClip {
 	if !clip.Finite(dur) {
 		return inner
 	}
-	return &reverseNode{inner: inner, dur: dur, scratch: &clip.AudioBuffer{}}
+	return &reverseNode{inner: inner, dur: dur, scratch: newScratchPool()}
 }
 
 type reverseNode struct {
 	inner   AudioClip
 	dur     clip.Time
 	start   clip.Time
-	scratch *clip.AudioBuffer
+	scratch *scratchPool
 }
 
 func (n *reverseNode) Start() clip.Time    { return n.start }
@@ -37,14 +37,12 @@ func (n *reverseNode) End() clip.Time      { return n.start + n.dur }
 func (n *reverseNode) WithStart(t clip.Time) clip.Clip {
 	c := *n
 	c.start = t
-	c.scratch = &clip.AudioBuffer{}
 	return &c
 }
 
 func (n *reverseNode) WithDuration(d clip.Time) clip.Clip {
 	c := *n
 	c.dur = d
-	c.scratch = &clip.AudioBuffer{}
 	return &c
 }
 
@@ -55,7 +53,6 @@ func (n *reverseNode) WithEnd(end clip.Time, changeDuration bool) clip.Clip {
 	} else {
 		c.start = end - c.dur
 	}
-	c.scratch = &clip.AudioBuffer{}
 	return &c
 }
 
@@ -109,13 +106,15 @@ func (n *reverseNode) SamplesInto(ctx context.Context, start clip.Time, count in
 	// the last in-window output, the highest backs the first.
 	low := innerTotal - 1 - (startIdx + (jHi - 1))
 	run := jHi - jLo
-	if err := n.inner.SamplesInto(ctx, clip.SampleTime(low, sr), run, n.scratch); err != nil {
+	scratch := n.scratch.get()
+	defer n.scratch.put(scratch)
+	if err := n.inner.SamplesInto(ctx, clip.SampleTime(low, sr), run, scratch); err != nil {
 		return err
 	}
 	for j := jLo; j < jHi; j++ {
 		src := innerTotal - 1 - (startIdx + j)
 		m := src - low // index into the pulled run
-		copy(dst.Samples[j*ch:(j+1)*ch], n.scratch.Samples[m*ch:(m+1)*ch])
+		copy(dst.Samples[j*ch:(j+1)*ch], scratch.Samples[m*ch:(m+1)*ch])
 	}
 	return nil
 }

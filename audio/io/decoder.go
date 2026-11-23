@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"io"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/mowshon/moviego/v2/clip"
@@ -35,8 +36,10 @@ type DecoderOptions struct {
 }
 
 // Decoder reads interleaved float32 PCM from a media file in sample-frame order.
-// It owns one FFmpeg subprocess and is not safe for concurrent use; an audio
-// render gives each decoder to a single goroutine.
+// It owns one FFmpeg subprocess. ReadInto and Close are serialized by an
+// internal mutex so a render-scoped reaper (see Reaper) can safely close a
+// decoder while another render sharing the same node is mid-read; the decoder
+// is otherwise used from a single goroutine per render.
 type Decoder struct {
 	ctx        context.Context
 	path       string
@@ -44,6 +47,7 @@ type Decoder struct {
 	channels   int
 	frameBytes int // bytes per sample frame = nbytes * channels
 
+	mu      sync.Mutex
 	proc    *ffmpeg.Proc
 	pos     int    // index of the next sample frame ReadInto will return
 	scratch []byte // reusable skip/read buffer
@@ -56,6 +60,10 @@ type Decoder struct {
 // OpenDecoder starts decoding path from sample frame 0 at the requested (or
 // native) sample rate and channel count.
 func OpenDecoder(ctx context.Context, path string, opts DecoderOptions) (*Decoder, error) {
+	// Never launch a process under an already-canceled render context.
+	if err := ctx.Err(); err != nil {
+		return nil, clip.Wrap("open audio "+path, err)
+	}
 	sr, ch := opts.SampleRate, opts.Channels
 	if sr <= 0 || ch <= 0 {
 		info, err := ffmpeg.Probe(ctx, path, ffmpeg.ProbeOptions{})
@@ -106,8 +114,16 @@ func (d *Decoder) Channels() int { return d.channels }
 // caller that knows the timeline never needs to special-case EOF. dst must hold
 // at least count*Channels float32 samples.
 func (d *Decoder) ReadInto(start, count int, dst []float32) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
 	if d.closed {
 		return clip.ErrClosed
+	}
+	// A decoder is bound to one render's context; once that render is canceled
+	// the decoder is done — fail fast instead of relaunching FFmpeg (or
+	// reporting stale EOF silence) under a dead context.
+	if d.ctx != nil && d.ctx.Err() != nil {
+		return clip.Wrap("decode "+d.path, d.ctx.Err())
 	}
 	if count <= 0 {
 		return nil
@@ -138,14 +154,27 @@ func (d *Decoder) ReadInto(start, count int, dst []float32) error {
 	return d.readFrames(count, dst[dstFrame*d.channels:])
 }
 
-// Close stops the subprocess and releases resources. It is idempotent.
+// Close stops the subprocess and releases resources, including the scratch
+// buffer. It is idempotent and safe to call concurrently with ReadInto (a
+// concurrent read either finishes first or sees ErrClosed).
 func (d *Decoder) Close() error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
 	if d.closed {
 		return nil
 	}
 	d.closed = true
 	d.stopProc()
+	d.scratch = nil
 	return nil
+}
+
+// Closed reports whether Close has been called, so an owner can reopen instead
+// of reusing a decoder a render-scoped reaper already closed.
+func (d *Decoder) Closed() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.closed
 }
 
 // seek positions the decoder so the next read returns sample frame idx, using
@@ -197,7 +226,11 @@ func (d *Decoder) readRaw(buf []byte) (int, error) {
 	case err == nil:
 		return n, nil
 	case d.ctx.Err() != nil:
+		// Canceled mid-read: kill the process AND release the scratch buffer on
+		// the cancel path itself rather than leaving both for the next pull (or
+		// the process reaper) to clean up.
 		d.stopProc()
+		d.scratch = nil
 		return n, clip.Wrap("decode "+d.path, d.ctx.Err())
 	case err == io.EOF || err == io.ErrUnexpectedEOF:
 		// End of stream (possibly mid-frame): keep the whole frames we have and

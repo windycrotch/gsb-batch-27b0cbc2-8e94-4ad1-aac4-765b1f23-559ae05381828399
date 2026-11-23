@@ -53,9 +53,9 @@ func SubclipDur(inner AudioClip, offset, dur clip.Time) AudioClip {
 	return newShift(inner, offset, dur, clip.Finite(dur) && dur >= 0)
 }
 
-// newShift builds a shiftNode with its own scratch buffer.
+// newShift builds a shiftNode with its own scratch pool.
 func newShift(inner AudioClip, offset, dur clip.Time, hasDur bool) *shiftNode {
-	return &shiftNode{inner: inner, offset: offset, dur: dur, hasDur: hasDur, scratch: &clip.AudioBuffer{}}
+	return &shiftNode{inner: inner, offset: offset, dur: dur, hasDur: hasDur, scratch: newScratchPool()}
 }
 
 func clampTime(t, lo, hi clip.Time) clip.Time {
@@ -79,7 +79,7 @@ type shiftNode struct {
 	dur     clip.Time
 	hasDur  bool
 	start   clip.Time
-	scratch *clip.AudioBuffer
+	scratch *scratchPool
 }
 
 func (n *shiftNode) Start() clip.Time    { return n.start }
@@ -90,14 +90,12 @@ func (n *shiftNode) End() clip.Time { return clip.EndOr(n.start, n.dur, n.hasDur
 func (n *shiftNode) WithStart(t clip.Time) clip.Clip {
 	c := *n
 	c.start = t
-	c.scratch = &clip.AudioBuffer{}
 	return &c
 }
 
 func (n *shiftNode) WithDuration(d clip.Time) clip.Clip {
 	c := *n
 	c.dur, c.hasDur = d, true
-	c.scratch = &clip.AudioBuffer{}
 	return &c
 }
 
@@ -108,7 +106,6 @@ func (n *shiftNode) WithEnd(end clip.Time, changeDuration bool) clip.Clip {
 	} else if c.hasDur {
 		c.start = end - c.dur
 	}
-	c.scratch = &clip.AudioBuffer{}
 	return &c
 }
 
@@ -153,10 +150,12 @@ func (n *shiftNode) SamplesInto(ctx context.Context, start clip.Time, count int,
 	run := jHi - jLo
 	// Pull the run at the inner frame aligned to dst[jLo]; SampleTime is the left
 	// inverse of SampleIndex, so this lands on inner frame srcBase+jLo exactly.
-	if err := n.inner.SamplesInto(ctx, clip.SampleTime(srcBase+jLo, sr), run, n.scratch); err != nil {
+	scratch := n.scratch.get()
+	defer n.scratch.put(scratch)
+	if err := n.inner.SamplesInto(ctx, clip.SampleTime(srcBase+jLo, sr), run, scratch); err != nil {
 		return err
 	}
-	copy(dst.Samples[jLo*ch:jHi*ch], n.scratch.Samples[:run*ch])
+	copy(dst.Samples[jLo*ch:jHi*ch], scratch.Samples[:run*ch])
 	return nil
 }
 
@@ -179,7 +178,7 @@ func Speed(inner AudioClip, factor float64) AudioClip {
 	if ok {
 		out = clip.Time(float64(dur) / factor)
 	}
-	return &speedNode{inner: inner, factor: factor, dur: out, hasDur: ok, scratch: &clip.AudioBuffer{}}
+	return &speedNode{inner: inner, factor: factor, dur: out, hasDur: ok, scratch: newScratchPool()}
 }
 
 type speedNode struct {
@@ -188,7 +187,7 @@ type speedNode struct {
 	dur     clip.Time
 	hasDur  bool
 	start   clip.Time
-	scratch *clip.AudioBuffer
+	scratch *scratchPool
 }
 
 func (n *speedNode) Start() clip.Time    { return n.start }
@@ -199,14 +198,12 @@ func (n *speedNode) End() clip.Time { return clip.EndOr(n.start, n.dur, n.hasDur
 func (n *speedNode) WithStart(t clip.Time) clip.Clip {
 	c := *n
 	c.start = t
-	c.scratch = &clip.AudioBuffer{}
 	return &c
 }
 
 func (n *speedNode) WithDuration(d clip.Time) clip.Clip {
 	c := *n
 	c.dur, c.hasDur = d, true
-	c.scratch = &clip.AudioBuffer{}
 	return &c
 }
 
@@ -217,7 +214,6 @@ func (n *speedNode) WithEnd(end clip.Time, changeDuration bool) clip.Clip {
 	} else if c.hasDur {
 		c.start = end - c.dur
 	}
-	c.scratch = &clip.AudioBuffer{}
 	return &c
 }
 
@@ -244,7 +240,9 @@ func (n *speedNode) SamplesInto(ctx context.Context, start clip.Time, count int,
 	if srcCount < 1 {
 		srcCount = 1
 	}
-	if err := n.inner.SamplesInto(ctx, clip.SampleTime(srcLo, rate), srcCount, n.scratch); err != nil {
+	scratch := n.scratch.get()
+	defer n.scratch.put(scratch)
+	if err := n.inner.SamplesInto(ctx, clip.SampleTime(srcLo, rate), srcCount, scratch); err != nil {
 		return err
 	}
 	for j := 0; j < count; j++ {
@@ -263,7 +261,7 @@ func (n *speedNode) SamplesInto(ctx context.Context, start clip.Time, count int,
 		}
 		b0, b1, dBase := k*ch, k2*ch, j*ch
 		for c := 0; c < ch; c++ {
-			dst.Samples[dBase+c] = n.scratch.Samples[b0+c]*(1-frac) + n.scratch.Samples[b1+c]*frac
+			dst.Samples[dBase+c] = scratch.Samples[b0+c]*(1-frac) + scratch.Samples[b1+c]*frac
 		}
 	}
 	return nil
@@ -277,7 +275,7 @@ func Loop(inner AudioClip, n int) AudioClip {
 	if !clip.Finite(srcDur) || srcDur <= 0 || n < 1 {
 		return inner
 	}
-	return &loopNode{inner: inner, srcDur: srcDur, dur: srcDur * clip.Time(n), scratch: &clip.AudioBuffer{}}
+	return &loopNode{inner: inner, srcDur: srcDur, dur: srcDur * clip.Time(n), scratch: newScratchPool()}
 }
 
 type loopNode struct {
@@ -285,7 +283,7 @@ type loopNode struct {
 	srcDur  clip.Time
 	dur     clip.Time
 	start   clip.Time
-	scratch *clip.AudioBuffer
+	scratch *scratchPool
 }
 
 func (n *loopNode) Start() clip.Time    { return n.start }
@@ -295,14 +293,12 @@ func (n *loopNode) End() clip.Time      { return n.start + n.dur }
 func (n *loopNode) WithStart(t clip.Time) clip.Clip {
 	c := *n
 	c.start = t
-	c.scratch = &clip.AudioBuffer{}
 	return &c
 }
 
 func (n *loopNode) WithDuration(d clip.Time) clip.Clip {
 	c := *n
 	c.dur = d
-	c.scratch = &clip.AudioBuffer{}
 	return &c
 }
 
@@ -313,7 +309,6 @@ func (n *loopNode) WithEnd(end clip.Time, changeDuration bool) clip.Clip {
 	} else {
 		c.start = end - c.dur
 	}
-	c.scratch = &clip.AudioBuffer{}
 	return &c
 }
 
@@ -361,6 +356,8 @@ func (n *loopNode) SamplesInto(ctx context.Context, start clip.Time, count int, 
 		clear(dst.Samples[jHi*ch:])
 	}
 
+	scratch := n.scratch.get()
+	defer n.scratch.put(scratch)
 	for j := jLo; j < jHi; {
 		s := startIdx + j
 		srcIdx := s % srcLen
@@ -368,10 +365,10 @@ func (n *loopNode) SamplesInto(ctx context.Context, start clip.Time, count int, 
 		if avail := srcLen - srcIdx; avail < run {
 			run = avail
 		}
-		if err := n.inner.SamplesInto(ctx, clip.SampleTime(srcIdx, rate), run, n.scratch); err != nil {
+		if err := n.inner.SamplesInto(ctx, clip.SampleTime(srcIdx, rate), run, scratch); err != nil {
 			return err
 		}
-		copy(dst.Samples[j*ch:(j+run)*ch], n.scratch.Samples[:run*ch])
+		copy(dst.Samples[j*ch:(j+run)*ch], scratch.Samples[:run*ch])
 		j += run
 	}
 	return nil

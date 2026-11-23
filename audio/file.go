@@ -126,9 +126,12 @@ func (n *AudioFileNode) SamplesInto(ctx context.Context, start clip.Time, count 
 	}
 	// Bind the decoder to the caller's context, reopening if it changed so a
 	// cancelable render can always kill the FFmpeg process (see VideoFileNode).
-	if r.dec == nil || r.decCtx != ctx {
+	// A decoder already closed from the outside (e.g. reaped at the end of a
+	// previous render under this same context) is reopened the same way.
+	if r.dec == nil || r.decCtx != ctx || r.dec.Closed() {
 		if r.dec != nil {
 			_ = r.dec.Close()
+			r.dec, r.decCtx = nil, nil
 		}
 		dec, err := audioio.OpenDecoder(ctx, n.path, audioio.DecoderOptions{
 			SampleRate: n.sampleRate,
@@ -139,7 +142,18 @@ func (n *AudioFileNode) SamplesInto(ctx context.Context, start clip.Time, count 
 		}
 		r.dec, r.decCtx = dec, ctx
 	}
-	return r.dec.ReadInto(idx, count, dst.Samples)
+	err := r.dec.ReadInto(idx, count, dst.Samples)
+	if err != nil {
+		// A failed pull — above all a render canceled mid-decode — leaves the
+		// decoder's FFmpeg process dead or dying and its scratch held for
+		// nothing. Drop the decoder on the error path itself so the process is
+		// killed and its buffers released now, not whenever the next pull or
+		// Close happens to rebind. The next pull reopens lazily, so a retry
+		// over this same node starts from a clean decoder.
+		_ = r.dec.Close()
+		r.dec, r.decCtx = nil, nil
+	}
+	return err
 }
 
 // Close stops the decoder. It is idempotent.
