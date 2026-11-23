@@ -67,7 +67,12 @@ func main() {
 
 	// A real application would call Packetize in a loop with proper timing.
 	// For this demo we aren't actually timing things
-	packets := packetizer.Packetize(data, 0)
+	packets, err := packetizer.Packetize(data, 0)
+	if err != nil {
+		// The frame is still returned without the failing extension; a real
+		// application decides whether to send it or surface the error.
+		log.Printf("packetize warning: %v", err)
+	}
 
 	for i := range packets {
 		marshaled, err := packets[i].Marshal()

@@ -4,6 +4,9 @@
 package rtp
 
 import (
+	"errors"
+	"fmt"
+	"sync"
 	"time"
 )
 
@@ -12,15 +15,41 @@ type Payloader interface {
 	Payload(mtu uint16, payload []byte) [][]byte
 }
 
+// ErrAbsSendTimeExtension is returned when the AbsSendTime header extension
+// could not be attached to the last packet of a frame. When it is returned,
+// Packetize still returns the complete set of packets for the frame, just
+// without the extension, and the consumed sequence numbers and advanced
+// timestamp are identical to the success path.
+var ErrAbsSendTimeExtension = errors.New("failed to write AbsSendTime extension")
+
 // Packetizer packetizes a payload.
 type Packetizer interface {
-	Packetize(payload []byte, samples uint32) []*Packet
+	// Packetize splits a frame into one or more RTP packets.
+	//
+	// All packets of a frame share the same timestamp and use consecutive
+	// sequence numbers. When the AbsSendTime extension is enabled, it is
+	// attached to the last packet of the frame only.
+	//
+	// An empty payload does not produce any packet (and therefore does not
+	// consume sequence numbers), it only advances the timestamp by samples.
+	//
+	// If attaching the AbsSendTime extension fails, the full set of packets
+	// is still returned (without the extension) together with a non-nil
+	// error wrapping ErrAbsSendTimeExtension. The sequence numbers consumed
+	// and the timestamp advanced are the same as on the success path, so a
+	// later frame continues with consecutive sequence numbers and a
+	// monotonically increasing timestamp.
+	Packetize(payload []byte, samples uint32) ([]*Packet, error)
 	GeneratePadding(samples uint32) []*Packet
 	EnableAbsSendTime(value int)
 	SkipSamples(skippedSamples uint32)
 }
 
 type packetizer struct {
+	// mu guards every field below. A single packetizer may be shared by
+	// multiple sending goroutines.
+	mu sync.Mutex
+
 	MTU         uint16
 	PayloadType uint8
 	SSRC        uint32
@@ -108,16 +137,25 @@ func NewPacketizerWithOptions(
 }
 
 func (p *packetizer) EnableAbsSendTime(value int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
 	p.extensionNumbers.AbsSendTime = value
 }
 
 // Packetize packetizes the payload of an RTP packet and returns one or more RTP packets.
-func (p *packetizer) Packetize(payload []byte, samples uint32) []*Packet {
-	// Guard against an empty payload
-	if len(payload) == 0 {
-		p.SkipSamples(samples)
+func (p *packetizer) Packetize(payload []byte, samples uint32) ([]*Packet, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 
-		return nil
+	// Guard against an empty payload: only advance the timestamp, do not
+	// consume any sequence number. Returning nil without an error keeps this
+	// distinguishable from an extension-write failure, which always returns
+	// the packets together with a non-nil error.
+	if len(payload) == 0 {
+		p.Timestamp += samples
+
+		return nil, nil //nolint:nilnil // documented empty-payload contract
 	}
 
 	payloads := p.Payloader.Payload(p.MTU-12, payload)
@@ -138,22 +176,50 @@ func (p *packetizer) Packetize(payload []byte, samples uint32) []*Packet {
 			Payload: pp,
 		}
 	}
+	// The timestamp is advanced before the extension is written, so a failed
+	// extension write cannot roll it back or make the next frame's timestamp
+	// go backwards.
 	p.Timestamp += samples
 
+	// Extension id 0 means the extension is disabled: write nothing and do
+	// not change the number of produced packets.
 	if len(packets) != 0 && p.extensionNumbers.AbsSendTime != 0 {
-		sendTime := NewAbsSendTimeExtension(p.timegen())
-		// apply http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time
-		b, err := sendTime.Marshal()
-		if err != nil {
-			return nil // never happens
-		}
-		err = packets[len(packets)-1].SetExtension(uint8(p.extensionNumbers.AbsSendTime), b) // nolint: gosec // G115
-		if err != nil {
-			return nil // never happens
+		if err := p.writeAbsSendTime(packets[len(packets)-1]); err != nil {
+			// Do not drop the frame: return the packets without the
+			// extension together with a diagnosable error. The sequence
+			// numbers above and the timestamp advance above are already
+			// committed, matching the success path exactly.
+			return packets, fmt.Errorf("%w: %w", ErrAbsSendTimeExtension, err)
 		}
 	}
 
-	return packets
+	return packets, nil
+}
+
+// writeAbsSendTime attaches the AbsSendTime extension (see
+// http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time) to the last
+// packet of a frame. The packet is left untouched when an error is returned.
+func (p *packetizer) writeAbsSendTime(packet *Packet) error {
+	id := uint8(p.extensionNumbers.AbsSendTime) // nolint: gosec // G115
+	// Packets produced by Packetize always start without extensions and the
+	// 3-byte AbsSendTime payload therefore uses the one-byte header extension
+	// profile, whose legal ids are 1..14 and payloads must be at most 16
+	// bytes. Validate explicitly instead of silently emitting a packet with
+	// the reserved id or an illegal extension size.
+	if err := headerExtensionCheck(ExtensionProfileOneByte, id, make([]byte, absSendTimeExtensionSize)); err != nil {
+		return fmt.Errorf("invalid AbsSendTime extension id %d: %w", id, err)
+	}
+
+	sendTime := NewAbsSendTimeExtension(p.timegen())
+	b, err := sendTime.Marshal()
+	if err != nil {
+		return fmt.Errorf("marshal AbsSendTime: %w", err)
+	}
+	if err := packet.SetExtension(id, b); err != nil {
+		return fmt.Errorf("set AbsSendTime extension: %w", err)
+	}
+
+	return nil
 }
 
 // GeneratePadding returns required padding-only packages.
@@ -162,6 +228,9 @@ func (p *packetizer) GeneratePadding(samples uint32) []*Packet {
 	if samples == 0 {
 		return nil
 	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
 
 	packets := make([]*Packet, samples)
 
@@ -187,5 +256,8 @@ func (p *packetizer) GeneratePadding(samples uint32) []*Packet {
 // SkipSamples causes a gap in sample count between Packetize requests so the
 // RTP payloads produced have a gap in timestamps.
 func (p *packetizer) SkipSamples(skippedSamples uint32) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
 	p.Timestamp += skippedSamples
 }

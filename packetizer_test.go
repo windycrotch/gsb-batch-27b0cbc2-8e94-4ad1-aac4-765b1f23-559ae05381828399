@@ -17,7 +17,8 @@ func TestPacketizer(t *testing.T) {
 	multiplepayload := make([]byte, 128)
 	// use the G722 payloader here, because it's very simple and all 0s is valid G722 data.
 	packetizer := NewPacketizer(100, 98, 0x1234ABCD, &codecs.G722Payloader{}, NewRandomSequencer(), 90000)
-	packets := packetizer.Packetize(multiplepayload, 2000)
+	packets, err := packetizer.Packetize(multiplepayload, 2000)
+	assert.NoError(t, err)
 
 	expectedLen := 2
 	if len(packets) != expectedLen {
@@ -46,7 +47,8 @@ func TestPacketizer_AbsSendTime(t *testing.T) {
 	pktizer.EnableAbsSendTime(1)
 
 	payload := []byte{0x11, 0x12, 0x13, 0x14}
-	packets := pktizer.Packetize(payload, 2000)
+	packets, err := pktizer.Packetize(payload, 2000)
+	assert.NoError(t, err)
 
 	expected := &Packet{
 		Header: Header{
@@ -76,7 +78,8 @@ func TestPacketizer_AbsSendTime(t *testing.T) {
 func TestPacketizer_Roundtrip(t *testing.T) {
 	multiplepayload := make([]byte, 128)
 	packetizer := NewPacketizer(100, 98, 0x1234ABCD, &codecs.G722Payloader{}, NewRandomSequencer(), 90000)
-	packets := packetizer.Packetize(multiplepayload, 1000)
+	packets, err := packetizer.Packetize(multiplepayload, 1000)
+	assert.NoError(t, err)
 
 	rawPkts := make([][]byte, 0, 1400)
 	for _, pkt := range packets {
@@ -158,7 +161,8 @@ func TestNewPacketizerWithOptions_WithOptions(t *testing.T) {
 	assert.Equal(t, uint32(90000), p.ClockRate)
 
 	payload := []byte{0x11, 0x12, 0x13, 0x14}
-	packets := pack.Packetize(payload, 2000)
+	packets, err := pack.Packetize(payload, 2000)
+	assert.NoError(t, err)
 
 	assert.Len(t, packets, 1, "Should generate exactly one packet")
 	assert.Equal(t, uint8(98), packets[0].PayloadType)
@@ -196,7 +200,8 @@ func TestPacketizer_Empty_Payload(t *testing.T) {
 			payload = nil
 		}
 
-		packets := pktizer.Packetize(payload, 2000)
+		packets, err := pktizer.Packetize(payload, 2000)
+		assert.NoError(t, err)
 
 		if isEmptyPayload {
 			assert.Len(t, packets, 0)
@@ -238,7 +243,8 @@ func FuzzPacketizer_Packetize_G722(f *testing.F) {
 			packetizer.EnableAbsSendTime(1)
 		}
 
-		packets := packetizer.Packetize(payload, samples)
+		packets, err := packetizer.Packetize(payload, samples)
+		assert.NoError(t, err)
 
 		if len(payload) == 0 {
 			assert.Nil(t, packets)
@@ -333,7 +339,20 @@ func FuzzPacketizer_SkipSamples_And_Timestamps(f *testing.F) {
 
 		packetizer.SkipSamples(skip)
 
-		pkts1 := packetizer.Packetize(p1, samples1)
+		// An effective MTU of zero (mtu <= 12) makes the G722 payloader emit
+		// no payloads even for non-empty input; nothing can then be asserted
+		// about the produced packets.
+		if mtu <= 12 {
+			_, err1 := packetizer.Packetize(p1, samples1)
+			assert.NoError(t, err1)
+			_, err2 := packetizer.Packetize(p2, samples2)
+			assert.NoError(t, err2)
+
+			return
+		}
+
+		pkts1, err := packetizer.Packetize(p1, samples1)
+		assert.NoError(t, err)
 		if len(p1) == 0 {
 			assert.Nil(t, pkts1)
 		} else {
@@ -341,7 +360,8 @@ func FuzzPacketizer_SkipSamples_And_Timestamps(f *testing.F) {
 			assert.Equal(t, startTS+skip, pkts1[0].Timestamp)
 		}
 
-		pkts2 := packetizer.Packetize(p2, samples2)
+		pkts2, err := packetizer.Packetize(p2, samples2)
+		assert.NoError(t, err)
 		if len(p2) == 0 {
 			assert.Nil(t, pkts2)
 		} else {
