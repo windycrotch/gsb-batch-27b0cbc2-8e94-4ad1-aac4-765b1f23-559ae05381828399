@@ -1,0 +1,231 @@
+//go:build darwin
+
+package video
+
+import (
+	"context"
+	"fmt"
+	"os/exec"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+)
+
+var avFoundationDeviceIDRegex = regexp.MustCompile(`^\d+$`)
+
+func ListDevices() ([]Device, error) {
+	out, err := exec.Command("ffmpeg", "-hide_banner", "-f", "avfoundation", "-list_devices", "true", "-i", "").CombinedOutput()
+	devices := parseAVFoundationDevices(string(out))
+	if len(devices) > 0 {
+		return devices, nil
+	}
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to list avfoundation devices: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+
+	return devices, nil
+}
+
+func GetDeviceResolution(device Device) (int, int, error) {
+	if !avFoundationDeviceIDRegex.MatchString(device.ID) {
+		return 640, 480, fmt.Errorf("unsafe avfoundation device id rejected: %q", device.ID)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// #nosec G204 -- Sanitized above using regex validation.
+	out, err := exec.CommandContext(
+		ctx,
+		"ffmpeg",
+		"-hide_banner",
+		"-nostdin",
+		"-f", "avfoundation",
+		"-framerate", "30",
+		"-i", fmt.Sprintf("%s:none", device.ID),
+		"-frames:v", "1",
+		"-f", "null",
+		"-",
+	).CombinedOutput()
+
+	w, h, parseErr := parseAVFoundationResolution(string(out))
+	if parseErr == nil {
+		return w, h, nil
+	}
+
+	if ctx.Err() != nil {
+		return 640, 480, fmt.Errorf("failed to probe avfoundation resolution: %w", ctx.Err())
+	}
+	if err != nil {
+		return 640, 480, fmt.Errorf("failed to probe avfoundation resolution: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+
+	return 640, 480, parseErr
+}
+
+func GetDeviceFramerate(device Device, captureWidth, captureHeight, targetFPS int) (float64, error) {
+	if !avFoundationDeviceIDRegex.MatchString(device.ID) {
+		return 30, fmt.Errorf("unsafe avfoundation device id rejected: %q", device.ID)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Ask for an intentionally invalid framerate so AVFoundation prints its supported modes without starting capture
+	// #nosec G204 -- Sanitized above using regex validation.
+	out, err := exec.CommandContext(
+		ctx,
+		"ffmpeg",
+		"-hide_banner",
+		"-nostdin",
+		"-f", "avfoundation",
+		"-framerate", "10000",
+		"-i", fmt.Sprintf("%s:none", device.ID),
+		"-frames:v", "1",
+		"-f", "null",
+		"-",
+	).CombinedOutput()
+
+	modes := parseAVFoundationModes(string(out))
+	if fps := chooseCaptureFramerate(targetFPS, captureWidth, captureHeight, modes); fps > 0 {
+		return fps, nil
+	}
+
+	if ctx.Err() != nil {
+		return 30, fmt.Errorf("failed to probe avfoundation framerate: %w", ctx.Err())
+	}
+	if err != nil {
+		return 30, fmt.Errorf("failed to probe avfoundation framerate: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+
+	return 30, fmt.Errorf("could not parse framerate from avfoundation output")
+}
+
+func NewSession(device Device, captureWidth, captureHeight, width, height, fps int, captureFPS float64) (*Session, error) {
+	if !avFoundationDeviceIDRegex.MatchString(device.ID) {
+		return nil, fmt.Errorf("unsafe avfoundation device id rejected: %q", device.ID)
+	}
+	if captureFPS <= 0 {
+		captureFPS = 30
+	}
+
+	args := []string{
+		"-hide_banner",
+		"-loglevel", "error",
+		"-nostdin",
+		"-fflags", "nobuffer",
+		"-flags", "low_delay",
+		"-f", "avfoundation",
+		"-video_size", fmt.Sprintf("%dx%d", captureWidth, captureHeight),
+		"-framerate", formatFramerate(captureFPS),
+		"-i", fmt.Sprintf("%s:none", device.ID),
+		"-vf", fmt.Sprintf("scale=%d:%d", width, height),
+		"-r", fmt.Sprintf("%d", fps),
+		"-f", "rawvideo",
+		"-pix_fmt", "rgb24",
+		"pipe:1",
+	}
+
+	return newSession(width, height, args)
+}
+
+func parseAVFoundationDevices(output string) []Device {
+	deviceLine := regexp.MustCompile(`\[(\d+)\]\s+(.+)$`)
+	devices := make([]Device, 0)
+	inVideoDevices := false
+
+	for _, line := range strings.Split(output, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.Contains(trimmed, "AVFoundation video devices:") {
+			inVideoDevices = true
+			continue
+		}
+
+		if strings.Contains(trimmed, "AVFoundation audio devices:") {
+			inVideoDevices = false
+			continue
+		}
+
+		if !inVideoDevices {
+			continue
+		}
+
+		matches := deviceLine.FindStringSubmatch(trimmed)
+		if len(matches) < 3 {
+			continue
+		}
+
+		devices = append(devices, Device{
+			ID:   matches[1],
+			Name: strings.TrimSpace(matches[2]),
+		})
+	}
+
+	return devices
+}
+
+func parseAVFoundationResolution(output string) (int, int, error) {
+	dimensions := regexp.MustCompile(`^(\d+)x(\d+)(?:\s|$)`)
+	fallbackW, fallbackH := 0, 0
+
+	for _, line := range strings.Split(output, "\n") {
+		if !strings.Contains(line, "Video:") {
+			continue
+		}
+
+		for _, field := range strings.Split(line, ",") {
+			matches := dimensions.FindStringSubmatch(strings.TrimSpace(field))
+			if len(matches) < 3 {
+				continue
+			}
+
+			w, _ := strconv.Atoi(matches[1])
+			h, _ := strconv.Atoi(matches[2])
+			if w > 0 && h > 0 {
+				if fallbackW == 0 || fallbackH == 0 {
+					fallbackW, fallbackH = w, h
+				}
+				if w >= h {
+					return w, h, nil
+				}
+			}
+		}
+	}
+	if fallbackW > 0 && fallbackH > 0 {
+		if fallbackH > fallbackW {
+			return fallbackH, fallbackW, nil
+		}
+		return fallbackW, fallbackH, nil
+	}
+
+	return 640, 480, fmt.Errorf("could not parse resolution from avfoundation output")
+}
+
+func parseAVFoundationModes(output string) []captureMode {
+	modeLine := regexp.MustCompile(`(\d+)x(\d+)@\[(.*?)\]fps`)
+	modes := make([]captureMode, 0)
+
+	for _, matches := range modeLine.FindAllStringSubmatch(output, -1) {
+		if len(matches) < 4 {
+			continue
+		}
+
+		w, _ := strconv.Atoi(matches[1])
+		h, _ := strconv.Atoi(matches[2])
+		framerates := make([]float64, 0)
+		for _, field := range strings.Fields(matches[3]) {
+			fps, err := strconv.ParseFloat(field, 64)
+			if err == nil && fps > 0 {
+				framerates = append(framerates, fps)
+			}
+		}
+
+		if w > 0 && h > 0 && len(framerates) > 0 {
+			modes = append(modes, captureMode{width: w, height: h, framerates: framerates})
+		}
+	}
+
+	return modes
+}
