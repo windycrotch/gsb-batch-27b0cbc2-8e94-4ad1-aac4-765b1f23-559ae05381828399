@@ -1,0 +1,15 @@
+# .gitignore file
+
+# Ignore binaries
+
+rtmp-server
+rtmp-server.exe
+
+# Ignore temp files
+
+temp
+
+# Ignore .env
+
+.env
+*.log
