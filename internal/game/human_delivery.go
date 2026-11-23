@@ -336,13 +336,19 @@ func (s *Service) refreshHumanPresence(ctx context.Context, c *Connection) error
 	return nil
 }
 func (s *Service) removeHumanPresence(c *Connection) {
+	s.removeHumanPresenceByID(c.humanPresenceID)
+}
+
+// removeHumanPresenceByID 按租约编号清理；接管前任连接时新连接已持锁，
+// 不能反向再取旧连接锁，由调用方先取出编号。
+func (s *Service) removeHumanPresenceByID(id string) {
 	store, ok := s.Accounts.(HumanPresenceAccounts)
-	if !ok || c.humanPresenceID == "" {
+	if !ok || id == "" {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	if err := store.RemoveHumanPresence(ctx, c.humanPresenceID); err != nil {
+	if err := store.RemoveHumanPresence(ctx, id); err != nil {
 		log.Printf("真人离线租约清理失败，等待租约过期：%v", err)
 	}
 	_, _ = s.humanOnlineIDs(ctx)

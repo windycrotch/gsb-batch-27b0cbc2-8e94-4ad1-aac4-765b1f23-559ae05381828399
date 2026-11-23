@@ -4,9 +4,14 @@ import "encoding/hex"
 
 // 注册表只保存在线连接；传输断开时必须Detach，避免保留离线会话。
 func (s *Service) attachPlayer(c *Connection) {
-	key := hex.EncodeToString(selectedOID(c))
 	s.onlineMu.Lock()
 	defer s.onlineMu.Unlock()
+	s.attachPlayerLocked(c)
+}
+
+// 调用方持有连接锁与 onlineMu。
+func (s *Service) attachPlayerLocked(c *Connection) {
+	key := hex.EncodeToString(selectedOID(c))
 	if s.online == nil {
 		s.online = map[string]map[*Connection]bool{}
 	}
@@ -18,6 +23,33 @@ func (s *Service) attachPlayer(c *Connection) {
 	c.lastDailyCheckDay = socialDay(s.Now())
 	// Handle已持连接锁，通知好友延迟至它的解锁defer，避免同时登入互锁。
 	c.pendingSocialOIDs = append(c.pendingSocialOIDs, socialFriendOIDs(c.SelectedAvatarUnsafe().Progress.Social)...)
+}
+
+// takeoverConnection 把角色在线注册原子切换到新连接：同角色旧连接移出注册表，
+// 新连接登记为该角色唯一在线会话，返回被接管的前任连接由调用方终止。
+// 调用方持有新连接锁。注册表手术只在 onlineMu 内完成，不取旧连接锁，
+// 避免与 Detach（连接锁→onlineMu）的锁序相逆造成死锁。
+func (s *Service) takeoverConnection(c *Connection, oid []byte) []*Connection {
+	key := hex.EncodeToString(oid)
+	s.onlineMu.Lock()
+	var predecessors []*Connection
+	for other := range s.online[key] {
+		if other == c {
+			continue
+		}
+		predecessors = append(predecessors, other)
+		delete(s.online[key], other)
+	}
+	s.attachPlayerLocked(c)
+	s.onlineMu.Unlock()
+	return predecessors
+}
+
+// OnlineConnections 返回角色当前绑定的在线连接数；接管后必须恰好为 1。
+func (s *Service) OnlineConnections(oid []byte) int {
+	s.onlineMu.Lock()
+	defer s.onlineMu.Unlock()
+	return len(s.online[hex.EncodeToString(oid)])
 }
 
 func (s *Service) Detach(c *Connection) {

@@ -270,6 +270,8 @@ const (
 type Connection struct {
 	mu               sync.Mutex
 	phase            Phase
+	done             chan struct{}
+	closeOnce        sync.Once
 	identity         Identity
 	connType         int
 	hostnum          int
@@ -328,9 +330,21 @@ type Connection struct {
 }
 
 func NewConnection() *Connection {
-	return &Connection{phase: Connected, finishedGuides: map[int]bool{}}
+	return &Connection{phase: Connected, finishedGuides: map[int]bool{}, done: make(chan struct{})}
 }
 func (c *Connection) Phase() Phase { c.mu.Lock(); defer c.mu.Unlock(); return c.phase }
+
+// Done 在会话被接管或终止时关闭；传输层据此停止读写并关闭 socket。
+func (c *Connection) Done() <-chan struct{} { return c.done }
+
+// Close 终止会话：阶段置为已关闭并通知传输层；幂等，断开重入安全。
+// 被同账号新连接接管后，旧连接不得再以原角色身份处理业务或推送战斗时钟。
+func (c *Connection) Close() {
+	c.mu.Lock()
+	c.phase = Closed
+	c.mu.Unlock()
+	c.closeOnce.Do(func() { close(c.done) })
+}
 
 // SelectedAvatar 返回当前鉴权账号在所选服务器上的角色，供传输层绑定实体。
 func (c *Connection) SelectedAvatar() (Avatar, bool) {

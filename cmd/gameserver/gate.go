@@ -35,6 +35,9 @@ type gate struct {
 	mu          sync.Mutex
 	read, write *rc4
 	avatarReady bool
+	// holdPushes 在重连接管期间暂停定时推送：Resume 提交角色状态到
+	// connect_reply+战斗回放整批写出之间，战斗时钟不得抢先进入 RC4 流。
+	holdPushes  bool
 	accountID   []byte
 	avatarID    []byte
 	avatarInfo  game.AvatarInfo
@@ -50,6 +53,21 @@ func newGate(maxPayload int, logf func(string, ...any)) *gate {
 		accountID:  entityID(1),
 		avatarID:   entityID(2),
 	}
+}
+
+// pushesHeld 报告接管批次是否尚未写出；为真时定时推送整体跳过本次节拍，
+// 不提前推进业务时钟，因此不丢帧也不与回包批次争序。
+func (g *gate) pushesHeld() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.holdPushes
+}
+
+// releasePushes 在回包批次整批写出后恢复定时推送；未持有接管窗口时是空操作。
+func (g *gate) releasePushes() {
+	g.mu.Lock()
+	g.holdPushes = false
+	g.mu.Unlock()
 }
 
 // entityID 生成 12 字节 bson ObjectId 兼容 id（客户端 IdManager.bytes2id=ObjectId(bytes) 要求 12B）。
@@ -131,10 +149,18 @@ func (g *gate) handleFrame(svc *game.Service, conn *game.Connection, key *rsa.Pr
 		}
 		g.logf("connect_server type=%d device=%q", req.Type, req.DeviceID)
 		if req.Type == 1 {
+			// 接管窗口内暂停本连接的定时推送：恢复事务提交角色状态后，
+			// 战斗时钟若在回包批次写出前抢跑，会以未更新的实体绑定错帧。
+			g.mu.Lock()
+			g.holdPushes = true
+			g.mu.Unlock()
 			ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
-			defer cancel()
 			avatar, replay, err := svc.Resume(ctx, conn, req.EntityID, string(req.DeviceID), req.AuthMsg)
+			cancel()
 			if err != nil {
+				g.mu.Lock()
+				g.holdPushes = false
+				g.mu.Unlock()
 				g.logf("重连拒绝: %v", err)
 				return []mobileproto.Frame{{Command: mobileproto.CmdConnectReply, Payload: mobileproto.EncodeConnectReply(3, nil)}}
 			}

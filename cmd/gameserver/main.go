@@ -180,13 +180,29 @@ func serveWithIdleTimeout(conn net.Conn, mgr *session.Manager, svc *game.Service
 	clockCtx, stopClock := context.WithCancel(context.Background())
 	defer stopClock()
 	go func() {
+		// 会话被同账号新连接接管（或被服务端终止）时立即停止读写，
+		// 旧连接不得继续以原角色身份收发业务。
+		select {
+		case <-biz.Done():
+			_ = conn.Close()
+		case <-clockCtx.Done():
+		}
+	}()
+	go func() {
 		ticker := time.NewTicker(100 * time.Millisecond)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-clockCtx.Done():
 				return
+			case <-biz.Done():
+				return
 			case <-ticker.C:
+				if g.pushesHeld() {
+					// 重连接管批次未写出前暂停时钟：本拍不推进、不丢帧，
+					// 下一拍在回包批次之后按序写出。
+					continue
+				}
 				ctx, cancel := context.WithTimeout(clockCtx, requestTimeout)
 				pushes, err := svc.Tick(ctx, biz)
 				cancel()
@@ -228,6 +244,8 @@ func serveWithIdleTimeout(conn net.Conn, mgr *session.Manager, svc *game.Service
 			if !writeFrames(g.handleFrame(svc, biz, key, f)) {
 				return
 			}
+			// 重连回包批次已整批进入 RC4 流，恢复本连接的定时推送。
+			g.releasePushes()
 		}
 		if err != nil {
 			log.Printf("连接 %s 读取结束: %v", s.ID, err)
