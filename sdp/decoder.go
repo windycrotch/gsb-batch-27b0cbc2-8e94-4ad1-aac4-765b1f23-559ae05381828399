@@ -229,6 +229,7 @@ func (d *Decoder) rtpmap(f *Format, v string) error {
 	if f.ClockRate, err = strconv.Atoi(p[1]); err != nil {
 		return err
 	}
+	f.hasRTPMap = true
 	return nil
 }
 
@@ -250,6 +251,7 @@ func (d *Decoder) proto(m *Media, v string) error {
 		if m.PortNum, err = strconv.Atoi(p[1]); err != nil {
 			return err
 		}
+		m.hasPortNum = true
 	}
 	if m.Port, err = strconv.Atoi(p[0]); err != nil {
 		return err
@@ -308,6 +310,7 @@ func (d *Decoder) connection(v string) (*Connection, error) {
 				return nil, err
 			}
 			c.AddressNum = int(num)
+			c.hasAddrNum = true
 		}
 		if len(p) > 1 {
 			ttl, err := d.int(p[1])
@@ -315,6 +318,7 @@ func (d *Decoder) connection(v string) (*Connection, error) {
 				return nil, err
 			}
 			c.Address, c.TTL = p[0], int(ttl)
+			c.hasTTL = true
 		}
 	case TypeIPv6:
 		if len(p) > 1 {
@@ -323,6 +327,7 @@ func (d *Decoder) connection(v string) (*Connection, error) {
 				return nil, err
 			}
 			c.Address, c.AddressNum = p[0], int(num)
+			c.hasAddrNum = true
 		}
 	}
 	return c, nil

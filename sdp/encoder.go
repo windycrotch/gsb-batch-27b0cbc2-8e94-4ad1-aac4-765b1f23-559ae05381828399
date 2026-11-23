@@ -140,7 +140,7 @@ func (w writer) origin(o *Origin) writer {
 
 func (w writer) media(m *Media) writer {
 	w = w.add('m').str(m.Type).sp().int(int64(m.Port))
-	if m.PortNum > 0 {
+	if m.hasPortNum || m.PortNum > 0 {
 		w = w.char('/').int(int64(m.PortNum))
 	}
 	w = w.sp().str(m.Proto)
@@ -179,7 +179,10 @@ func (w writer) media(m *Media) writer {
 
 func (w writer) format(f *Format) writer {
 	p := int64(f.Payload)
-	if f.Name != "" && int(f.Payload) > len(wellKnownNames) {
+	// Emit an rtpmap when the description explicitly contained one, or for
+	// a payload type outside the well-known static range that has a name.
+	// Static payload types without an explicit rtpmap must never gain one.
+	if f.Name != "" && (f.hasRTPMap || int(f.Payload) >= len(wellKnownNames)) {
 		w = w.add('a').str("rtpmap:").int(p).sp().str(f.Name).char('/').int(int64(f.ClockRate))
 		if f.Channels > 1 {
 			w = w.char('/').int(int64(f.Channels))
@@ -262,10 +265,10 @@ func (w writer) key(k *Key) writer {
 
 func (w writer) connection(c *Connection) writer {
 	w = w.transport(c.Network, c.Type, c.Address)
-	if c.TTL > 0 {
+	if c.hasTTL || c.TTL > 0 {
 		w = w.char('/').int(int64(c.TTL))
 	}
-	if c.AddressNum > 1 {
+	if c.hasAddrNum || c.AddressNum > 1 {
 		w = w.char('/').int(int64(c.AddressNum))
 	}
 	return w

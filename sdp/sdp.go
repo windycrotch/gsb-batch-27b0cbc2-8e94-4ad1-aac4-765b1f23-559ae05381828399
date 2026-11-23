@@ -66,6 +66,12 @@ type Connection struct {
 	Address    string
 	TTL        int
 	AddressNum int
+
+	// hasTTL and hasAddrNum record whether the TTL and address count were
+	// present in the original description. They keep values such as an
+	// explicit TTL of 0 or address count of 1 stable across a round-trip.
+	hasTTL     bool
+	hasAddrNum bool
 }
 
 // Bandwidth contains session or media bandwidth information.
@@ -113,6 +119,10 @@ type Media struct {
 	Mode        string        // Streaming mode ("sendrecv", "recvonly", "sendonly", or "inactive")
 	Format      []*Format     // Media Format for RTP/AVP or RTP/SAVP protocols ("rtpmap", "fmtp", "rtcp-fb")
 	FormatDescr string        // Media Format for other protocols
+
+	// hasPortNum records whether the m= port carried an explicit "/N"
+	// port count, so a value of 1 survives a round-trip.
+	hasPortNum bool
 }
 
 // Streaming modes.
@@ -183,6 +193,12 @@ type Format struct {
 	Channels  int
 	Feedback  []string // "rtcp-fb" attributes
 	Params    []string // "fmtp" attributes
+
+	// hasRTPMap reports whether an explicit "a=rtpmap" attribute was
+	// present for the payload in the parsed description. Static payload
+	// types keep their well-known name and clock rate without it and must
+	// not gain a synthesized rtpmap on encoding.
+	hasRTPMap bool
 }
 
 func (f *Format) String() string {

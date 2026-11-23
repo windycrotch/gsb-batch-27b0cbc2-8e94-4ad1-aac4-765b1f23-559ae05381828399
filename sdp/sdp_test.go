@@ -359,6 +359,11 @@ func (t *T) AssertAny(name string, got, exp interface{}) {
 			t.Assert(name, got, exp)
 		default:
 			for i := 0; i < r.NumField(); i++ {
+				// Unexported fields hold internal presence markers and are
+				// not part of the public structure under test.
+				if r.Field(i).PkgPath != "" {
+					continue
+				}
 				t.AssertAny(
 					fmt.Sprintf("%s %s", name, strings.ToLower(r.Field(i).Name)),
 					a.Field(i).Interface(),
