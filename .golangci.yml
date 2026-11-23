@@ -1,0 +1,26 @@
+version: 2
+
+linters:
+  enable:
+    - govet
+    - errcheck
+    - staticcheck
+    - unused
+    - ineffassign
+    - bodyclose
+    - noctx
+    - unconvert
+  settings:
+    govet:
+      enable-all: true
+
+run:
+  go: "1.25"
+  timeout: 5m
+  issues-exit-code: 1
+  tests: true
+
+issues:
+  exclude-use-default: false
+  max-issues-per-linter: 0
+  max-same-issues: 0

@@ -1,0 +1,65 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"os"
+	"path/filepath"
+	"time"
+
+	"github.com/farshidrezaei/mosaic"
+)
+
+func main() {
+	cwd, err := os.Getwd()
+	if err != nil {
+		log.Fatalf("failed to get current directory: %v", err)
+	}
+
+	inputPath := filepath.Join(cwd, "input.mp4")
+	outputDir := filepath.Join(cwd, "output", "dash_advanced")
+
+	if _, statErr := os.Stat(inputPath); os.IsNotExist(statErr) {
+		log.Printf("input file not found: %s", inputPath)
+		log.Printf("place a video file named input.mp4 in %s", cwd)
+		return
+	}
+
+	if mkDirErr := os.MkdirAll(outputDir, 0o755); mkDirErr != nil {
+		log.Fatalf("failed to create output directory: %v", mkDirErr)
+	}
+
+	job := mosaic.Job{
+		Input:     inputPath,
+		OutputDir: outputDir,
+		Profile:   mosaic.ProfileVOD,
+		ProgressHandler: func(info mosaic.ProgressInfo) {
+			fmt.Printf("\r[%5.1f%%] time=%s speed=%s bitrate=%s", info.Percentage, info.CurrentTime, info.Speed, info.Bitrate)
+		},
+	}
+
+	fmt.Printf("starting DASH encoding: %s\n", inputPath)
+	start := time.Now()
+
+	usage, err := mosaic.EncodeDash(
+		context.Background(),
+		job,
+		mosaic.WithNormalizeOrientation(),
+		mosaic.WithBFrames(2),
+		mosaic.WithScaleBitrateWithFPS(),
+		mosaic.WithThreads(4),
+		mosaic.WithLogLevel("warning"),
+	)
+	fmt.Println()
+	if err != nil {
+		log.Fatalf("DASH encoding failed: %v", err)
+	}
+
+	if usage != nil {
+		fmt.Printf("usage: user=%.2fs system=%.2fs maxrss=%d\n", usage.UserTime, usage.SystemTime, usage.MaxMemory)
+	}
+
+	fmt.Printf("completed in %s\n", time.Since(start).Round(time.Second))
+	fmt.Printf("output: %s\n", outputDir)
+}

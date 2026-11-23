@@ -1,0 +1,79 @@
+# Mosaic - Adaptive Bitrate Video Packaging for Go
+
+> Mosaic is a production-ready, zero-dependency Go library for adaptive bitrate (ABR) video packaging into HLS and DASH CMAF. It features Next-Gen Codecs (AV1/HEVC), Capped-CRF Content-Aware Bitrate, Storyboard Thumbnails, Web Preview DevTools Player, Subtitles (SRT-to-VTT), EBU R128 Audio Normalization, Dynamic Watermarking, HLS AES-128 Encryption, and direct S3/MinIO cloud uploading using AWS SigV4.
+
+## Core Capabilities
+- **Next-Gen Codecs**: Support for AV1 (`libsvtav1`), HEVC (`libx265`), and H.264 (`libx264`) with software & GPU acceleration (NVENC, VAAPI, VideoToolbox).
+- **Capped-CRF Quality**: Content-aware bitrate optimization combining Constant Rate Factor with VBV maxrate caps.
+- **Storyboard Thumbnails**: Automatic generation of JPEG sprite sheets and WebVTT timeline cue files (`thumbnails.vtt`).
+- **Web Preview DevTools**: Built-in dark-mode web player (`mosaic preview [dir]`) with Hls.js/Dash.js and telemetry.
+- **Subtitles & Multi-Audio**: SRT to WebVTT conversion and HLS/DASH manifest injection.
+- **EBU R128 Audio Leveling**: Broadcast-standard volume normalization (`loudnorm=I=-16:TP=-1.5:LRA=11`).
+- **Dynamic Watermarking**: Responsive logo overlay with alpha opacity blending.
+- **HLS AES-128 Encryption**: Automated cryptographic key generation and playlist security (`#EXT-X-KEY`).
+- **Zero-Dependency Cloud Upload**: Pure Go AWS SigV4 direct streaming asset uploads to S3, MinIO, and Cloudflare R2.
+- **Aspect Ratio & Orientation Normalization**: Preserves 16:9, 1:1, 9:16 portrait ratios and transposes rotated mobile videos.
+- **Real-Time Progress Tracking**: Calculates accurate percentage (`0.0%` to `100.0%`), encoded time, bitrate, and speed.
+
+## Installation
+```bash
+go get github.com/farshidrezaei/mosaic
+```
+
+## Quick Example (Production HLS Workflow)
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+
+	"github.com/farshidrezaei/mosaic"
+)
+
+func main() {
+	job := mosaic.Job{
+		Input:     "input.mp4",
+		OutputDir: "./output/hls",
+		Profile:   mosaic.ProfileVOD,
+		ProgressHandler: func(info mosaic.ProgressInfo) {
+			fmt.Printf("\r[%5.1f%%] time=%s speed=%s", info.Percentage, info.CurrentTime, info.Speed)
+		},
+	}
+
+	usage, err := mosaic.EncodeHls(
+		context.Background(),
+		job,
+		mosaic.WithNormalizeOrientation(),
+		mosaic.WithNormalizeAudio(),
+		mosaic.WithThumbnails(),
+		mosaic.WithWatermark(mosaic.WatermarkConfig{
+			Path:     "./branding/logo.png",
+			Position: mosaic.PositionTopRight,
+			Opacity:  0.85,
+		}),
+		mosaic.WithSubtitles(mosaic.SubtitleTrack{
+			Path:     "./subtitles/en.srt",
+			Language: "en",
+			Label:    "English",
+			Default:  true,
+		}),
+		mosaic.WithAES128Encryption(),
+		mosaic.WithThreads(4),
+	)
+	if err != nil {
+		log.Fatalf("HLS encoding failed: %v", err)
+	}
+	fmt.Printf("\nDone! Memory used: %d KB\n", usage.MaxMemory)
+}
+```
+
+## Key Documentation Links
+- Full API Reference: https://farshidrezaei.github.io/mosaic/#/API
+- Architecture & Pipeline: https://farshidrezaei.github.io/mosaic/#/ARCHITECTURE
+- Encoding & CMAF Guide: https://farshidrezaei.github.io/mosaic/#/ENCODING
+- Orientation Normalization: https://farshidrezaei.github.io/mosaic/#/orientation
+- Functional Options: https://farshidrezaei.github.io/mosaic/#/options
+- Examples Catalog: https://farshidrezaei.github.io/mosaic/#/EXAMPLES
+- Full Consolidated LLM Reference: https://farshidrezaei.github.io/mosaic/llms-full.txt
