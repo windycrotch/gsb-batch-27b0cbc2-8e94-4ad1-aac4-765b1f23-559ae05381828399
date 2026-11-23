@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `Decoder.FeedNALU` and `Decoder.Flush`: a streaming API that assembles a
+  multi-slice IDR picture one NALU at a time. `Decoder.DecodePSkip` makes it
+  decode non-IDR slices as P_Skip frames as well.
+
+### Fixed
+- Multi-slice IDR assembly is now insensitive to slice arrival order: a
+  picture's slices reconstruct to the same frame in any order, since the
+  picture boundary uses the picture-identifying slice-header fields rather
+  than `first_mb_in_slice`.
+- A repeated slice (same `first_mb_in_slice` as one already accepted, including
+  a slice retransmitted after the picture completed) is recognized and ignored
+  without changing coverage or triggering an early reconstruction.
+- A truncated or corrupt slice makes the decode fail with an error and never
+  yields a partially covered frame; the failed picture is discarded so the same
+  decoder instance decodes the next picture normally with no carried-over
+  state.
+
 ## [0.12.3] - 2026-11-17
 
 ### Changed

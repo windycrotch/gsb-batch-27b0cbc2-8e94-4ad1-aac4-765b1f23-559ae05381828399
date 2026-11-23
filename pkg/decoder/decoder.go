@@ -28,6 +28,21 @@ type Decoder struct {
 	refFrame    *frame.Frame // most recently decoded reference frame (for P-slice)
 	TraceMBCMP  bool         // emit MBCMP lines for FFmpeg comparison
 	SkipDeblock bool         // skip deblocking filter for debugging
+
+	// DecodePSkip makes FeedNALU decode non-IDR slices as P_Skip frames
+	// instead of ignoring them. The batch methods set it themselves:
+	// DecodeAllFrames enables it, DecodeNALUs and DecodeIDRFrames disable it.
+	DecodePSkip bool
+	// pic is the IDR picture whose slices have started arriving but whose
+	// macroblocks are not yet all covered. It is nil between pictures. A
+	// failed picture is discarded, so a decode error never leaks state into
+	// the next picture fed to the same decoder.
+	pic *idrPicture
+	// lastPic is the most recently reconstructed picture, kept only to
+	// recognize slices retransmitted after the picture was already complete.
+	// A new picture starts at macroblock 0, so such a retransmission is the
+	// only non-zero first_mb_in_slice NALU that can arrive with pic == nil.
+	lastPic *idrPicture
 }
 
 // ScalingMatrices holds effective scaling lists in raster order for dequantization.
@@ -207,83 +222,161 @@ func (d *Decoder) DecodeIDRFrames(nalus [][]byte) ([]*frame.Frame, error) {
 	return d.decodeFrames(nalus, false, 0)
 }
 
+// FeedNALU feeds one NALU to the decoder as part of a stream. The slices of a
+// multi-slice IDR picture may arrive in any order: the picture is assembled by
+// each slice's first_mb_in_slice and reconstructed only once its slices cover
+// every macroblock. Repeating a slice already seen for the current picture is
+// harmless — the repeat is ignored and changes neither the coverage state nor
+// when the picture is reconstructed. A truncated or corrupt slice makes
+// FeedNALU return an error and discards the whole picture; the same decoder
+// can then be fed the slices of the next picture, with no state carried over.
+//
+// Non-IDR slices are decoded as P_Skip frames when DecodePSkip is set; other
+// NALU types (SPS, PPS, SEI, AUD, ...) update parameter-set state or are
+// ignored. FeedNALU returns the frame completed by this NALU, or nil when the
+// current picture still has uncovered macroblocks.
+func (d *Decoder) FeedNALU(nalu []byte) (*frame.Frame, error) {
+	if len(nalu) == 0 {
+		return nil, nil
+	}
+	naluType := avc.NaluType(nalu[0] & 0x1f)
+
+	switch naluType {
+	case avc.NALU_SPS:
+		sps, err := avc.ParseSPSNALUnit(nalu, true)
+		if err != nil {
+			return nil, fmt.Errorf("parse SPS: %w", err)
+		}
+		d.spsMap[sps.ParameterID] = sps
+		return nil, nil
+	case avc.NALU_PPS:
+		pps, err := avc.ParsePPSNALUnit(nalu, d.spsMap)
+		if err != nil {
+			return nil, fmt.Errorf("parse PPS: %w", err)
+		}
+		d.ppsMap[pps.PicParameterSetID] = pps
+		return nil, nil
+	case avc.NALU_IDR:
+		sh, err := avc.ParseSliceHeader(nalu, d.spsMap, d.ppsMap)
+		if err != nil {
+			d.pic = nil
+			return nil, fmt.Errorf("parse slice header: %w", err)
+		}
+		if sh.RedundantPicCnt > 0 {
+			return nil, nil // a redundant slice only replaces a lost primary slice
+		}
+		// A slice already received for this picture (same first_mb_in_slice)
+		// is a retransmission: ignore it without touching coverage state.
+		// This is checked before the picture boundary, since an out-of-order
+		// first slice (first_mb_in_slice 0) of the current picture must not
+		// be mistaken for the start of the next picture.
+		if d.pic != nil && d.pic.hasSlice(int(sh.FirstMBInSlice)) {
+			return nil, nil
+		}
+		// With no picture open, a non-zero first_mb_in_slice NALU cannot start
+		// a conforming picture. It is a slice of the just-completed picture
+		// retransmitted after completion: recognize and ignore it.
+		if d.pic == nil && sh.FirstMBInSlice != 0 &&
+			d.lastPic != nil && d.lastPic.hasSlice(int(sh.FirstMBInSlice)) {
+			return nil, nil
+		}
+		if d.pic != nil && d.pic.beginsNextPicture(sh) {
+			err := d.pic.incompleteError()
+			d.pic = nil
+			return nil, err
+		}
+		if d.pic == nil {
+			pic, perr := d.newIDRPicture(sh)
+			if perr != nil {
+				return nil, perr
+			}
+			d.pic = pic
+			d.lastPic = nil
+		}
+		if err := d.pic.decodeSlice(nalu, sh); err != nil {
+			// Drop every partial result of the failed picture so the next
+			// NALU starts a clean picture on the same decoder.
+			d.pic = nil
+			return nil, fmt.Errorf("decode IDR slice: %w", err)
+		}
+		d.pic.seen[int(sh.FirstMBInSlice)] = true
+		if d.pic.sc.DecodedMBs() < d.pic.sc.TotalMBs {
+			return nil, nil
+		}
+		f, err := d.pic.reconstruct(d.SkipDeblock)
+		// Remember the completed picture's slice set so a slice retransmitted
+		// after completion is still recognized as a duplicate.
+		d.lastPic = d.pic
+		d.pic = nil
+		if err != nil {
+			d.lastPic = nil
+			return nil, fmt.Errorf("reconstruct IDR picture: %w", err)
+		}
+		d.refFrame = f
+		return f, nil
+	case 1: // non-IDR coded slice
+		if !d.DecodePSkip {
+			return nil, nil
+		}
+		if d.pic != nil {
+			err := d.pic.incompleteError()
+			d.pic = nil
+			return nil, err
+		}
+		f, err := d.decodePSkip(nalu)
+		if err != nil {
+			return nil, fmt.Errorf("decode P-slice: %w", err)
+		}
+		// A P slice follows a complete picture; its slices cannot be
+		// retransmitted as IDR slices, so forget the last IDR's slice set.
+		d.lastPic = nil
+		d.refFrame = f
+		return f, nil
+	default:
+		return nil, nil
+	}
+}
+
+// Flush reports an unfinished picture when the stream has no more NALUs: an
+// IDR picture whose slices do not cover all its macroblocks is an error, and
+// the partial picture is discarded. It returns nil after a complete picture.
+func (d *Decoder) Flush() error {
+	if d.pic == nil {
+		return nil
+	}
+	err := d.pic.incompleteError()
+	d.pic = nil
+	return err
+}
+
 // decodeFrames decodes the frames in nalus, stopping after maxFrames of them
 // when maxFrames > 0. An IDR picture may be carried by several slices; it is
 // reconstructed once its slices cover all its macroblocks, and it is an error
-// if nalus ends, or the next picture starts, before they do.
+// if nalus ends, or the next picture starts, before they do. The slices of one
+// picture may be presented in any order and may repeat; repeats are ignored.
 func (d *Decoder) decodeFrames(nalus [][]byte, includeNonIDR bool, maxFrames int) ([]*frame.Frame, error) {
-	var frames []*frame.Frame
-	var pic *idrPicture // IDR picture whose slices are being decoded
+	// A decoder instance keeps no in-progress picture between batch calls:
+	// the first NALU of the batch starts from a clean state.
+	d.pic = nil
+	d.lastPic = nil
+	d.DecodePSkip = includeNonIDR
 
+	var frames []*frame.Frame
 	for _, nalu := range nalus {
 		if maxFrames > 0 && len(frames) == maxFrames {
 			break
 		}
-		if len(nalu) == 0 {
-			continue
+		f, err := d.FeedNALU(nalu)
+		if err != nil {
+			d.pic = nil
+			return frames, err
 		}
-		naluType := avc.NaluType(nalu[0] & 0x1f)
-
-		switch naluType {
-		case avc.NALU_SPS:
-			sps, err := avc.ParseSPSNALUnit(nalu, true)
-			if err != nil {
-				return frames, fmt.Errorf("parse SPS: %w", err)
-			}
-			d.spsMap[sps.ParameterID] = sps
-		case avc.NALU_PPS:
-			pps, err := avc.ParsePPSNALUnit(nalu, d.spsMap)
-			if err != nil {
-				return frames, fmt.Errorf("parse PPS: %w", err)
-			}
-			d.ppsMap[pps.PicParameterSetID] = pps
-		case avc.NALU_IDR:
-			sh, err := avc.ParseSliceHeader(nalu, d.spsMap, d.ppsMap)
-			if err != nil {
-				return frames, fmt.Errorf("IDR frame %d: parse slice header: %w", len(frames), err)
-			}
-			if sh.RedundantPicCnt > 0 {
-				continue // a redundant slice only replaces a lost primary slice
-			}
-			if pic != nil && startsNewPicture(pic.first, sh) {
-				return frames, fmt.Errorf("IDR frame %d: %w", len(frames), pic.incompleteError())
-			}
-			if pic == nil {
-				pic, err = d.newIDRPicture(sh)
-				if err != nil {
-					return frames, fmt.Errorf("IDR frame %d: %w", len(frames), err)
-				}
-			}
-			if err := pic.decodeSlice(nalu, sh); err != nil {
-				return frames, fmt.Errorf("IDR frame %d: %w", len(frames), err)
-			}
-			if pic.sc.DecodedMBs() < pic.sc.TotalMBs {
-				continue
-			}
-			f, err := pic.reconstruct(d.SkipDeblock)
-			pic = nil
-			if err != nil {
-				return frames, fmt.Errorf("IDR frame %d: %w", len(frames), err)
-			}
-			d.refFrame = f
-			frames = append(frames, f)
-		case 1: // non-IDR coded slice
-			if !includeNonIDR {
-				continue
-			}
-			if pic != nil {
-				return frames, fmt.Errorf("IDR frame %d: %w", len(frames), pic.incompleteError())
-			}
-			f, err := d.decodePSkip(nalu)
-			if err != nil {
-				return frames, fmt.Errorf("p frame %d: %w", len(frames), err)
-			}
-			d.refFrame = f
+		if f != nil {
 			frames = append(frames, f)
 		}
 	}
-	if pic != nil {
-		return frames, fmt.Errorf("IDR frame %d: %w", len(frames), pic.incompleteError())
+	if err := d.Flush(); err != nil {
+		return frames, err
 	}
 	return frames, nil
 }
@@ -450,12 +543,16 @@ func (d *Decoder) decodePSkip(nalu []byte) (*frame.Frame, error) {
 // idrPicture is an IDR picture whose slices are being decoded. The
 // macroblocks of each slice are parsed as the slice arrives, with the SPS and
 // PPS of the picture's first slice; the picture is reconstructed once its
-// slices cover all its macroblocks.
+// slices cover all its macroblocks. Slices may arrive in any order, and a
+// slice whose first_mb_in_slice has already been seen is a repeat.
 type idrPicture struct {
 	first *avc.SliceHeader // header of the picture's first slice
 	sps   *avc.SPS
 	pps   *avc.PPS
 	sc    *slice.SliceContext
+	// seen records the first_mb_in_slice of every slice already accepted for
+	// the picture, so a repeated slice is detected before it is parsed.
+	seen map[int]bool
 }
 
 // newIDRPicture starts the IDR picture whose first slice has header sh.
@@ -495,16 +592,36 @@ func (d *Decoder) newIDRPicture(sh *avc.SliceHeader) (*idrPicture, error) {
 	sc := slice.NewSliceContext(mbWidth, mbHeight, !pps.EntropyCodingModeFlag,
 		pps.Transform8x8ModeFlag, chromaArrayType, bitDepthY, bitDepthC,
 		int(pps.ChromaQpIndexOffset), d.TraceMBCMP)
-	return &idrPicture{first: sh, sps: sps, pps: pps, sc: sc}, nil
+	return &idrPicture{
+		first: sh,
+		sps:   sps,
+		pps:   pps,
+		sc:    sc,
+		seen:  make(map[int]bool),
+	}, nil
 }
 
-// startsNewPicture reports whether the slice with header sh starts a new
-// picture rather than continuing the IDR picture whose first slice has header
-// first (clause 7.4.1.2.4). As in FFmpeg, a slice that starts at macroblock 0
-// always starts a new picture.
-func startsNewPicture(first, sh *avc.SliceHeader) bool {
-	return sh.FirstMBInSlice == 0 ||
-		sh.FrameNum != first.FrameNum ||
+// hasSlice reports whether a slice starting at firstMB has already been
+// accepted for the picture.
+func (p *idrPicture) hasSlice(firstMB int) bool {
+	return p.seen[firstMB]
+}
+
+// beginsNextPicture reports whether the slice with header sh belongs to a
+// different picture than this one (clause 7.4.1.2.4). Only the
+// picture-identifying header fields are compared: first_mb_in_slice is not one
+// of them, since the slices of one picture may arrive in any order, so the
+// picture's macroblock-0 slice can turn up after its other slices.
+//
+// Two consecutive pictures encoded with identical identifying fields cannot be
+// told apart from their headers. A conforming stream only starts the next
+// picture after this one is complete, at which point it has been reconstructed
+// and removed from the decoder; the new picture then starts with no current
+// picture. While a picture is open, a slice with the same identifying fields
+// is therefore its slice, even when it starts at macroblock 0.
+func (p *idrPicture) beginsNextPicture(sh *avc.SliceHeader) bool {
+	first := p.first
+	return sh.FrameNum != first.FrameNum ||
 		sh.PicParamID != first.PicParamID ||
 		sh.FieldPicFlag != first.FieldPicFlag ||
 		sh.BottomFieldFlag != first.BottomFieldFlag ||
