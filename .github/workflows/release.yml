@@ -1,0 +1,45 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Create Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.23.9'
+
+      - name: Build
+        shell: bash
+        run: |
+          mkdir ~/build
+          set +e
+          go tool dist list | while IFS='/' read -ra TARGET
+          do
+          export GOOS=${TARGET[0]}
+          export GOARCH=${TARGET[1]}
+          echo "Building target $GOOS/$GOARCH"
+          go build -o ~/build/rtmp-pioneer-${{ github.ref_name }}-$GOOS-$GOARCH
+          done
+          cd ~/build
+          zstd *
+          sha256sum *zst > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run:
+          gh release -R ${{ github.repository }} create -F README.md ${{ github.ref_name }} -t ${{ github.ref_name }} ~/build/SHA256SUMS.txt ~/build/*zst
