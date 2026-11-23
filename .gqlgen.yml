@@ -1,0 +1,29 @@
+# .gqlgen.yml example
+#
+# Refer to https://gqlgen.com/config/
+# for detailed .gqlgen.yml documentation.
+
+schema:
+- schema.graphql
+exec:
+  filename: gql/generated.go
+  package: gql
+model:
+  filename: models/generated.go
+  package: models
+
+models:
+  User:
+    model: github.com/tengen-io/server/models.User
+  Identity:
+    model: github.com/tengen-io/server/models.Identity
+  Game:
+    model: github.com/tengen-io/server/models.Game
+  GameState:
+    model: github.com/tengen-io/server/models.GameState
+  GameType:
+    model: github.com/tengen-io/server/models.GameType
+  Timestamp:
+    model: github.com/tengen-io/server/models.Timestamp
+  MatchmakingRequest:
+    model: github.com/tengen-io/server/models.MatchmakingRequest
