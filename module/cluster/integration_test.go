@@ -72,7 +72,7 @@ func handleMockRTMP(conn net.Conn) {
 		case rtmp.MsgSetChunkSize:
 			if len(msg.Payload) >= 4 {
 				size := int(binary.BigEndian.Uint32(msg.Payload))
-				cr.SetChunkSize(size)
+				_ = cr.SetChunkSize(size)
 			}
 
 		case rtmp.MsgAMF0Command:
@@ -347,7 +347,7 @@ func serveControlledRTMPOrigin(conn net.Conn, playReady chan<- struct{}, sendAct
 			return err
 		}
 		if msg.TypeID == rtmp.MsgSetChunkSize && len(msg.Payload) >= 4 {
-			cr.SetChunkSize(int(binary.BigEndian.Uint32(msg.Payload)))
+			_ = cr.SetChunkSize(int(binary.BigEndian.Uint32(msg.Payload)))
 			continue
 		}
 		if msg.TypeID != rtmp.MsgAMF0Command {
@@ -503,7 +503,7 @@ func handleMockOriginServer(conn net.Conn) {
 		case rtmp.MsgSetChunkSize:
 			if len(msg.Payload) >= 4 {
 				size := int(binary.BigEndian.Uint32(msg.Payload))
-				cr.SetChunkSize(size)
+				_ = cr.SetChunkSize(size)
 			}
 
 		case rtmp.MsgAMF0Command:

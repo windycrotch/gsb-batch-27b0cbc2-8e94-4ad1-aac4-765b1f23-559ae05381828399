@@ -2,6 +2,7 @@ package rtmp
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 )
@@ -27,6 +28,14 @@ type chunkHeader struct {
 	messageActive            bool
 }
 
+// ErrInvalidChunkSize reports a chunk size outside the accepted range.
+// Chunk sizes must be positive and no larger than MaxChunkSize.
+var ErrInvalidChunkSize = fmt.Errorf("rtmp: chunk size must be between 1 and %d", MaxChunkSize)
+
+// ErrChunkSizeChangedMidMessage reports a chunk size update delivered while a
+// message payload is still being assembled on this connection.
+var ErrChunkSizeChangedMidMessage = errors.New("rtmp: chunk size changed while a message is incomplete")
+
 // ChunkReader reads RTMP chunks from a stream and reassembles messages.
 type ChunkReader struct {
 	r         io.Reader
@@ -35,19 +44,50 @@ type ChunkReader struct {
 	buffers   map[uint32][]byte // partial message data per CSID
 }
 
-// NewChunkReader creates a new chunk reader.
+// NewChunkReader creates a new chunk reader. A chunk size outside
+// 1..MaxChunkSize falls back to DefaultChunkSize so framing never divides by
+// zero or allocates an unbounded chunk.
 func NewChunkReader(r io.Reader, chunkSize int) *ChunkReader {
 	return &ChunkReader{
 		r:         r,
-		chunkSize: chunkSize,
+		chunkSize: normalizeChunkSize(chunkSize),
 		headers:   make(map[uint32]*chunkHeader),
 		buffers:   make(map[uint32][]byte),
 	}
 }
 
-// SetChunkSize updates the chunk size for reading.
-func (cr *ChunkReader) SetChunkSize(size int) {
+func normalizeChunkSize(size int) int {
+	if size <= 0 || size > MaxChunkSize {
+		return DefaultChunkSize
+	}
+	return size
+}
+
+// ChunkSize returns the chunk size currently used for reading.
+func (cr *ChunkReader) ChunkSize() int { return cr.chunkSize }
+
+// SetChunkSize updates the chunk size for reading. It rejects sizes outside
+// 1..MaxChunkSize and refuses to change size while a message is partially
+// assembled, because the rest of that message was framed with the old size.
+func (cr *ChunkReader) SetChunkSize(size int) error {
+	if size <= 0 || size > MaxChunkSize {
+		return ErrInvalidChunkSize
+	}
+	if cr.messageInProgress() {
+		return ErrChunkSizeChangedMidMessage
+	}
 	cr.chunkSize = size
+	return nil
+}
+
+// messageInProgress reports whether any chunk stream holds a partial message.
+func (cr *ChunkReader) messageInProgress() bool {
+	for _, header := range cr.headers {
+		if header.messageActive {
+			return true
+		}
+	}
+	return false
 }
 
 // ReadMessage reads chunks until a complete message is assembled.
@@ -238,8 +278,10 @@ type ChunkWriter struct {
 	buf       []byte // reusable write buffer to batch syscalls
 }
 
-// NewChunkWriter creates a new chunk writer.
+// NewChunkWriter creates a new chunk writer. A chunk size outside
+// 1..MaxChunkSize falls back to DefaultChunkSize.
 func NewChunkWriter(w io.Writer, chunkSize int) *ChunkWriter {
+	chunkSize = normalizeChunkSize(chunkSize)
 	return &ChunkWriter{
 		w:         w,
 		chunkSize: chunkSize,
@@ -247,9 +289,17 @@ func NewChunkWriter(w io.Writer, chunkSize int) *ChunkWriter {
 	}
 }
 
-// SetChunkSize updates the chunk size for writing.
-func (cw *ChunkWriter) SetChunkSize(size int) {
+// ChunkSize returns the chunk size currently used for writing.
+func (cw *ChunkWriter) ChunkSize() int { return cw.chunkSize }
+
+// SetChunkSize updates the chunk size for writing. It rejects sizes outside
+// 1..MaxChunkSize, which would otherwise produce unframable or empty chunks.
+func (cw *ChunkWriter) SetChunkSize(size int) error {
+	if size <= 0 || size > MaxChunkSize {
+		return ErrInvalidChunkSize
+	}
 	cw.chunkSize = size
+	return nil
 }
 
 // WriteMessage writes a complete message as one or more chunks.

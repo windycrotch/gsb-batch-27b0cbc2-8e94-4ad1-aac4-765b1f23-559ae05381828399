@@ -427,7 +427,7 @@ func TestHandlerConnectWithAppParams(t *testing.T) {
 		msg, _ := cr.ReadMessage()
 		if msg.TypeID == MsgSetChunkSize && len(msg.Payload) >= 4 {
 			size := int(msg.Payload[0])<<24 | int(msg.Payload[1])<<16 | int(msg.Payload[2])<<8 | int(msg.Payload[3])
-			cr.SetChunkSize(size)
+			_ = cr.SetChunkSize(size)
 		}
 	}
 

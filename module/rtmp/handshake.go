@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -12,9 +13,22 @@ import (
 
 const handshakeSize = 1536
 
+// ErrInvalidC1Digest reports a complex-handshake C1 whose digest does not
+// match the bytes it protects. The connection must be dropped without
+// answering the handshake.
+var ErrInvalidC1Digest = errors.New("rtmp: C1 digest verification failed")
+
+// handshakeMode records how a peer announced its C1 packet.
+type handshakeMode uint8
+
+const (
+	handshakeSimple handshakeMode = iota
+	handshakeComplex
+)
+
 // RTMP handshake keys for HMAC-SHA256 digest verification.
 var (
-	genuineFPKey = []byte("Genuine Adobe Flash Player 001") // 30 bytes
+	genuineFPKey  = []byte("Genuine Adobe Flash Player 001")       // 30 bytes
 	genuineFMSKey = []byte("Genuine Adobe Flash Media Server 001") // 36 bytes
 
 	// Full 68-byte server key (36 + 32 random bytes from spec)
@@ -44,7 +58,11 @@ var (
 )
 
 // ServerHandshake performs the RTMP server-side handshake.
-// Tries complex handshake first (HMAC-SHA256 digest); falls back to simple if C1 has no digest.
+//
+// C1 is classified before any server bytes are written. A C1 that announces a
+// client version must carry a valid HMAC-SHA256 digest and is rejected
+// otherwise; a C1 without a version uses the simple handshake. Returning an
+// error here prevents the connection from reaching command processing.
 func ServerHandshake(conn net.Conn) error {
 	// Read C0 (1 byte) + C1 (1536 bytes)
 	c0c1 := make([]byte, 1+handshakeSize)
@@ -59,20 +77,20 @@ func ServerHandshake(conn net.Conn) error {
 
 	c1 := c0c1[1:]
 
-	// Try to find C1 digest (complex handshake)
-	digestOffset, isComplex := findDigest(c1, genuineFPKey)
+	mode, digestOffset, err := classifyC1(c1)
+	if err != nil {
+		return err
+	}
 
 	var s1, s2 []byte
-
-	if isComplex {
+	if mode == handshakeComplex {
 		s1 = makeS1Complex()
 		s2 = makeS2Complex(c1, digestOffset)
 	} else {
-		// Simple handshake fallback
-		s1 = make([]byte, handshakeSize)
-		rand.Read(s1)
-		s2 = make([]byte, handshakeSize)
-		copy(s2, c1)
+		// Simple handshake fallback. S2 restates the client's time and its own
+		// random bytes instead of echoing the client's packet back verbatim.
+		s1 = makeS1Simple()
+		s2 = makeS2Simple(c1)
 	}
 
 	// Write S0 + S1 + S2
@@ -81,7 +99,7 @@ func ServerHandshake(conn net.Conn) error {
 	s0s1s2 = append(s0s1s2, s1...)
 	s0s1s2 = append(s0s1s2, s2...)
 
-	if _, err := conn.Write(s0s1s2); err != nil {
+	if err := writeAll(conn, s0s1s2); err != nil {
 		return fmt.Errorf("write S0S1S2: %w", err)
 	}
 
@@ -92,6 +110,28 @@ func ServerHandshake(conn net.Conn) error {
 	}
 
 	return nil
+}
+
+// classifyC1 decides which handshake variant C1 announces and, for a complex
+// C1, verifies its digest.
+//
+// A client that implements the digest handshake writes a non-zero client
+// version into C1 bytes 4-7; the simple handshake leaves those bytes zero.
+// When a version is present the digest must verify. Falling back to the simple
+// handshake on a mismatch would let a peer skip digest verification entirely.
+func classifyC1(c1 []byte) (handshakeMode, int, error) {
+	if !c1HasClientVersion(c1) {
+		return handshakeSimple, 0, nil
+	}
+	offset, ok := findDigest(c1, genuineFPKey)
+	if !ok {
+		return handshakeComplex, 0, ErrInvalidC1Digest
+	}
+	return handshakeComplex, offset, nil
+}
+
+func c1HasClientVersion(c1 []byte) bool {
+	return c1[4] != 0 || c1[5] != 0 || c1[6] != 0 || c1[7] != 0
 }
 
 // findDigest tries to locate the HMAC-SHA256 digest in a C1/S1 packet.
@@ -122,7 +162,7 @@ func calcDigestOffset(b []byte, base int) int {
 
 // validateDigest checks if a 32-byte HMAC-SHA256 digest at the given offset is valid.
 func validateDigest(data []byte, offset int, key []byte) bool {
-	if offset+32 > len(data) {
+	if offset < 0 || offset+32 > len(data) {
 		return false
 	}
 
@@ -169,6 +209,23 @@ func makeS1Complex() []byte {
 	return s1
 }
 
+// makeS1Simple builds a version-less S1 packet for the simple handshake.
+func makeS1Simple() []byte {
+	s1 := make([]byte, handshakeSize)
+	rand.Read(s1[8:])
+	return s1
+}
+
+// makeS2Simple builds an S2 packet for the simple handshake. It echoes C1's
+// time field and fills the remainder with fresh random bytes; client-supplied
+// content is never mirrored back.
+func makeS2Simple(c1 []byte) []byte {
+	s2 := make([]byte, handshakeSize)
+	copy(s2[0:4], c1[0:4]) // echo client time
+	rand.Read(s2[8:])
+	return s2
+}
+
 // makeS2Complex builds an S2 packet that the client will validate.
 // S2 is 1536 bytes: 1504 bytes of random data + 32-byte HMAC digest.
 func makeS2Complex(c1 []byte, c1DigestOffset int) []byte {
@@ -192,4 +249,18 @@ func makeS2Complex(c1 []byte, c1DigestOffset int) []byte {
 
 	copy(s2[handshakeSize-32:], digest)
 	return s2
+}
+
+func writeAll(w io.Writer, buf []byte) error {
+	for len(buf) > 0 {
+		n, err := w.Write(buf)
+		if err != nil {
+			return err
+		}
+		if n <= 0 {
+			return io.ErrShortWrite
+		}
+		buf = buf[n:]
+	}
+	return nil
 }

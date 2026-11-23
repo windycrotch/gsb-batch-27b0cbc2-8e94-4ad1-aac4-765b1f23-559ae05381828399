@@ -90,13 +90,17 @@ func (h *Handler) sendSetPeerBandwidth(size uint32, limitType byte) error {
 }
 
 func (h *Handler) sendSetChunkSize(size int) error {
+	if size <= 0 || size > MaxChunkSize {
+		return ErrInvalidChunkSize
+	}
 	payload := make([]byte, 4)
 	binary.BigEndian.PutUint32(payload, uint32(size))
+	// The control message itself is framed with the old size; the peer only
+	// knows the new size once it has read this message.
 	if err := h.cw.WriteMessage(2, &Message{TypeID: MsgSetChunkSize, Length: 4, Payload: payload}); err != nil {
 		return err
 	}
-	h.cw.SetChunkSize(size)
-	return nil
+	return h.cw.SetChunkSize(size)
 }
 
 func (h *Handler) sendConnectResult(txID float64) error {

@@ -50,7 +50,9 @@ type Handler struct {
 	skipCfg   *config.SkipTrackerConfig
 }
 
-// NewHandler creates a new RTMP connection handler.
+// NewHandler creates a new RTMP connection handler. An out-of-range configured
+// chunk size falls back to DefaultChunkSize rather than advertising an
+// unusable framing size to the peer.
 func NewHandler(conn net.Conn, hub *core.StreamHub, eventBus *core.EventBus, chunkSize int, skipCfg *config.SkipTrackerConfig) *Handler {
 	return &Handler{
 		conn:      conn,
@@ -58,7 +60,7 @@ func NewHandler(conn net.Conn, hub *core.StreamHub, eventBus *core.EventBus, chu
 		cw:        NewChunkWriter(conn, DefaultChunkSize),
 		hub:       hub,
 		eventBus:  eventBus,
-		chunkSize: chunkSize,
+		chunkSize: normalizeChunkSize(chunkSize),
 		skipCfg:   skipCfg,
 	}
 }
@@ -84,29 +86,38 @@ func (h *Handler) Handle() error {
 }
 
 // cleanup releases the publisher when the connection closes for any reason.
+// Exactly one call performs the release even if a disconnect races an error
+// return or another cleanup attempt.
 func (h *Handler) cleanup() {
 	h.publishCleanupOnce.Do(func() {
 		if h.streamKey == "" || !h.isPublisher {
 			return
 		}
-		if stream, ok := h.hub.Find(h.streamKey); ok {
-			stream.RemovePublisherIf(h.publisher)
-		}
-		publisherID := ""
-		if h.publisher != nil {
-			publisherID = h.publisher.ID()
-		}
-		if err := h.eventBus.EmitAsync(core.EventPublishStop, &core.EventContext{
-			StreamKey:           h.streamKey,
+		streamKey := h.streamKey
+		publishStopCtx := &core.EventContext{
+			StreamKey:           streamKey,
 			StreamInstanceID:    h.streamInstanceID,
 			PublisherGeneration: h.publisherGeneration,
-			PublisherID:         publisherID,
 			Protocol:            "rtmp",
-			RemoteAddr:          h.conn.RemoteAddr().String(),
-		}); err != nil {
-			slog.Error("publisher terminal lifecycle admission failed", "module", "rtmp", "stream", h.streamKey, "error", err)
+			RemoteAddr:          h.remoteAddr(),
+		}
+		if h.publisher != nil {
+			publishStopCtx.PublisherID = h.publisher.ID()
+		}
+		if stream, ok := h.hub.Find(streamKey); ok {
+			stream.RemovePublisherIf(h.publisher)
+		}
+		if err := h.eventBus.EmitAsync(core.EventPublishStop, publishStopCtx); err != nil {
+			slog.Error("publisher terminal lifecycle admission failed", "module", "rtmp", "stream", streamKey, "error", err)
 		}
 	})
+}
+
+func (h *Handler) remoteAddr() string {
+	if h.conn == nil || h.conn.RemoteAddr() == nil {
+		return ""
+	}
+	return h.conn.RemoteAddr().String()
 }
 
 func (h *Handler) handleMessage(msg *Message) error {
@@ -116,7 +127,9 @@ func (h *Handler) handleMessage(msg *Message) error {
 			return fmt.Errorf("invalid SetChunkSize payload")
 		}
 		size := int(binary.BigEndian.Uint32(msg.Payload))
-		h.cr.SetChunkSize(size)
+		if err := h.cr.SetChunkSize(size); err != nil {
+			return fmt.Errorf("set chunk size %d: %w", size, err)
+		}
 		return nil
 
 	case MsgWindowAckSize:
@@ -231,48 +244,59 @@ func (h *Handler) onCreateStream(vals []any) error {
 }
 
 func (h *Handler) onPublish(vals []any) error {
-	var mergedParams map[string]string
-	if len(vals) >= 4 {
-		if name, ok := vals[3].(string); ok {
-			// Parse query string from stream name (e.g. "test?token=xxx")
-			cleanName, params := splitNameParams(name)
-			h.streamKey = h.app + "/" + cleanName
-			// Merge app-level params with stream-level params (stream-level wins)
-			mergedParams = mergeParams(h.appParams, params)
-		}
+	if h.isPublisher {
+		// A second publish on the same connection would replace the tracked
+		// publisher and leave the first stream entry behind.
+		return fmt.Errorf("publish: connection is already publishing %s", h.streamKey)
 	}
-	if h.streamKey == "" {
-		return fmt.Errorf("publish: missing stream name")
+	streamKey, mergedParams, err := h.resolvePublishTarget(vals)
+	if err != nil {
+		return err
 	}
+	remoteAddr := h.remoteAddr()
 
-	pub := NewPublisher(h.streamKey, h.conn)
+	pub := NewPublisher(streamKey, h.conn)
 	publishCtx := &core.EventContext{
-		StreamKey:   h.streamKey,
+		StreamKey:   streamKey,
 		PublisherID: pub.ID(),
 		Protocol:    "rtmp",
-		RemoteAddr:  h.conn.RemoteAddr().String(),
+		RemoteAddr:  remoteAddr,
 		Params:      mergedParams,
 	}
+	// emitPublishStart reports the started lifecycle. The context carries the
+	// generation identity so the eventual stop event matches it.
+	emitPublishStart := func(streamInstanceID, generation uint64) error {
+		publishCtx.StreamInstanceID = streamInstanceID
+		publishCtx.PublisherGeneration = generation
+		return h.eventBus.EmitAsync(core.EventPublish, publishCtx)
+	}
+
 	if err := h.eventBus.EmitSync(core.EventPublish, publishCtx); err != nil {
 		_ = h.sendOnStatus("error", "NetStream.Publish.Rejected", err.Error())
-		return fmt.Errorf("publish %s: %w", h.streamKey, err)
+		return fmt.Errorf("publish %s: %w", streamKey, err)
 	}
-	stream, err := h.hub.GetOrCreate(h.streamKey)
+	stream, created, err := h.hub.GetOrCreateWithCreated(streamKey)
 	if err != nil {
 		_ = h.sendOnStatus("error", "NetStream.Publish.Rejected", err.Error())
-		return fmt.Errorf("publish %s: %w", h.streamKey, err)
+		return fmt.Errorf("publish %s: %w", streamKey, err)
 	}
 	if err := stream.SetPublisher(pub); err != nil {
-		return fmt.Errorf("publish %s: %w", h.streamKey, err)
+		// Report the rejection while the connection is still open: retiring a
+		// candidate stream below closes the publisher connection.
+		_ = h.sendOnStatus("error", "NetStream.Publish.Rejected", err.Error())
+		if created {
+			stream.DiscardFailedAdmission(pub.ID())
+		}
+		return fmt.Errorf("publish %s: %w", streamKey, err)
 	}
 	startup := stream.StartupSnapshot()
-	publishCtx.StreamInstanceID = startup.StreamInstanceID
-	publishCtx.PublisherGeneration = startup.Generation
-	if err := h.eventBus.EmitAsync(core.EventPublish, publishCtx); err != nil {
-		stream.RemovePublisherIf(pub)
+	if err := emitPublishStart(startup.StreamInstanceID, startup.Generation); err != nil {
 		_ = h.sendOnStatus("error", "NetStream.Publish.Rejected", err.Error())
-		return fmt.Errorf("publish %s: %w", h.streamKey, err)
+		h.rollbackPublish(stream, pub, created)
+		return fmt.Errorf("publish %s: %w", streamKey, err)
 	}
+
+	h.streamKey = streamKey
 	h.publisher = pub
 	h.isPublisher = true
 	h.streamInstanceID = startup.StreamInstanceID
@@ -280,6 +304,37 @@ func (h *Handler) onPublish(vals []any) error {
 
 	// Send onStatus(NetStream.Publish.Start)
 	return h.sendOnStatus("status", "NetStream.Publish.Start", "Publishing started")
+}
+
+// resolvePublishTarget parses the stream name out of a publish command without
+// mutating handler state, so a rejected publish leaves the connection as it was.
+func (h *Handler) resolvePublishTarget(vals []any) (string, map[string]string, error) {
+	if len(vals) < 4 {
+		return "", nil, fmt.Errorf("publish: missing stream name")
+	}
+	name, ok := vals[3].(string)
+	if !ok || name == "" {
+		return "", nil, fmt.Errorf("publish: missing stream name")
+	}
+	cleanName, params := splitNameParams(name)
+	if cleanName == "" {
+		return "", nil, fmt.Errorf("publish: missing stream name")
+	}
+	return h.app + "/" + cleanName, mergeParams(h.appParams, params), nil
+}
+
+// rollbackPublish restores the stream and publisher to their pre-publish state
+// after lifecycle admission is refused.
+//
+// EventBus admission is all-or-nothing across consumers, so a refused start
+// leaves no started lifecycle behind and no stop event is owed. A stream this
+// attempt created is retired through DiscardFailedAdmission when nothing else
+// attached to it; an existing stream simply returns to the ownerless state.
+func (h *Handler) rollbackPublish(stream *core.Stream, pub *Publisher, created bool) {
+	stream.RemovePublisherIf(pub)
+	if created {
+		stream.DiscardFailedAdmission(pub.ID())
+	}
 }
 
 func (h *Handler) onPlay(vals []any) error {

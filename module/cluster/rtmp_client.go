@@ -52,11 +52,13 @@ func dialRTMP(addr string) (*rtmpConn, error) {
 }
 
 // clientHandshake performs the RTMP client-side handshake (simple mode).
+// C1 time and version stay zero: a non-zero version announces the digest
+// handshake, which this client does not implement.
 func clientHandshake(conn net.Conn) error {
-	// Send C0 (version 3) + C1 (1536 random bytes)
+	// Send C0 (version 3) + C1 (time 0, version 0, 1528 random bytes).
 	c0c1 := make([]byte, 1+handshakeSize)
 	c0c1[0] = 3
-	rand.Read(c0c1[1:])
+	rand.Read(c0c1[9:])
 
 	if _, err := conn.Write(c0c1); err != nil {
 		return fmt.Errorf("write C0C1: %w", err)
@@ -161,8 +163,10 @@ func (rc *rtmpConn) readResponses(targetTxnID float64) error {
 		case rtmp.MsgSetChunkSize:
 			if len(msg.Payload) >= 4 {
 				size := int(binary.BigEndian.Uint32(msg.Payload))
-				rc.cr.SetChunkSize(size)
-				rc.cw.SetChunkSize(size)
+				if err := rc.cr.SetChunkSize(size); err != nil {
+					return fmt.Errorf("peer chunk size %d: %w", size, err)
+				}
+				_ = rc.cw.SetChunkSize(size)
 			}
 			continue
 		case rtmp.MsgWindowAckSize, rtmp.MsgSetPeerBandwidth, rtmp.MsgAck, rtmp.MsgUserControl:
@@ -215,6 +219,9 @@ func (rc *rtmpConn) readResponses(targetTxnID float64) error {
 
 // setChunkSize sends a set-chunk-size protocol control message.
 func (rc *rtmpConn) setChunkSize(size int) error {
+	if size <= 0 || size > rtmp.MaxChunkSize {
+		return rtmp.ErrInvalidChunkSize
+	}
 	payload := make([]byte, 4)
 	binary.BigEndian.PutUint32(payload, uint32(size))
 	if err := rc.cw.WriteMessage(2, &rtmp.Message{
@@ -224,8 +231,7 @@ func (rc *rtmpConn) setChunkSize(size int) error {
 	}); err != nil {
 		return err
 	}
-	rc.cw.SetChunkSize(size)
-	return nil
+	return rc.cw.SetChunkSize(size)
 }
 
 // sendMediaFrame sends an AVFrame as an RTMP media message.

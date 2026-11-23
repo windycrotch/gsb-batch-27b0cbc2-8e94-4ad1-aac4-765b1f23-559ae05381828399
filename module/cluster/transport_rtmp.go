@@ -191,7 +191,9 @@ func (t *RTMPTransport) Pull(ctx context.Context, sourceURL string, stream *core
 		case rtmp.MsgSetChunkSize:
 			if len(msg.Payload) >= 4 {
 				size := int(binary.BigEndian.Uint32(msg.Payload))
-				rc.cr.SetChunkSize(size)
+				if err := rc.cr.SetChunkSize(size); err != nil {
+					return fmt.Errorf("peer chunk size %d: %w", size, err)
+				}
 			}
 		case rtmp.MsgVideo:
 			recordRelayBytes(ctx, int64(len(msg.Payload)))

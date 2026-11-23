@@ -1,6 +1,14 @@
 # Protocol input guards
 
-LiveForge applies bounds before retaining untrusted RTSP control messages or H.264 fragments. These guards complement authentication, connection limits and deployment capacity planning.
+LiveForge applies bounds before retaining untrusted RTSP control messages or H.264 fragments, and before answering an RTMP handshake. These guards complement authentication, connection limits and deployment capacity planning.
+
+## RTMP handshake and chunk framing
+
+C1 is classified before the server writes any bytes. A non-zero client version in C1 bytes 4-7 announces the digest handshake, so its HMAC-SHA256 digest must verify at one of the two schema positions; a mismatch closes the connection without entering command processing, and a forged digest is never downgraded to the simple handshake. A version-less C1 uses the simple handshake, whose S2 echoes only the C1 time field and fills the rest with fresh random bytes instead of mirroring client content, and whose S1 stays version-less so the client does not switch protocols mid-handshake.
+
+A peer's chunk size is accepted only in the range 1 to 16,777,215 (the 24-bit message length ceiling); zero and any value above the ceiling are rejected, and a configured out-of-range size falls back to the 128-byte default. A SetChunkSize received while any chunk stream still holds a partially assembled message terminates that connection instead of silently reframing the remainder, because the rest of that message was already framed with the previous size. These checks bound allocations and prevent a message from being reassembled from mixed chunk sizes; they do not validate AMF0 semantics.
+
+A publish that fails after `SetPublisher` detaches the candidate publisher. A stream created by that attempt is retired through `DiscardFailedAdmission` when nothing else attached to it, and an existing stream returns to the ownerless state, so a failed publish leaves neither a ghost publisher nor a publishing stream. Event admission for the start marker is all-or-nothing across consumers, so a refused start emits no stop event. A second publish on the same connection is rejected, and publisher cleanup runs exactly once even when a disconnect races handler teardown.
 
 ## RTSP server and cluster peers
 
@@ -49,9 +57,11 @@ Sender shutdown permanently closes admission. A later handshake receives 503; an
 ## Verification
 
 ```sh
-CGO_ENABLED=0 go test ./module/rtsp ./module/cluster ./module/notify ./module/webrtc ./pkg/rtp ./pkg/muxer/ps -count=1
+CGO_ENABLED=0 go test ./module/rtmp ./module/rtsp ./module/cluster ./module/notify ./module/webrtc ./pkg/rtp ./pkg/muxer/ps -count=1
 CGO_ENABLED=1 go test -tags audiocodec -race ./pkg/rtp -count=1
 tools/check-agent-docs_test.sh
 ```
+
+The RTMP handshake and chunk regressions use `net.Pipe` and byte buffers rather than TCP listeners: valid complex handshakes in both digest schemas, a forged digest rejected before command handling, the simple-handshake fallback, and zero, oversized and mid-message chunk sizes. Publish regressions cover admission-failure rollback for created and pre-existing streams, a repeated publish on one connection, and concurrent cleanup emitting exactly one stop event.
 
 The real TCP incomplete-body regression takes approximately 10 seconds and checks that the server releases its connection slot. WebSocket tests exercise real upgrade/close races and accepted event delivery. RTP tests cover malformed aggregation, fragment/access-unit limits, continuity, parameter caching, recovery and two bounded fuzz targets. RTSP regressions exercise real TCP/UDP recovery, concurrent tracks and independent audio/video clocks; WHIP regressions exercise the actual receive loop. Do not run a second cluster test binary concurrently. Native FFmpeg and full browser acceptance require their own usable toolchain and browser; a passing pure RTP package does not prove those dependencies are available.

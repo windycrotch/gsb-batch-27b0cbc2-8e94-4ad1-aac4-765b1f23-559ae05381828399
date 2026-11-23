@@ -17,6 +17,11 @@ const (
 // Default chunk size per RTMP spec.
 const DefaultChunkSize = 128
 
+// MaxChunkSize bounds a chunk size advertised by a peer. An RTMP message
+// length field is 24 bits, so no single chunk can carry more than
+// 0xFFFFFF bytes of payload; larger values only buy a larger allocation.
+const MaxChunkSize = 0xFFFFFF
+
 // Message represents a fully reassembled RTMP message.
 type Message struct {
 	TypeID    uint8
