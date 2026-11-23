@@ -1,6 +1,9 @@
 package atom
 
-import "encoding/binary"
+import (
+	"encoding/binary"
+	"fmt"
+)
 
 // HmhdBox - Hint Media Header Box
 // Box Type: hmhd
@@ -20,6 +23,9 @@ type HmhdBox struct {
 
 func (b *HmhdBox) parse() error {
 	data := b.ReadBoxData()
+	if len(data) < 12 {
+		return fmt.Errorf("hmhd: not enough data: %d bytes", len(data))
+	}
 	b.Version = data[0]
 	b.MaxPDUSize = binary.BigEndian.Uint16(data[0:2])
 	b.AvgPDUSize = binary.BigEndian.Uint16(data[2:4])

@@ -2,6 +2,7 @@ package atom
 
 import (
 	"encoding/binary"
+	"fmt"
 )
 
 // TkhdBox - Track Header Box
@@ -26,6 +27,9 @@ type TkhdBox struct {
 
 func (b *TkhdBox) parse() error {
 	data := b.ReadBoxData()
+	if len(data) < 84 {
+		return fmt.Errorf("tkhd: not enough data: %d bytes", len(data))
+	}
 	b.Version = data[0]
 	// b.Flags = [3]byte{data[1], data[2], data[3]}
 	b.Flags = binary.BigEndian.Uint32(data[0:4])

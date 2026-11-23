@@ -22,16 +22,22 @@ func (b *MinfBox) parse() error {
 	for _, box := range boxes {
 		switch box.Name {
 		case "vmhd":
-			b.Vmhd = &VmhdBox{Box: box}
-			b.Vmhd.parse()
+			vmhd := &VmhdBox{Box: box}
+			if b.Reader.tryParse(box, vmhd.parse) {
+				b.Vmhd = vmhd
+			}
 
 		case "stbl":
-			b.Stbl = &StblBox{Box: box}
-			b.Stbl.parse()
+			stbl := &StblBox{Box: box}
+			if b.Reader.tryParse(box, stbl.parse) {
+				b.Stbl = stbl
+			}
 
 		case "hmhd":
-			b.Hmhd = &HmhdBox{Box: box}
-			b.Hmhd.parse()
+			hmhd := &HmhdBox{Box: box}
+			if b.Reader.tryParse(box, hmhd.parse) {
+				b.Hmhd = hmhd
+			}
 		}
 	}
 	return nil

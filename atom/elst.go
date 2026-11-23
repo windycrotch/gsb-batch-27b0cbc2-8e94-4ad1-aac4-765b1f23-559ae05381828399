@@ -2,6 +2,7 @@ package atom
 
 import (
 	"encoding/binary"
+	"fmt"
 )
 
 // ElstBox - Edit List Box
@@ -25,8 +26,16 @@ type elstEntry struct {
 
 func (b *ElstBox) parse() error {
 	data := b.ReadBoxData()
+	if len(data) < 8 {
+		return fmt.Errorf("elst: not enough data: %d bytes", len(data))
+	}
 	b.Version = binary.BigEndian.Uint32(data[0:4])
 	b.EntryCount = binary.BigEndian.Uint32(data[4:8])
+	// Each entry is 12 bytes; count*12 must fit in the box data area.
+	if uint64(b.EntryCount)*12 > uint64(len(data))-8 {
+		return fmt.Errorf("elst: entry count %d needs %d bytes, only %d available",
+			b.EntryCount, uint64(b.EntryCount)*12, len(data)-8)
+	}
 	b.Entries = make([]elstEntry, b.EntryCount)
 
 	for i := 0; i < len(b.Entries); i++ {

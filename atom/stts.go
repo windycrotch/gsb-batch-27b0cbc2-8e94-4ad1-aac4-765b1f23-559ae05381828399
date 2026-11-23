@@ -1,6 +1,9 @@
 package atom
 
-import "encoding/binary"
+import (
+	"encoding/binary"
+	"fmt"
+)
 
 // SttsBox - Decoding Time to Sample Box
 // Box Type: stts
@@ -18,11 +21,20 @@ type SttsBox struct {
 
 func (b *SttsBox) parse() error {
 	data := b.ReadBoxData()
+	if len(data) < 8 {
+		return fmt.Errorf("stts: not enough data: %d bytes", len(data))
+	}
 
 	b.Version = data[0]
 	b.Flags = binary.BigEndian.Uint32(data[0:4])
 
 	count := binary.BigEndian.Uint32(data[4:8])
+	// Each entry is 8 bytes; count*8 must fit in the box data area.
+	if uint64(count)*8 > uint64(len(data))-8 {
+		return fmt.Errorf("stts: entry count %d needs %d bytes, only %d available",
+			count, uint64(count)*8, len(data)-8)
+	}
+	b.EntryCount = count
 	b.SampleCounts = make([]uint32, count)
 	b.SampleDeltas = make([]uint32, count)
 

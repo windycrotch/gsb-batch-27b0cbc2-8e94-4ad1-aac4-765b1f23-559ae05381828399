@@ -2,6 +2,7 @@ package atom
 
 import (
 	"encoding/binary"
+	"fmt"
 )
 
 // MvhdBox - Movie Header Box
@@ -26,6 +27,9 @@ type MvhdBox struct {
 
 func (b *MvhdBox) parse() error {
 	data := b.ReadBoxData()
+	if len(data) < 26 {
+		return fmt.Errorf("mvhd: not enough data: %d bytes", len(data))
+	}
 	b.Version = data[0]
 	b.Timescale = binary.BigEndian.Uint32(data[12:16])
 	b.Duration = binary.BigEndian.Uint32(data[16:20])

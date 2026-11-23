@@ -27,6 +27,9 @@ type MdhdBox struct {
 
 func (b *MdhdBox) parse() error {
 	data := b.ReadBoxData()
+	if len(data) < 22 {
+		return fmt.Errorf("mdhd: not enough data: %d bytes", len(data))
+	}
 	b.Version = data[0]
 	b.Flags = binary.BigEndian.Uint32(data[0:4])
 	b.CreationTime = binary.BigEndian.Uint32(data[4:8])

@@ -15,35 +15,59 @@ import (
 const tmpl = `
 File:
   file size:    {{.Size}}
-  brands:       {{.Ftyp.MajorBrand}} {{.Ftyp.MinorVersion}} {{.Ftyp.CompatibleBrands}}
+{{- with .Ftyp}}
+  brands:       {{.MajorBrand}} {{.MinorVersion}} {{.CompatibleBrands}}
+{{- end}}
+{{- with .Moov}}
 
 Movie:
-  duration:     {{.Moov.Mvhd.Duration}} ms / {{.Moov.Mvhd.Timescale}} ({{getDurationString .Moov.Mvhd.Duration .Moov.Mvhd.Timescale}})
-  fragments:    {{.IsFragmented}}
-  timescale:    {{.Moov.Mvhd.Timescale}}
+  {{- with .Mvhd}}
+  duration:     {{.Duration}} ms / {{.Timescale}} ({{getDurationString .Duration .Timescale}})
+  timescale:    {{.Timescale}}
+  {{- end}}
+  fragments:    {{$.IsFragmented}}
 
-Found {{len .Moov.Traks}} Tracks 
-{{range $trak := .Moov.Traks}}
-Track: {{$trak.Tkhd.TrackID}}
-  flags:    {{$trak.Tkhd.Flags}} {{getFlags $trak.Tkhd.Flags}}
-  id:       {{$trak.Tkhd.TrackID}}
-  type:     {{getHandlerType $trak.Mdia.Hdlr.Handler}}
-  duration: {{$trak.Tkhd.Duration}} ms
-  language: {{$trak.Mdia.Mdhd.LanguageString}}
-  width:    {{to16 $trak.Tkhd.Width}}
-  height:   {{to16 $trak.Tkhd.Height}}
+Found {{len .Traks}} Tracks
+{{- range $trak := .Traks}}
+{{with $trak.Tkhd}}
+Track: {{.TrackID}}
+  flags:    {{.Flags}} {{getFlags .Flags}}
+  id:       {{.TrackID}}
+  duration: {{.Duration}} ms
+  width:    {{to16 .Width}}
+  height:   {{to16 .Height}}
+  {{- if (or (ne .GetWidth 0) (ne .GetHeight 0)) }}
+    display width:  {{.GetWidth}}
+    display height: {{.GetHeight}}
+  {{- end}}
+{{- end}}
+{{- with $trak.Mdia}}{{$mdia := .}}
+  {{- with .Hdlr}}
+  type:     {{getHandlerType .Handler}}
+  {{- end}}
+  {{- with .Mdhd}}
+  language: {{.LanguageString}}
   media:
-    sample count:   {{index $trak.Mdia.Minf.Stbl.Stts.SampleCounts 0}}
-    timescale:      {{$trak.Mdia.Mdhd.Timescale}}
-    duration:       {{$trak.Mdia.Mdhd.Duration}} (media timescale units)
-    duration:       {{getDurationMS $trak.Mdia.Mdhd.Duration $trak.Mdia.Mdhd.Timescale}} (ms)
-  {{- if (or (ne $trak.Tkhd.GetWidth 0) (ne $trak.Tkhd.GetHeight 0)) }}
-    display width:  {{$trak.Tkhd.GetWidth}}
-    display width:  {{$trak.Tkhd.GetHeight}}
+    timescale:      {{.Timescale}}
+    duration:       {{.Duration}} (media timescale units)
+    duration:       {{getDurationMS .Duration .Timescale}} (ms)
   {{- end}}
-  {{- if (eq (getHandlerType $trak.Mdia.Hdlr.Handler) "Video")}}
-    frame rate (computed): {{getFramerate $trak.Mdia.Minf.Stbl.Stts.SampleCounts $trak.Mdia.Mdhd.Duration $trak.Mdia.Mdhd.Timescale}}
+  {{- with .Minf}}
+    {{- with .Stbl}}
+      {{- with .Stts}}
+        {{- if .SampleCounts}}
+    sample count:   {{index .SampleCounts 0}}
+        {{- end}}
+        {{- if and $mdia.Hdlr $mdia.Mdhd}}
+          {{- if (eq (getHandlerType $mdia.Hdlr.Handler) "Video")}}
+    frame rate (computed): {{getFramerate .SampleCounts $mdia.Mdhd.Duration $mdia.Mdhd.Timescale}}
+          {{- end}}
+        {{- end}}
+      {{- end}}
+    {{- end}}
   {{- end}}
+{{- end}}
+{{- end}}
 {{- end}}
 `
 
@@ -61,8 +85,14 @@ func main() {
 	}
 
 	f, err := mp4.Open(input)
+	if err != nil && f == nil {
+		// Total failure: nothing could be parsed.
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(1)
+	}
 	if err != nil {
-		return
+		// Partial success: keep going with whatever parsed cleanly.
+		fmt.Fprintln(os.Stderr, "warning:", err)
 	}
 
 	// defer f.Close()
@@ -78,17 +108,33 @@ func main() {
 
 	t := template.Must(template.New("tmpl").Funcs(funcMap).Parse(tmpl))
 	if err := t.Execute(os.Stdout, f); err != nil {
-		panic(err)
+		fmt.Fprintln(os.Stderr, "template error:", err)
+	}
+
+	if len(f.Errors) > 0 {
+		fmt.Println("\nFailed boxes:")
+		for _, be := range f.Errors {
+			fmt.Println(" ", be)
+		}
 	}
 }
 
 func getFramerate(sampleCounts []uint32, duration, timescale uint32) string {
+	if len(sampleCounts) == 0 || duration == 0 || timescale == 0 {
+		return "n/a"
+	}
 	sc := 1000 * sampleCounts[0]
 	durationMS := math.Floor(float64(duration) / float64(timescale) * 1000)
+	if durationMS == 0 {
+		return "n/a"
+	}
 	return fmt.Sprintf("%.2f", float64(sc)/durationMS)
 }
 
 func getDurationMS(duration, timescale uint32) string {
+	if timescale == 0 {
+		return "n/a"
+	}
 	return fmt.Sprintf("%.2f", math.Floor(float64(duration)/float64(timescale)*1000))
 }
 

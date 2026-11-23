@@ -16,8 +16,10 @@ func (b *EdtsBox) parse() error {
 	for _, box := range boxes {
 		switch box.Name {
 		case "elst":
-			b.Elst = &ElstBox{Box: box}
-			b.Elst.parse()
+			elst := &ElstBox{Box: box}
+			if b.Reader.tryParse(box, elst.parse) {
+				b.Elst = elst
+			}
 		}
 	}
 	return nil

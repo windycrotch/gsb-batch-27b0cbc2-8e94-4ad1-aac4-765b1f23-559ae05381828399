@@ -17,12 +17,16 @@ func (b *StblBox) parse() error {
 	for _, box := range boxes {
 		switch box.Name {
 		case "stts":
-			b.Stts = &SttsBox{Box: box}
-			b.Stts.parse()
+			stts := &SttsBox{Box: box}
+			if b.Reader.tryParse(box, stts.parse) {
+				b.Stts = stts
+			}
 
 		case "stsd":
-			b.Stsd = &StsdBox{Box: box}
-			b.Stsd.parse()
+			stsd := &StsdBox{Box: box}
+			if b.Reader.tryParse(box, stsd.parse) {
+				b.Stsd = stsd
+			}
 		}
 	}
 	return nil

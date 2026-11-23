@@ -22,16 +22,22 @@ func (b *TrakBox) parse() error {
 	for _, box := range boxes {
 		switch box.Name {
 		case "tkhd":
-			b.Tkhd = &TkhdBox{Box: box}
-			b.Tkhd.parse()
+			tkhd := &TkhdBox{Box: box}
+			if b.Reader.tryParse(box, tkhd.parse) {
+				b.Tkhd = tkhd
+			}
 
 		case "mdia":
-			b.Mdia = &MdiaBox{Box: box}
-			b.Mdia.parse()
+			mdia := &MdiaBox{Box: box}
+			if b.Reader.tryParse(box, mdia.parse) {
+				b.Mdia = mdia
+			}
 
 		case "edts":
-			b.Edts = &EdtsBox{Box: box}
-			b.Edts.parse()
+			edts := &EdtsBox{Box: box}
+			if b.Reader.tryParse(box, edts.parse) {
+				b.Edts = edts
+			}
 		}
 	}
 	return nil

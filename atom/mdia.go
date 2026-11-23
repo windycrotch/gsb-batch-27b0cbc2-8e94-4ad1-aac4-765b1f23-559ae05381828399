@@ -20,16 +20,22 @@ func (b *MdiaBox) parse() error {
 	for _, box := range boxes {
 		switch box.Name {
 		case "hdlr":
-			b.Hdlr = &HdlrBox{Box: box}
-			b.Hdlr.parse()
+			hdlr := &HdlrBox{Box: box}
+			if b.Reader.tryParse(box, hdlr.parse) {
+				b.Hdlr = hdlr
+			}
 
 		case "mdhd":
-			b.Mdhd = &MdhdBox{Box: box}
-			b.Mdhd.parse()
+			mdhd := &MdhdBox{Box: box}
+			if b.Reader.tryParse(box, mdhd.parse) {
+				b.Mdhd = mdhd
+			}
 
 		case "minf":
-			b.Minf = &MinfBox{Box: box}
-			b.Minf.parse()
+			minf := &MinfBox{Box: box}
+			if b.Reader.tryParse(box, minf.parse) {
+				b.Minf = minf
+			}
 		}
 	}
 	return nil

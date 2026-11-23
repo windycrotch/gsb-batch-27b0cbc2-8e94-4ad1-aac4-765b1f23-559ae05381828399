@@ -30,13 +30,16 @@ func (b *MoovBox) parse() error {
 	for _, box := range boxes {
 		switch box.Name {
 		case "mvhd":
-			b.Mvhd = &MvhdBox{Box: box}
-			b.Mvhd.parse()
+			mvhd := &MvhdBox{Box: box}
+			if b.Reader.tryParse(box, mvhd.parse) {
+				b.Mvhd = mvhd
+			}
 
 		case "trak":
 			trak := &TrakBox{Box: box}
-			trak.parse()
-			b.Traks = append(b.Traks, trak)
+			if b.Reader.tryParse(box, trak.parse) {
+				b.Traks = append(b.Traks, trak)
+			}
 
 		case "mvex":
 			b.IsFragmented = true
