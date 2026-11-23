@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`FlushMulti` is a resumable, concurrency-safe lifecycle.** A multi-channel
+  drain no longer loses data when a stage fails: the channels that finished keep
+  their returned samples, and calling `FlushMulti` again on the same instance
+  completes only the channels that did not finish, feeding the samples a failed
+  `Process` had already read out of the inter-stage buffer back through the same
+  stage instead of dropping them. The concatenation of a channel's results
+  across the attempts equals one successful `FlushMulti`, with no duplicated
+  tail and no re-injected flush padding. A drain after completion is a
+  side-effect-free empty result per channel, `Reset` re-arms the instance for a
+  new stream, and a later non-empty `ProcessMulti` after a drain behaves like a
+  fresh instance. `Flush` and `FlushMulti` share the lifecycle, so `Flush`
+  draining channel 0 and a following `FlushMulti` no longer returns channel 0's
+  tail twice. Public state-advancing entry points on one `New(config)` instance
+  are now serialized: a drain cannot interleave with `ProcessMulti`, and
+  concurrent `FlushMulti` calls resolve to one that advances the state and the
+  others that return the completed, empty result. Mono output is unchanged.
 - `New` no longer drops the rate change for conversions within 0.1% of 1:1 or
   of a power-of-two ratio at the Low, Medium, High and VeryHigh presets (for
   example 48000 to 47999, 48000 to 48040, 44100 to 44110, 48000 to 96050 and

@@ -325,6 +325,17 @@ if mf, ok := r.(resampling.MultiFlusher); ok {
 }
 ```
 
+`FlushMulti` drains each channel exactly once per stream and is terminal, like
+`Flush`: a second call returns an empty slice for every channel, and a later
+`ProcessMulti` starts a new stream. The drain is resumable. If a stage fails
+part way, the returned value still carries the per-channel data of the channels
+that finished; calling `FlushMulti` again on the same instance completes only
+the channels that did not, and concatenating each channel's results across the
+attempts gives exactly what one successful call would have returned — no
+channel is drained twice and no flush padding is re-injected. Concurrent
+`FlushMulti` calls on one instance serialize: one advances the state and the
+others return the completed, empty result.
+
 ## Quality Presets
 
 | Preset            | Precision | Attenuation | Use Case                        |
@@ -466,7 +477,10 @@ type Resampler interface {
 
 // Optional interface for draining every channel of a multi-channel stream.
 // Flush() only drains channel 0, so after ProcessMulti use FlushMulti to
-// avoid dropping the delay-line tails of channels 1..N-1.
+// avoid dropping the delay-line tails of channels 1..N-1. Each channel is
+// drained once per stream; a retry after a stage error resumes only the
+// channels that did not finish, and calling it again after completion returns
+// an empty slice per channel.
 type MultiFlusher interface {
     FlushMulti() ([][]float64, error)
 }

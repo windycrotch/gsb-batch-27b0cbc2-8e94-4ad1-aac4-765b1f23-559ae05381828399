@@ -22,6 +22,18 @@ type constantRateResampler struct {
 	// Per-channel state
 	channels []*channelResampler
 
+	// mu serializes the public state-advancing entry points (Process,
+	// ProcessInto, ProcessFloat32Into, ProcessMulti, Flush, FlushMulti and
+	// Reset; ProcessFloat32 delegates to Process). A drain must never
+	// interleave with processing: Flush works on the same stage delay lines
+	// that Process writes, so overlapping the two corrupts both. Holding mu for
+	// a whole ProcessMulti call keeps the per-channel parallelism (its
+	// goroutines run inside the critical section) while making a concurrent
+	// FlushMulti wait for the chunk to finish. Two concurrent drains therefore
+	// serialize: exactly one advances the state and the others observe its
+	// completed, empty result instead of replaying tails.
+	mu sync.Mutex
+
 	// Grow-only float64 scratch buffers reused by ProcessFloat32Into to convert
 	// float32 input/output without allocating on every call. The engine's
 	// growStableLen/appendStable helpers live in internal/engine and are not
@@ -37,6 +49,48 @@ type channelResampler struct {
 
 	// Pre-allocated scratch buffer reused by ReadInto to avoid allocations.
 	readScratch []float64
+
+	// Flush lifecycle. A flush is resumable rather than all-or-nothing: each
+	// channel is drained at most once per stream, and progress is kept on the
+	// channel so a stage error does not discard the channels already drained
+	// or make a retry inject the padding a second time.
+	//
+	// flushDone records that this channel's tail has already been returned;
+	// further FlushMulti calls return an empty slice for it. flushStage is the
+	// next stage to drain, and flushPending holds input read from
+	// buffers[flushStage] that the stage has not yet accepted, so a failed
+	// Stage.Process can be retried with the same samples instead of reading the
+	// ring buffer again (which would lose them) or skipping them.
+	flushDone    bool
+	flushStage   int
+	flushPending []float64
+}
+
+// beginStream clears the flush lifecycle so a Process after a completed flush
+// starts a new stream instead of being reported as already drained. It is not
+// called for empty input, so a stray Process(nil) does not undo a finished
+// drain.
+//
+// If an earlier drain stopped on a stage error, the samples it had already
+// read out of the ring buffer are handed back to the stage's input buffer
+// rather than dropped, so continuing the stream after a failed flush does not
+// lose input. (The supported recovery after an error is to call Flush again,
+// which resumes from flushPending directly.)
+func (ch *channelResampler) beginStream() {
+	if len(ch.flushPending) > 0 && ch.flushStage < len(ch.stages) {
+		ch.buffers[ch.flushStage].Write(ch.flushPending)
+	}
+	ch.clearFlushState()
+}
+
+// clearFlushState discards any drain progress without restoring it. Reset uses
+// it because Reset has already cleared the buffers: writing retained input back
+// would leave a fresh-looking instance with phantom samples in its first
+// buffer, so its next Process would not match a newly constructed one.
+func (ch *channelResampler) clearFlushState() {
+	ch.flushDone = false
+	ch.flushStage = 0
+	ch.flushPending = nil
 }
 
 // newConstantRateResampler creates a new constant-rate resampler.
@@ -86,7 +140,13 @@ func newConstantRateResampler(config *Config, ratio float64) (*constantRateResam
 }
 
 // Process resamples a mono audio channel.
+//
+// Process and a concurrent Flush on the same instance are serialized: the
+// drain cannot run against the delay lines a Process is writing.
 func (r *constantRateResampler) Process(input []float64) ([]float64, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
 	if len(r.channels) == 0 {
 		return nil, fmt.Errorf("no channels initialized")
 	}
@@ -102,6 +162,9 @@ func (r *constantRateResampler) Process(input []float64) ([]float64, error) {
 // If output is too small, ProcessInto returns ErrBufferTooSmall before any
 // processing state is advanced, so callers can retry with a larger buffer.
 func (r *constantRateResampler) ProcessInto(input, output []float64) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
 	if len(r.channels) == 0 {
 		return 0, fmt.Errorf("no channels initialized")
 	}
@@ -126,6 +189,9 @@ func (r *constantRateResampler) EstimateOutput(inputLen int) int {
 // to the filter computation (~5% of total time for typical buffers).
 // Native float32 processing would require duplicating the engine with
 // generic types, which is a trade-off between code complexity and performance.
+//
+// It does not lock the instance itself: the conversion touches only local
+// memory and the delegated Process call takes the lock.
 func (r *constantRateResampler) ProcessFloat32(input []float32) ([]float32, error) {
 	// Convert to float64 for high-precision internal processing
 	input64 := make([]float64, len(input))
@@ -158,8 +224,12 @@ func (r *constantRateResampler) ProcessFloat32(input []float32) ([]float32, erro
 // warm. Processing still runs through the float64 pipeline for precision.
 //
 // Single-channel only, matching ProcessFloat32 and the float64 ProcessInto.
-// It is not safe for concurrent use with itself or the other Process methods.
+// Like the other public entry points it is serialized against a concurrent
+// drain on the same instance.
 func (r *constantRateResampler) ProcessFloat32Into(input, output []float32) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
 	if len(r.channels) == 0 {
 		return 0, fmt.Errorf("no channels initialized")
 	}
@@ -202,7 +272,14 @@ func (r *constantRateResampler) ProcessFloat32Into(input, output []float32) (int
 // ProcessMulti processes multiple audio channels.
 // When EnableParallel is true in config, channels are processed concurrently.
 // Otherwise, channels are processed sequentially.
+//
+// The whole call runs under the instance lock, so no Flush can interleave with
+// the per-channel stage updates. Parallel channels inside one call still run
+// concurrently; each touches only its own channel state.
 func (r *constantRateResampler) ProcessMulti(input [][]float64) ([][]float64, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
 	if len(input) != r.config.Channels {
 		return nil, fmt.Errorf("expected %d channels, got %d", r.config.Channels, len(input))
 	}
@@ -260,6 +337,13 @@ func (r *constantRateResampler) processChannel(channel int, input []float64) ([]
 
 	ch := r.channels[channel]
 
+	// Non-empty input starts (or continues) a stream. After a completed
+	// drain, the stages are back at their fresh state, so this only re-arms
+	// the flush lifecycle; it does not touch filter state.
+	if len(input) > 0 {
+		ch.beginStream()
+	}
+
 	// Add input to first buffer
 	ch.buffers[0].Write(input)
 
@@ -304,6 +388,10 @@ func (r *constantRateResampler) processChannelInto(channel int, input, dst []flo
 
 	ch := r.channels[channel]
 
+	if len(input) > 0 {
+		ch.beginStream()
+	}
+
 	ch.buffers[0].Write(input)
 
 	for i, stage := range ch.stages {
@@ -347,61 +435,125 @@ func (r *constantRateResampler) processChannelInto(channel int, input, dst []flo
 
 // Flush drains channel 0's pipeline. For multi-channel streams processed
 // via ProcessMulti, use FlushMulti to drain every channel.
+//
+// Flush is end-of-stream only and terminal for the drained stream: a second
+// Flush call returns an empty slice without touching the filter state, and a
+// later non-empty Process starts a new stream. The drain is resumable: if a
+// stage fails partway, the samples already drained for channel 0 are kept (in
+// the internal buffers) rather than dropped, and calling Flush again continues
+// where it stopped instead of re-injecting the flush padding.
 func (r *constantRateResampler) Flush() ([]float64, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
 	if len(r.channels) == 0 {
 		return []float64{}, nil
 	}
 	return r.flushChannel(0, r.channels[0])
 }
 
-// flushChannel drains one channel's multi-stage pipeline. Stages are flushed
-// front-to-back: pending input (including the previous stage's flushed tail)
-// is processed through the stage before flushing its delay line, so the tail
-// propagates all the way to the final buffer (issue #37).
+// flushChannel drains one channel's multi-stage pipeline, resuming from where
+// a previous attempt stopped.
+//
+// Stages are flushed front-to-back: pending input (including the previous
+// stage's flushed tail) is processed through the stage before flushing its
+// delay line, so the tail propagates all the way to the final buffer
+// (issue #37).
+//
+// The channel's progress lives in channelResampler (flushStage, flushPending,
+// flushDone) rather than in local variables, so a stage error can return
+// without losing the work already done. On error the caller gets the channels
+// that finished (FlushMulti) and a retry on the same instance only completes
+// the ones that did not, without replaying any padding. The final buffer keeps
+// the samples produced before the error, so nothing drained is discarded.
 func (r *constantRateResampler) flushChannel(chIdx int, ch *channelResampler) ([]float64, error) {
-	for i, stage := range ch.stages {
+	if ch.flushDone {
+		return []float64{}, nil
+	}
+
+	for i := ch.flushStage; i < len(ch.stages); i++ {
+		stage := ch.stages[i]
 		inputBuffer := ch.buffers[i]
 		outputBuffer := ch.buffers[i+1]
 
-		if avail := inputBuffer.Available(); avail > 0 {
-			out, err := stage.Process(inputBuffer.Read(avail))
+		// Anything the stage could not accept yet, including input read by a
+		// previous failed attempt, is held in flushPending so a retry feeds
+		// the same samples again. Reading the ring buffer is destructive, so
+		// it is read at most once.
+		if len(ch.flushPending) == 0 {
+			if avail := inputBuffer.Available(); avail > 0 {
+				ch.flushPending = inputBuffer.Read(avail)
+			}
+		}
+		if len(ch.flushPending) > 0 {
+			out, err := stage.Process(ch.flushPending)
 			if err != nil {
+				ch.flushStage = i
 				return nil, fmt.Errorf("channel %d stage %d flush-process error: %w", chIdx, i, err)
 			}
 			if len(out) > 0 {
 				outputBuffer.Write(out)
 			}
+			ch.flushPending = nil
 		}
 
 		out, err := stage.Flush()
 		if err != nil {
+			ch.flushStage = i
 			return nil, fmt.Errorf("channel %d stage %d flush error: %w", chIdx, i, err)
 		}
 		if len(out) > 0 {
 			outputBuffer.Write(out)
 		}
+		ch.flushStage = i + 1
 	}
 
 	finalBuffer := ch.buffers[len(ch.buffers)-1]
+	ch.flushDone = true
+	ch.flushStage = 0
 	return finalBuffer.ReadAll(), nil
 }
 
 // FlushMulti flushes every channel's pipeline independently, returning one
 // slice per channel.
+//
+// Each channel is drained exactly once per stream: the returned slice for a
+// channel whose tail was already returned (by an earlier FlushMulti or a
+// Flush) is empty. On a stage error the return value keeps the per-channel
+// data of the channels that did finish, plus empty slices for the rest, and
+// the error. Calling FlushMulti again on the same instance resumes the
+// unfinished channels only, so concatenating a channel's results across the
+// attempts yields exactly what one successful FlushMulti would have returned.
+// Concurrent FlushMulti calls on one instance serialize; all but the one that
+// advances the state see the completed, empty result.
 func (r *constantRateResampler) FlushMulti() ([][]float64, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
 	if len(r.channels) == 0 {
 		return [][]float64{}, nil
 	}
 
 	output := make([][]float64, len(r.channels))
+	var firstErr error
 	for chIdx, ch := range r.channels {
+		// Keep draining the other channels after a failure: their tails are
+		// independent, so returning them now preserves work a retry would
+		// otherwise have to (and could not) reproduce as partial results.
 		flushed, err := r.flushChannel(chIdx, ch)
 		if err != nil {
-			return nil, err
+			if firstErr == nil {
+				firstErr = err
+			}
+			// flushChannel returns nil on error; report an empty slice so the
+			// caller can index the result by channel.
+			if flushed == nil {
+				flushed = []float64{}
+			}
 		}
 		output[chIdx] = flushed
 	}
-	return output, nil
+	return output, firstErr
 }
 
 // startupDeficitStage is the accounting contract stages provide for accurate
@@ -443,10 +595,16 @@ func (r *constantRateResampler) GetLatency() int {
 }
 
 // Reset clears all internal state.
+//
+// After Reset the instance behaves like a freshly constructed one: any
+// partially or fully completed flush lifecycle is discarded, so the instance
+// can be used for a brand-new stream and drains exactly once at its end.
+// Reset is serialized against Process and Flush on the same instance.
 func (r *constantRateResampler) Reset() {
-	// No locking: doc.go documents that calls on a single instance must be
-	// serialized by the caller (standard for stateful streaming DSP), so a mutex
-	// here would protect nothing while falsely implying cross-method safety.
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	// The lock serializes Reset against the other public entry points (see mu).
 	for _, ch := range r.channels {
 		// Reset all stages
 		for _, stage := range ch.stages {
@@ -457,6 +615,8 @@ func (r *constantRateResampler) Reset() {
 		for _, buffer := range ch.buffers {
 			buffer.Clear()
 		}
+
+		ch.clearFlushState()
 	}
 }
 

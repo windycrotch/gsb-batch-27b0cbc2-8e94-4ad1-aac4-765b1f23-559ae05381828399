@@ -28,7 +28,9 @@ type Resampler interface {
 	// Flush returns any remaining samples in internal buffers.
 	// Should be called when no more input will be provided.
 	// For multi-channel streams processed via ProcessMulti, use the
-	// MultiFlusher interface instead to drain every channel.
+	// MultiFlusher interface instead to drain every channel: Flush drains
+	// channel 0 only, and the channels it has drained are skipped by a later
+	// FlushMulti.
 	Flush() ([]float64, error)
 
 	// GetLatency returns the startup deficit in output samples: how many
@@ -331,6 +333,17 @@ type Info struct {
 //	if mf, ok := r.(MultiFlusher); ok {
 //	    channels, err := mf.FlushMulti()
 //	}
+//
+// FlushMulti drains every channel exactly once per stream. It is terminal for
+// the drained stream, like Flush: a second call returns an empty slice for
+// every channel without touching the filter state, and a later non-empty
+// Process starts a new stream. The drain is resumable. If a stage fails part
+// way, the returned value still carries the per-channel data of the channels
+// that finished, and calling FlushMulti again on the same instance completes
+// only the channels that did not, so concatenating each channel's results
+// across the attempts equals one successful FlushMulti. Concurrent FlushMulti
+// calls on one instance serialize: one advances the state and the others
+// return the completed, empty result.
 type MultiFlusher interface {
 	// FlushMulti returns any remaining samples in internal buffers for
 	// every channel. Should be called instead of Flush when using

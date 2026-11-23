@@ -274,10 +274,16 @@
 //
 // # Thread Safety
 //
-// Individual [Resampler] instances are safe for concurrent use by multiple
-// goroutines when processing different channels via [Resampler.ProcessMulti].
-// However, calls to [Resampler.Process] and [Resampler.Flush] on the same
-// instance should be serialized.
+// The [Resampler] returned by [New] is safe for concurrent use by multiple
+// goroutines: with EnableParallel, one [Resampler.ProcessMulti] call runs its
+// channels concurrently, and each channel touches only its own state. That
+// resampler also serializes its state-advancing entry points (Process,
+// ProcessMulti, ProcessInto, ProcessFloat32Into, Flush, FlushMulti and Reset)
+// internally, so a multi-channel drain cannot interleave with the processing
+// that would corrupt it, and two concurrent drains resolve to one that advances
+// the state and the others that observe the completed, empty result. Each
+// [SimpleResampler] and [SimpleResamplerFloat32] is a single stream with no
+// such locking: use one instance per channel and serialize calls on it.
 //
 // # Attribution
 //
