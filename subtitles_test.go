@@ -3,6 +3,7 @@ package astisub_test
 import (
 	"bytes"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -211,6 +212,48 @@ func TestSubtitles_Merge(t *testing.T) {
 	assert.Equal(t, len(s1.Styles), 3)
 }
 
+func TestSubtitles_MergeDuplicateRegionAndStyleIDs(t *testing.T) {
+	var keptRegion = &astisub.Region{ID: "region_1"}
+	var keptStyle = &astisub.Style{ID: "style_1"}
+	var s1 = &astisub.Subtitles{
+		Items:   []*astisub.Item{{StartAt: time.Second, EndAt: 2 * time.Second, Region: keptRegion, Style: keptStyle}},
+		Regions: map[string]*astisub.Region{"region_1": keptRegion},
+		Styles:  map[string]*astisub.Style{"style_1": keptStyle},
+	}
+	var dupRegion = &astisub.Region{ID: "region_1"}
+	var dupStyle = &astisub.Style{ID: "style_1"}
+	var newRegion = &astisub.Region{ID: "region_2", Style: dupStyle}
+	var newStyle = &astisub.Style{ID: "style_2", Style: dupStyle}
+	var item = &astisub.Item{
+		StartAt: 3 * time.Second,
+		EndAt:   4 * time.Second,
+		Region:  dupRegion,
+		Style:   dupStyle,
+		Lines:   []astisub.Line{{Items: []astisub.LineItem{{Text: "text", Style: dupStyle}}}},
+	}
+	var s2 = &astisub.Subtitles{
+		Items:   []*astisub.Item{item},
+		Regions: map[string]*astisub.Region{"region_1": dupRegion, "region_2": newRegion},
+		Styles:  map[string]*astisub.Style{"style_1": dupStyle, "style_2": newStyle},
+	}
+	s1.Merge(s2)
+
+	// Same IDs are kept only once, different IDs are preserved untouched
+	assert.Len(t, s1.Regions, 2)
+	assert.Len(t, s1.Styles, 2)
+	assert.Same(t, keptRegion, s1.Regions["region_1"])
+	assert.Same(t, keptStyle, s1.Styles["style_1"])
+	assert.Same(t, newRegion, s1.Regions["region_2"])
+	assert.Same(t, newStyle, s1.Styles["style_2"])
+
+	// All references to duplicate IDs are remapped to the kept entries
+	assert.Same(t, keptRegion, item.Region)
+	assert.Same(t, keptStyle, item.Style)
+	assert.Same(t, keptStyle, item.Lines[0].Items[0].Style)
+	assert.Same(t, keptStyle, newRegion.Style)
+	assert.Same(t, keptStyle, newStyle.Style)
+}
+
 func TestSubtitles_Optimize(t *testing.T) {
 	var s = &astisub.Subtitles{
 		Items: []*astisub.Item{
@@ -233,6 +276,75 @@ func TestSubtitles_Optimize(t *testing.T) {
 	s.Optimize()
 	assert.Len(t, s.Regions, 1)
 	assert.Len(t, s.Styles, 3)
+}
+
+func TestSubtitles_OptimizeKeepsFullReferenceChain(t *testing.T) {
+	var s = &astisub.Subtitles{
+		Items: []*astisub.Item{
+			{Region: &astisub.Region{ID: "region"}},
+		},
+		Regions: map[string]*astisub.Region{
+			"region": {ID: "region", Style: &astisub.Style{ID: "region_style"}},
+		},
+		Styles: map[string]*astisub.Style{
+			"region_style": {ID: "region_style", Style: &astisub.Style{ID: "parent_style"}},
+			"parent_style": {ID: "parent_style"},
+			"unused":       {ID: "unused"},
+		},
+	}
+	s.Optimize()
+
+	// The whole item -> region -> region style -> parent style chain survives
+	assert.Len(t, s.Regions, 1)
+	assert.Len(t, s.Styles, 2)
+	assert.Contains(t, s.Styles, "region_style")
+	assert.Contains(t, s.Styles, "parent_style")
+}
+
+func TestSubtitles_ConcurrentMergeAndOptimize(t *testing.T) {
+	var s = astisub.NewSubtitles()
+	var wg sync.WaitGroup
+	for idx := 0; idx < 50; idx++ {
+		wg.Add(2)
+		go func(idx int) {
+			defer wg.Done()
+			var src = astisub.NewSubtitles()
+			var d = time.Duration(idx) * time.Second
+			src.Items = append(src.Items, &astisub.Item{
+				StartAt: d,
+				EndAt:   d + time.Second,
+				Region:  &astisub.Region{ID: "shared_region"},
+				Style:   &astisub.Style{ID: "shared_style"},
+				Lines:   []astisub.Line{{Items: []astisub.LineItem{{Text: "text", Style: &astisub.Style{ID: "shared_style"}}}}},
+			})
+			src.Regions["shared_region"] = &astisub.Region{ID: "shared_region"}
+			src.Styles["shared_style"] = &astisub.Style{ID: "shared_style"}
+			s.Merge(src)
+		}(idx)
+		go func() {
+			defer wg.Done()
+			s.Optimize()
+		}()
+	}
+	wg.Wait()
+
+	// Every reference of every written item must resolve in the registries
+	assert.Len(t, s.Items, 50)
+	for _, item := range s.Items {
+		if item.Region != nil {
+			assert.Contains(t, s.Regions, item.Region.ID)
+		}
+		if item.Style != nil {
+			assert.Contains(t, s.Styles, item.Style.ID)
+		}
+		for _, l := range item.Lines {
+			for _, li := range l.Items {
+				if li.Style != nil {
+					assert.Contains(t, s.Styles, li.Style.ID)
+				}
+			}
+		}
+	}
 }
 
 func TestSubtitles_Order(t *testing.T) {
@@ -302,6 +414,29 @@ func TestSubtitles_ApplyLinearCorrection(t *testing.T) {
 	require.Equal(t, 8*time.Second, s.Items[1].EndAt)
 	require.Equal(t, 11*time.Second, s.Items[2].StartAt)
 	require.Equal(t, 15500*time.Millisecond, s.Items[2].EndAt)
+}
+
+func TestSubtitles_ApplyLinearCorrectionInvalidIntervals(t *testing.T) {
+	// Items shifted before 0 are clamped to valid intervals
+	s := &astisub.Subtitles{Items: []*astisub.Item{
+		{StartAt: time.Second, EndAt: 2 * time.Second},
+		{StartAt: 8 * time.Second, EndAt: 10 * time.Second},
+	}}
+	// a = 1, b = -6s
+	s.ApplyLinearCorrection(7*time.Second, time.Second, 8*time.Second, 2*time.Second)
+	require.Equal(t, time.Duration(0), s.Items[0].StartAt)
+	require.Equal(t, time.Duration(0), s.Items[0].EndAt)
+	require.Equal(t, 2*time.Second, s.Items[1].StartAt)
+	require.Equal(t, 4*time.Second, s.Items[1].EndAt)
+
+	// Inverted time boundaries are fixed
+	s = &astisub.Subtitles{Items: []*astisub.Item{
+		{StartAt: time.Second, EndAt: 2 * time.Second},
+	}}
+	// a = -1, b = 3s
+	s.ApplyLinearCorrection(time.Second, 2*time.Second, 2*time.Second, time.Second)
+	require.Equal(t, time.Second, s.Items[0].StartAt)
+	require.Equal(t, 2*time.Second, s.Items[0].EndAt)
 }
 
 func TestHTMLEntity(t *testing.T) {

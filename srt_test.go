@@ -292,3 +292,22 @@ func TestSRTTrailingBlankLines(t *testing.T) {
 		assert.Equal(t, "A", s.Items[0].String())
 	}
 }
+
+func TestSRTDanglingReferences(t *testing.T) {
+	// Items referencing regions or styles missing from the registries must not
+	// interrupt the write
+	var s = &astisub.Subtitles{
+		Items: []*astisub.Item{{
+			StartAt: time.Second,
+			EndAt:   2 * time.Second,
+			Region:  &astisub.Region{ID: "ghost_region"},
+			Style:   &astisub.Style{ID: "ghost_style"},
+			Lines:   []astisub.Line{{Items: []astisub.LineItem{{Text: "text"}}}},
+		}},
+	}
+	b := &bytes.Buffer{}
+	err := s.WriteToSRT(b)
+	assert.NoError(t, err)
+	assert.Contains(t, b.String(), "00:00:01,000 --> 00:00:02,000")
+	assert.Contains(t, b.String(), "text")
+}

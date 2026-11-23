@@ -742,8 +742,8 @@ func (s Subtitles) WriteToTTML(o io.Writer, opts ...WriteToTTMLOption) (err erro
 			ID:                     s.Regions[id].ID,
 			TTMLOutStyleAttributes: ttmlOutStyleAttributesFromStyleAttributes(s.Regions[id].InlineStyle),
 		}}
-		if s.Regions[id].Style != nil {
-			ttmlRegion.Style = s.Regions[id].Style.ID
+		if style := s.resolveStyle(s.Regions[id].Style); style != nil {
+			ttmlRegion.Style = style.ID
 		}
 		ttml.Regions = append(ttml.Regions, ttmlRegion)
 	}
@@ -759,8 +759,8 @@ func (s Subtitles) WriteToTTML(o io.Writer, opts ...WriteToTTMLOption) (err erro
 			ID:                     s.Styles[id].ID,
 			TTMLOutStyleAttributes: ttmlOutStyleAttributesFromStyleAttributes(s.Styles[id].InlineStyle),
 		}}
-		if s.Styles[id].Style != nil {
-			ttmlStyle.Style = s.Styles[id].Style.ID
+		if style := s.resolveStyle(s.Styles[id].Style); style != nil {
+			ttmlStyle.Style = style.ID
 		}
 		ttml.Styles = append(ttml.Styles, ttmlStyle)
 	}
@@ -774,14 +774,14 @@ func (s Subtitles) WriteToTTML(o io.Writer, opts ...WriteToTTMLOption) (err erro
 			TTMLOutStyleAttributes: ttmlOutStyleAttributesFromStyleAttributes(item.InlineStyle),
 		}
 
-		// Add region
-		if item.Region != nil {
-			ttmlSubtitle.Region = item.Region.ID
+		// Add region, skipping dangling references
+		if region := s.resolveRegion(item.Region); region != nil {
+			ttmlSubtitle.Region = region.ID
 		}
 
-		// Add style
-		if item.Style != nil {
-			ttmlSubtitle.Style = item.Style.ID
+		// Add style, skipping dangling references
+		if style := s.resolveStyle(item.Style); style != nil {
+			ttmlSubtitle.Style = style.ID
 		}
 
 		// Add lines
@@ -795,9 +795,9 @@ func (s Subtitles) WriteToTTML(o io.Writer, opts ...WriteToTTMLOption) (err erro
 					XMLName:                xml.Name{Local: "span"},
 				}
 
-				// Add style
-				if lineItem.Style != nil {
-					ttmlItem.Style = lineItem.Style.ID
+				// Add style, skipping dangling references
+				if style := s.resolveStyle(lineItem.Style); style != nil {
+					ttmlItem.Style = style.ID
 				}
 
 				// Add ttml item

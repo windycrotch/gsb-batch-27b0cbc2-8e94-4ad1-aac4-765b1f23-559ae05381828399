@@ -117,3 +117,30 @@ func TestTTMLTiming(t *testing.T) {
 	_, err = astisub.ReadFromTTML(strings.NewReader(`<tt xmlns="http://www.w3.org/ns/ttml"><body><div><p begin="1s">No end</p></div></body></tt>`))
 	assert.EqualError(t, err, `astisub: subtitle "" has no begin or end time`)
 }
+
+func TestTTMLDanglingReferences(t *testing.T) {
+	// References to regions or styles missing from the registries are skipped
+	// instead of interrupting the write
+	var s = &astisub.Subtitles{
+		Items: []*astisub.Item{{
+			StartAt: time.Second,
+			EndAt:   2 * time.Second,
+			Region:  &astisub.Region{ID: "ghost_region"},
+			Style:   &astisub.Style{ID: "ghost_style"},
+			Lines:   []astisub.Line{{Items: []astisub.LineItem{{Text: "text", Style: &astisub.Style{ID: "ghost_line_style"}}}}},
+		}},
+		Regions: map[string]*astisub.Region{
+			"region": {ID: "region", Style: &astisub.Style{ID: "ghost_region_style"}},
+		},
+		Styles: map[string]*astisub.Style{
+			"style": {ID: "style", Style: &astisub.Style{ID: "ghost_parent_style"}},
+		},
+	}
+	w := &bytes.Buffer{}
+	err := s.WriteToTTML(w)
+	assert.NoError(t, err)
+	assert.NotContains(t, w.String(), "ghost")
+	assert.Contains(t, w.String(), `xml:id="region"`)
+	assert.Contains(t, w.String(), `xml:id="style"`)
+	assert.Contains(t, w.String(), "text")
+}

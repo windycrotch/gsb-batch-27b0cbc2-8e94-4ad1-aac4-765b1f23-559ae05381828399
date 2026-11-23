@@ -561,3 +561,34 @@ func TestWebVTTUnescapesAllEntities(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Contains(t, b.String(), ">> It's café\n")
 }
+
+func TestWebVTTDanglingReferences(t *testing.T) {
+	// Items referencing regions or styles missing from the registries must not
+	// interrupt the write: the references are skipped, text and times are kept
+	var s = &astisub.Subtitles{
+		Items: []*astisub.Item{{
+			StartAt:     time.Second,
+			EndAt:       2 * time.Second,
+			InlineStyle: &astisub.StyleAttributes{},
+			Region:      &astisub.Region{ID: "ghost_region"},
+			Style:       &astisub.Style{ID: "ghost_style", InlineStyle: &astisub.StyleAttributes{WebVTTAlign: "left"}},
+			Lines:       []astisub.Line{{Items: []astisub.LineItem{{Text: "text"}}}},
+		}},
+		Regions: map[string]*astisub.Region{},
+		Styles:  map[string]*astisub.Style{},
+	}
+	w := &bytes.Buffer{}
+	err := s.WriteToWebVTT(w)
+	assert.NoError(t, err)
+	assert.NotContains(t, w.String(), "ghost_region")
+	assert.NotContains(t, w.String(), "align:left")
+	assert.Contains(t, w.String(), "00:00:01.000 --> 00:00:02.000")
+	assert.Contains(t, w.String(), "text")
+
+	// References resolving to a registered entry use the registered entry
+	s.Styles["ghost_style"] = &astisub.Style{ID: "ghost_style", InlineStyle: &astisub.StyleAttributes{WebVTTAlign: "right"}}
+	w.Reset()
+	err = s.WriteToWebVTT(w)
+	assert.NoError(t, err)
+	assert.Contains(t, w.String(), "align:right")
+}

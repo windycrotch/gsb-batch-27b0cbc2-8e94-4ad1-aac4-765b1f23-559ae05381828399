@@ -655,44 +655,48 @@ func (s Subtitles) WriteToWebVTT(o io.Writer) (err error) {
 
 		// Add styles
 		if item.InlineStyle != nil {
+			// Resolve references against the registry so that dangling ones are
+			// skipped instead of written out
+			var itemStyle = s.resolveStyle(item.Style)
+			var itemRegion = s.resolveRegion(item.Region)
 			if item.InlineStyle.WebVTTAlign != "" {
 				c = append(c, bytesSpace...)
 				c = append(c, []byte("align:"+item.InlineStyle.WebVTTAlign)...)
-			} else if item.Style != nil && item.Style.InlineStyle != nil && item.Style.InlineStyle.WebVTTAlign != "" {
+			} else if itemStyle != nil && itemStyle.InlineStyle != nil && itemStyle.InlineStyle.WebVTTAlign != "" {
 				c = append(c, bytesSpace...)
-				c = append(c, []byte("align:"+item.Style.InlineStyle.WebVTTAlign)...)
+				c = append(c, []byte("align:"+itemStyle.InlineStyle.WebVTTAlign)...)
 			}
 			if item.InlineStyle.WebVTTLine != "" {
 				c = append(c, bytesSpace...)
 				c = append(c, []byte("line:"+item.InlineStyle.WebVTTLine)...)
-			} else if item.Style != nil && item.Style.InlineStyle != nil && item.Style.InlineStyle.WebVTTLine != "" {
+			} else if itemStyle != nil && itemStyle.InlineStyle != nil && itemStyle.InlineStyle.WebVTTLine != "" {
 				c = append(c, bytesSpace...)
-				c = append(c, []byte("line:"+item.Style.InlineStyle.WebVTTLine)...)
+				c = append(c, []byte("line:"+itemStyle.InlineStyle.WebVTTLine)...)
 			}
 			if item.InlineStyle.WebVTTPosition != nil {
 				c = append(c, bytesSpace...)
 				c = append(c, []byte("position:"+item.InlineStyle.WebVTTPosition.String())...)
-			} else if item.Style != nil && item.Style.InlineStyle != nil && item.Style.InlineStyle.WebVTTPosition != nil {
+			} else if itemStyle != nil && itemStyle.InlineStyle != nil && itemStyle.InlineStyle.WebVTTPosition != nil {
 				c = append(c, bytesSpace...)
-				c = append(c, []byte("position:"+item.Style.InlineStyle.WebVTTPosition.String())...)
+				c = append(c, []byte("position:"+itemStyle.InlineStyle.WebVTTPosition.String())...)
 			}
-			if item.Region != nil {
+			if itemRegion != nil {
 				c = append(c, bytesSpace...)
-				c = append(c, []byte("region:"+item.Region.ID)...)
+				c = append(c, []byte("region:"+itemRegion.ID)...)
 			}
 			if item.InlineStyle.WebVTTSize != "" {
 				c = append(c, bytesSpace...)
 				c = append(c, []byte("size:"+item.InlineStyle.WebVTTSize)...)
-			} else if item.Style != nil && item.Style.InlineStyle != nil && item.Style.InlineStyle.WebVTTSize != "" {
+			} else if itemStyle != nil && itemStyle.InlineStyle != nil && itemStyle.InlineStyle.WebVTTSize != "" {
 				c = append(c, bytesSpace...)
-				c = append(c, []byte("size:"+item.Style.InlineStyle.WebVTTSize)...)
+				c = append(c, []byte("size:"+itemStyle.InlineStyle.WebVTTSize)...)
 			}
 			if item.InlineStyle.WebVTTVertical != "" {
 				c = append(c, bytesSpace...)
 				c = append(c, []byte("vertical:"+item.InlineStyle.WebVTTVertical)...)
-			} else if item.Style != nil && item.Style.InlineStyle != nil && item.Style.InlineStyle.WebVTTVertical != "" {
+			} else if itemStyle != nil && itemStyle.InlineStyle != nil && itemStyle.InlineStyle.WebVTTVertical != "" {
 				c = append(c, bytesSpace...)
-				c = append(c, []byte("vertical:"+item.Style.InlineStyle.WebVTTVertical)...)
+				c = append(c, []byte("vertical:"+itemStyle.InlineStyle.WebVTTVertical)...)
 			}
 		}
 

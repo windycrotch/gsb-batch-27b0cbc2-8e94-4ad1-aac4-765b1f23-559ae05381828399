@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/asticode/go-astikit"
@@ -109,6 +110,52 @@ type Subtitles struct {
 	Metadata *Metadata
 	Regions  map[string]*Region
 	Styles   map[string]*Style
+
+	// mu serializes operations that mutate the items and the region/style
+	// registries (e.g. Merge, Optimize, ApplyLinearCorrection) so they can be
+	// run concurrently on the same subtitles without data races or
+	// half-updated state. It is a pointer so that copying Subtitles by value
+	// (e.g. in the write methods) doesn't copy a lock by value.
+	mu *sync.Mutex
+}
+
+// subtitlesMutexGuard guards the lazy initialization of Subtitles.mu
+var subtitlesMutexGuard sync.Mutex
+
+// mutex lazily initializes and returns the subtitles mutex
+func (s *Subtitles) mutex() *sync.Mutex {
+	subtitlesMutexGuard.Lock()
+	defer subtitlesMutexGuard.Unlock()
+	if s.mu == nil {
+		s.mu = &sync.Mutex{}
+	}
+	return s.mu
+}
+
+// resolveRegion returns the region registered under the same ID as r, or nil
+// if r is nil or no region with this ID is registered. This allows callers to
+// drop dangling region references instead of writing them out.
+func (s *Subtitles) resolveRegion(r *Region) *Region {
+	if r == nil {
+		return nil
+	}
+	if region, ok := s.Regions[r.ID]; ok {
+		return region
+	}
+	return nil
+}
+
+// resolveStyle returns the style registered under the same ID as st, or nil
+// if st is nil or no style with this ID is registered. This allows callers to
+// drop dangling style references instead of writing them out.
+func (s *Subtitles) resolveStyle(st *Style) *Style {
+	if st == nil {
+		return nil
+	}
+	if style, ok := s.Styles[st.ID]; ok {
+		return style
+	}
+	return nil
 }
 
 // NewSubtitles creates new subtitles
@@ -991,27 +1038,79 @@ func (s Subtitles) IsEmpty() bool {
 
 // Merge merges subtitles i into subtitles
 func (s *Subtitles) Merge(i *Subtitles) {
+	mu := s.mutex()
+	mu.Lock()
+	defer mu.Unlock()
+
 	// Append items
 	s.Items = append(s.Items, i.Items...)
 	s.Order()
 
-	// Add regions
+	// Add regions. When an ID is already registered, the first registered
+	// entry is kept and incoming objects are remembered so that all
+	// references to them can be remapped to the kept entry.
+	var remappedRegions = make(map[*Region]*Region)
 	for _, region := range i.Regions {
-		if _, ok := s.Regions[region.ID]; !ok {
+		if kept, ok := s.Regions[region.ID]; ok {
+			remappedRegions[region] = kept
+		} else {
 			s.Regions[region.ID] = region
 		}
 	}
 
-	// Add styles
+	// Add styles the same way
+	var remappedStyles = make(map[*Style]*Style)
 	for _, style := range i.Styles {
-		if _, ok := s.Styles[style.ID]; !ok {
+		if kept, ok := s.Styles[style.ID]; ok {
+			remappedStyles[style] = kept
+		} else {
 			s.Styles[style.ID] = style
+		}
+	}
+
+	// Nothing to remap
+	if len(remappedRegions) == 0 && len(remappedStyles) == 0 {
+		return
+	}
+
+	// Remap item and line item references to the kept registry entries
+	for _, item := range i.Items {
+		if kept, ok := remappedRegions[item.Region]; ok {
+			item.Region = kept
+		}
+		if kept, ok := remappedStyles[item.Style]; ok {
+			item.Style = kept
+		}
+		for idxLine := range item.Lines {
+			for idxLineItem := range item.Lines[idxLine].Items {
+				if kept, ok := remappedStyles[item.Lines[idxLine].Items[idxLineItem].Style]; ok {
+					item.Lines[idxLine].Items[idxLineItem].Style = kept
+				}
+			}
+		}
+	}
+
+	// Remap the styles referenced by the incoming regions
+	for _, region := range i.Regions {
+		if kept, ok := remappedStyles[region.Style]; ok {
+			region.Style = kept
+		}
+	}
+
+	// Remap the parent styles referenced by the incoming styles
+	for _, style := range i.Styles {
+		if kept, ok := remappedStyles[style.Style]; ok {
+			style.Style = kept
 		}
 	}
 }
 
 // Optimize optimizes subtitles
 func (s *Subtitles) Optimize() {
+	mu := s.mutex()
+	mu.Lock()
+	defer mu.Unlock()
+
 	// Nothing to optimize
 	if len(s.Items) == 0 {
 		return
@@ -1048,13 +1147,29 @@ func (s *Subtitles) removeUnusedRegionsAndStyles() {
 		}
 	}
 
+	// A region that is used keeps the style it references alive
+	for _, region := range s.Regions {
+		if _, ok := usedRegions[region.ID]; ok && region.Style != nil {
+			usedStyles[region.Style.ID] = true
+		}
+	}
+
+	// A style that is used keeps its parent styles alive, transitively
+	for changed := true; changed; {
+		changed = false
+		for _, style := range s.Styles {
+			if _, ok := usedStyles[style.ID]; ok && style.Style != nil {
+				if _, ok = usedStyles[style.Style.ID]; !ok {
+					usedStyles[style.Style.ID] = true
+					changed = true
+				}
+			}
+		}
+	}
+
 	// Loop through regions
 	for id, region := range s.Regions {
-		if _, ok := usedRegions[region.ID]; ok {
-			if region.Style != nil {
-				usedStyles[region.Style.ID] = true
-			}
-		} else {
+		if _, ok := usedRegions[region.ID]; !ok {
 			delete(s.Regions, id)
 		}
 	}
@@ -1127,6 +1242,10 @@ func (s *Subtitles) Unfragment() {
 
 // ApplyLinearCorrection applies linear correction
 func (s *Subtitles) ApplyLinearCorrection(actual1, desired1, actual2, desired2 time.Duration) {
+	mu := s.mutex()
+	mu.Lock()
+	defer mu.Unlock()
+
 	// Get parameters
 	a := float64(desired2-desired1) / float64(actual2-actual1)
 	b := time.Duration(float64(desired1) - a*float64(actual1))
@@ -1135,6 +1254,19 @@ func (s *Subtitles) ApplyLinearCorrection(actual1, desired1, actual2, desired2 t
 	for idx := range s.Items {
 		s.Items[idx].EndAt = time.Duration(a*float64(s.Items[idx].EndAt)) + b
 		s.Items[idx].StartAt = time.Duration(a*float64(s.Items[idx].StartAt)) + b
+
+		// Fix inverted time boundaries
+		if s.Items[idx].EndAt < s.Items[idx].StartAt {
+			s.Items[idx].StartAt, s.Items[idx].EndAt = s.Items[idx].EndAt, s.Items[idx].StartAt
+		}
+
+		// Fix negative time boundaries
+		if s.Items[idx].StartAt < 0 {
+			s.Items[idx].StartAt = time.Duration(0)
+		}
+		if s.Items[idx].EndAt < s.Items[idx].StartAt {
+			s.Items[idx].EndAt = s.Items[idx].StartAt
+		}
 	}
 }
 
