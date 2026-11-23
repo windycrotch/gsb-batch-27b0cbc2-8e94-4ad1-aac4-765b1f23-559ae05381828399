@@ -11,8 +11,6 @@ import (
 	"strings"
 	"unicode"
 	"unicode/utf8"
-
-	"golang.org/x/sys/unix"
 )
 
 const MaxBytes = 2 << 20
@@ -37,11 +35,10 @@ func Kind(path string) string {
 // OpenRegular uses nonblocking open before checking the descriptor, so a FIFO
 // or a symlink swapped between listing and reading cannot hang the preview.
 func OpenRegular(path string) (*os.File, error) {
-	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	f, err := openNonblocking(path)
 	if err != nil {
 		return nil, fmt.Errorf("open file: %w", err)
 	}
-	f := os.NewFile(uintptr(fd), path)
 	st, err := f.Stat()
 	if err != nil {
 		f.Close()

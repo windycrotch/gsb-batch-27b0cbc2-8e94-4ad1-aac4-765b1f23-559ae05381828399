@@ -9,8 +9,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	"golang.org/x/sys/unix"
 )
 
 // ProbeInput preserves the terminal file interface and removes only replies to
@@ -55,9 +53,7 @@ func (p *ProbeInput) Read(dst []byte) (int, error) {
 	// 20 ms, and unrelated input is never discarded.
 	deadline := time.Now().Add(100 * time.Millisecond)
 	for incompleteAPC(data) && len(data) < len(dst) && time.Now().Before(deadline) {
-		fds := []unix.PollFd{{Fd: int32(p.Fd()), Events: unix.POLLIN}}
-		ready, pollErr := unix.Poll(fds, 20)
-		if pollErr != nil || ready == 0 || fds[0].Revents&unix.POLLIN == 0 {
+		if !waitReadable(p.File, 20*time.Millisecond) {
 			break
 		}
 		extra := make([]byte, len(dst)-len(data))

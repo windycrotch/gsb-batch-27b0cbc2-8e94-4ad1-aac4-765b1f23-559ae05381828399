@@ -20,6 +20,11 @@ type nativeMsg struct {
 	png []byte
 	err error
 }
+
+// Frame decoders are indirected so tests can substitute in-memory streams.
+var decodeFramesAtFPS = media.FramesAtFPS
+var decodeNativeFramesAtFPS = media.NativeFramesAtFPS
+
 type tickMsg time.Time
 type listMsg struct {
 	id      int
@@ -261,10 +266,10 @@ func (m *Model) startFrames(info media.Info, start float64, active bool) tea.Cmd
 		return func() tea.Msg { png, err := media.PreviewPNG(ctx, path); return nativeMsg{id, png, err} }
 	}
 	if m.graphics != nil {
-		m.frames = media.NativeFramesAtFPS(ctx, info.Path, start, float64(m.videoFPS()))
+		m.frames = decodeNativeFramesAtFPS(ctx, info.Path, start, float64(m.videoFPS()))
 	} else {
 		w, h := m.dimensions()
-		m.frames = media.FramesAtFPS(ctx, info.Path, w, h, start, !active || info.Kind == media.Image || info.Kind == media.Audio, float64(m.videoFPS()))
+		m.frames = decodeFramesAtFPS(ctx, info.Path, w, h, start, !active || info.Kind == media.Image || info.Kind == media.Audio, float64(m.videoFPS()))
 	}
 	return m.nextFrame()
 }
@@ -311,6 +316,7 @@ func (m *Model) loadState(index int, desired string) tea.Cmd {
 		m.pending = nil
 		m.rows = nil
 		m.nativePNG = nil
+		m.previewError = ""
 		m.previewID++
 	}
 	m.clearSpectrum()

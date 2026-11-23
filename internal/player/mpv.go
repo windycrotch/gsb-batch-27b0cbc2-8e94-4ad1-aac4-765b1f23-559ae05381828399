@@ -222,7 +222,17 @@ func (p *Player) Pause(ctx context.Context, pause bool) error {
 	return p.Command(ctx, "set_property", "pause", pause)
 }
 func (p *Player) Seek(ctx context.Context, pos float64) error {
-	return p.Command(ctx, "seek", pos, "absolute+exact")
+	if err := p.Command(ctx, "seek", pos, "absolute+exact"); err != nil {
+		return err
+	}
+	// The seek reply means mpv accepted the target. Publish it before the next
+	// property push arrives so Snapshot never reports the pre-seek position;
+	// consumers would otherwise drop or hold frames from the fresh decoder.
+	p.mu.Lock()
+	p.state.Position = pos
+	p.state.Ended = false
+	p.mu.Unlock()
+	return nil
 }
 func (p *Player) Close() {
 	p.close.Do(func() { p.cancel(); _ = p.conn.Close(); <-p.exited; <-p.done; _ = os.RemoveAll(p.dir) })

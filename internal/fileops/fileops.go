@@ -27,6 +27,7 @@ func Capture(path string) (Target, error) {
 	if err != nil {
 		return Target{}, fmt.Errorf("inspect target: %w", err)
 	}
+	pinFileIdentity(info)
 	return Target{absolute, info}, nil
 }
 func (t Target) validate(ctx context.Context) error {
