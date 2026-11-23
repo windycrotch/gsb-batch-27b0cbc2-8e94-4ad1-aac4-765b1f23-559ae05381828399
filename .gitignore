@@ -1,0 +1,73 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary
+*.test
+
+# Output of go coverage
+*.out
+*.prof
+
+# Go workspace
+go.work
+go.work.sum
+
+# Dependency directories
+vendor/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Build output
+/bin/
+/dist/
+/resample-wav
+/test-reference/test_quality
+/test-reference/test_soxr_reference
+/test-reference/test_antialiasing
+/test-reference/bench_soxr
+
+# Debug files
+*.log
+
+# Planning, design, and spec docs belong in the issue tracker, not in this public
+# repo. Keep them local or in the tracker; never commit them here.
+PLAN.md
+*_PLAN.md
+*-plan.md
+SPEC.md
+*-spec.md
+*-design.md
+docs/plans/
+docs/specs/
+docs/design/
+docs/research/
+docs/superpowers/
+
+# Claude settings
+.claude/
+
+# Task runner
+.task/
+
+# Benchmark results (keep in separate branch or release notes)
+benchmark_results*.txt
+*_benchmark*.txt
+REFACTOR_CHANGELOG.md
+
+# LEANN index
+.leann/
+
+# Serena project cache
+.serena/

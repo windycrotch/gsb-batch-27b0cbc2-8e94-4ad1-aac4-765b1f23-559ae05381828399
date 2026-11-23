@@ -1,0 +1,721 @@
+// SPDX-FileCopyrightText: 2025 Tomi P. Hakala
+// SPDX-License-Identifier: LGPL-2.1-or-later
+
+package engine
+
+import (
+	"fmt"
+	"math"
+
+	"github.com/tphakala/go-audio-resampler/internal/filter"
+	"github.com/tphakala/go-audio-resampler/internal/simdops"
+)
+
+// =============================================================================
+// DFT Stage - Simple FIR-based upsampling and anti-alias pre-stage
+// =============================================================================
+
+// DFTStage implements integer-ratio upsampling using FIR filtering.
+// Uses polyphase decomposition to avoid multiplying zeros. The lowpass is the
+// anti-imaging filter ([NewDFTStage]) or, as the pre-stage of a non-integer
+// downsampling chain, the anti-alias filter at the target Nyquist
+// ([NewDFTAntiAliasStage]).
+//
+// Type parameter F controls the precision of sample processing.
+type DFTStage[F simdops.Float] struct {
+	factor int // Upsampling factor (e.g., 2)
+
+	// Polyphase filter bank - coeffs[phase][tap] in reversed order
+	// Reversed order enables direct use with ConvolveValid
+	polyCoeffs   [][]F
+	tapsPerPhase int
+
+	// Half-band optimization: For 2× upsampling, Phase 0 is often a pure
+	// passthrough (single coefficient ≈ 1.0 at center). This skips ~50% of work.
+	isHalfBand      bool // True if Phase 0 is a passthrough
+	phase0TapOffset int  // Offset of non-zero tap in Phase 0 (for passthrough)
+	phase0TapScale  F    // Scale factor for the passthrough tap
+
+	// Input history buffer (non-upsampled)
+	history []F
+
+	// Pre-allocated output buffer for reduced allocations
+	outputBuf []F
+
+	// Temporary buffers for ConvolveValid per-phase output
+	phaseBufs [][]F
+
+	// SIMD operations for type F
+	ops *simdops.Ops[F]
+
+	// Time alignment. The prototype has odd length N, so its group delay
+	// groupDelay = (N-1)/2 is a whole number of output samples. Output sample
+	// j is aligned with input time j/factor when the delay line starts with
+	// prefill zeros (whole input samples of the delay) and the first skip raw
+	// outputs (the remainder, groupDelay mod factor) are dropped. Without
+	// this the first output would come from a window of real input only and
+	// the whole stream would run groupDelay samples early.
+	groupDelay int // (N-1)/2, in output samples
+	prefill    int // zeros placed in history at construction and Reset
+	skip       int // raw outputs dropped at stream start
+	skipLeft   int // part of skip not yet dropped
+	// fed is set by the first non-empty Process and cleared by Reset. Flush
+	// uses it instead of len(history), which a prefilled history never makes
+	// zero.
+	fed bool
+}
+
+// NewDFTStage creates a DFT upsampling stage with an anti-imaging lowpass at
+// the input Nyquist.
+func NewDFTStage[F simdops.Float](factor int, quality Quality) (*DFTStage[F], error) {
+	if factor < 1 {
+		return nil, fmt.Errorf("upsampling factor must be >= 1: %d", factor)
+	}
+
+	ops := simdops.For[F]()
+
+	if factor == 1 {
+		// No upsampling needed, pass-through
+		return &DFTStage[F]{factor: 1, ops: ops}, nil
+	}
+
+	// Design lowpass filter for upsampling (always in float64 for precision)
+	// For L× upsampling, we want to pass the original signal (0 to original Nyquist)
+	// and block images that appear above the original Nyquist.
+	//
+	// In normalized frequency (0.5 = output Nyquist):
+	// - Original Nyquist = 0.5/L of output Nyquist
+	// - For L=2: original content occupies 0 to 0.25 of output Nyquist
+	//
+	// soxr uses Fc=0.4778321 for the DFT stage with L=2, which in their
+	// normalization (1.0 = Nyquist) means cutoff at 0.4778 of Nyquist.
+	// In our normalization (0.5 = Nyquist), that's 0.4778 * 0.5 = 0.2389.
+	//
+	// For factor=2: cutoff = 0.4778 / 2 = 0.2389 (pass up to 0.2389 of sample rate)
+	cutoff := soxrDFTStageFc / float64(factor) // soxr's Fc scaled for our normalization
+	transitionBW := transitionBWFactor / float64(factor)
+	attenuation := qualityToAttenuation(quality)
+
+	coeffs, err := filter.DesignLowPassFilterAuto(cutoff, transitionBW, attenuation, 1.0)
+	if err != nil {
+		return nil, fmt.Errorf("failed to design DFT filter: %w", err)
+	}
+
+	return newDFTStageFromCoeffs(factor, coeffs, ops), nil
+}
+
+// minAntiAliasFactor is the smallest upsampling factor of an anti-alias
+// pre-stage; factor 1 would be a plain decimation stage.
+const minAntiAliasFactor = 2
+
+// NewDFTAntiAliasStage creates a 2x (or Lx) DFT stage whose lowpass is an
+// anti-alias filter for downsampling instead of an anti-imaging filter. fn is
+// soxr's Fn1 for the pre-stage: the stage output Nyquist divided by the
+// target Nyquist, which is factor * inputRate / outputRate for a chain that
+// upsamples by factor and then reduces the rate to outputRate. This is the
+// pre-stage design of libsoxr cr.c:383-387 (Fn1 = arbM / arbL, Fp1 /= Fn1,
+// Fs1 /= Fn1) for the layout this port always uses, a factor-2 pre-stage
+// followed by an arbitrary-ratio polyphase stage that only rejects images.
+//
+// The lowpass uses the same recipe as [NewDFTDecimationStage]
+// ([designDecimationLowpass]), so the passband edge matches the integer
+// decimation path and the stopband meets the quality's attenuation. The
+// half-band fast path of [newDFTStageFromCoeffs] does not engage because this
+// filter is not half-band (the detection returns false on its own).
+func NewDFTAntiAliasStage[F simdops.Float](factor int, fn float64, quality Quality) (*DFTStage[F], error) {
+	if factor < minAntiAliasFactor {
+		return nil, fmt.Errorf("anti-alias stage factor must be >= 2: %d", factor)
+	}
+	if !(fn > float64(factor)) {
+		return nil, fmt.Errorf("anti-alias stage fn must exceed the factor %d: %g", factor, fn)
+	}
+	coeffs, err := designDecimationLowpass(fn, quality)
+	if err != nil {
+		return nil, fmt.Errorf("failed to design anti-alias filter: %w", err)
+	}
+	return newDFTStageFromCoeffs(factor, coeffs, simdops.For[F]()), nil
+}
+
+// newDFTStageFromCoeffs builds a factor-times polyphase upsampling stage
+// around the lowpass prototype coeffs (odd length, unity DC gain before the
+// factor scaling applied here).
+func newDFTStageFromCoeffs[F simdops.Float](factor int, coeffs []float64, ops *simdops.Ops[F]) *DFTStage[F] {
+	// Decompose into polyphase filter bank
+	// coeffs[phase][tap] = prototype[tap * factor + phase]
+	// This avoids multiplying by zeros after zero-insertion
+	// Coefficients stored in REVERSED order for ConvolveValid
+	tapsPerPhase := (len(coeffs) + factor - 1) / factor
+
+	// Convert coefficients to target precision F
+	polyCoeffs := make([][]F, factor)
+	for phase := range factor {
+		polyCoeffs[phase] = make([]F, tapsPerPhase)
+		for tap := range tapsPerPhase {
+			protoIdx := tap*factor + phase
+			if protoIdx < len(coeffs) {
+				// Scale by factor and store reversed
+				polyCoeffs[phase][tapsPerPhase-1-tap] = F(coeffs[protoIdx] * float64(factor))
+			}
+		}
+	}
+
+	// Pre-allocate phase buffers for ConvolveValid
+	phaseBufs := make([][]F, factor)
+
+	// Detect half-band structure for 2× upsampling
+	// In a half-band filter, Phase 0 has only one significant coefficient (center tap ≈ 1.0)
+	isHalfBand := false
+	phase0TapOffset := 0
+	var phase0TapScale F = 1.0
+
+	if factor == halfBandFactor {
+		// Check if Phase 0 is essentially a passthrough
+		const halfBandThreshold = 1e-8
+		significantTaps := 0
+		significantIdx := 0
+		var significantVal F
+
+		for i, c := range polyCoeffs[0] {
+			if math.Abs(float64(c)) > halfBandThreshold {
+				significantTaps++
+				significantIdx = i
+				significantVal = c
+			}
+		}
+
+		// If only one significant tap and it's close to 1.0, this is half-band
+		if significantTaps == 1 && math.Abs(float64(significantVal)-1.0) < 0.01 {
+			isHalfBand = true
+			phase0TapOffset = significantIdx
+			phase0TapScale = significantVal
+		}
+	}
+
+	// The first output window covers tapsPerPhase inputs, so a window that
+	// has seen only prefill zeros plus the first real sample is centred
+	// gd/factor inputs back; prefill makes up the rest of the window.
+	gd := groupDelaySamples(len(coeffs))
+	prefill := tapsPerPhase - 1 - gd/factor
+	st := &DFTStage[F]{
+		factor:          factor,
+		polyCoeffs:      polyCoeffs,
+		tapsPerPhase:    tapsPerPhase,
+		isHalfBand:      isHalfBand,
+		phase0TapOffset: phase0TapOffset,
+		phase0TapScale:  phase0TapScale,
+		history:         make([]F, 0, tapsPerPhase*historyBufferMultiplier),
+		phaseBufs:       phaseBufs,
+		ops:             ops,
+		groupDelay:      gd,
+		prefill:         prefill,
+		skip:            gd % factor,
+	}
+	st.Reset()
+	return st
+}
+
+// processZeroCopy upsamples the input using polyphase FIR filtering.
+// It uses polyphase decomposition to avoid multiplying by zeros.
+// For large inputs it processes in L2-sized chunks for cache efficiency.
+// The returned slice
+// aliases s.outputBuf and is only valid until the next call to processZeroCopy,
+// Process, or Flush. Pipeline-internal callers that consume the output
+// immediately (e.g. writing it into the next stage's buffer) should use this
+// to avoid a defensive copy.
+func (s *DFTStage[F]) processZeroCopy(input []F) ([]F, error) { //nolint:unparam // error kept for symmetry with Process
+	if s.factor == 1 {
+		// Pass-through
+		return input, nil
+	}
+
+	if len(input) == 0 {
+		return []F{}, nil
+	}
+	s.fed = true
+
+	// Append input to history (no zero-insertion needed!).
+	// appendStable grows with headroom so steady-state streaming does not
+	// reallocate when the run length jitters by a sample between calls.
+	s.history = appendStable(s.history, input)
+
+	numAvailable := len(s.history)
+	if numAvailable < s.tapsPerPhase {
+		return []F{}, nil
+	}
+
+	// Number of input samples we can fully process
+	numInputProcessable := numAvailable - s.tapsPerPhase + 1
+	// Each input sample produces 'factor' output samples
+	numOutput := numInputProcessable * s.factor
+
+	// Reuse output buffer to reduce allocations. growStableLen adds headroom
+	// when it must grow so that numOutput jitter between calls does not
+	// reallocate in the steady state.
+	s.outputBuf = growStableLen(s.outputBuf, numOutput)
+
+	factor := s.factor
+	history := s.history
+	output := s.outputBuf
+	tapsPerPhase := s.tapsPerPhase
+
+	// For small inputs, use simple non-chunked path (less overhead)
+	if numInputProcessable <= l2CacheChunkSize {
+		s.processChunk(history, output, numInputProcessable, factor, tapsPerPhase)
+	} else {
+		// Large input: process in L2-cache-friendly chunks
+		// This keeps working set in L2 cache for better performance
+		s.processChunked(history, output, numInputProcessable, factor, tapsPerPhase)
+	}
+
+	// Shift history - keep only unprocessed samples
+	if numInputProcessable > 0 {
+		copy(s.history, s.history[numInputProcessable:])
+		s.history = s.history[:numAvailable-numInputProcessable]
+	}
+
+	if s.skipLeft > 0 {
+		d := min(s.skipLeft, numOutput)
+		s.skipLeft -= d
+		return s.outputBuf[d:numOutput], nil
+	}
+	return s.outputBuf[:numOutput], nil
+}
+
+// Process resamples input through the DFT upsampling stage. The returned
+// slice is owned by the caller and remains valid across subsequent calls.
+func (s *DFTStage[F]) Process(input []F) ([]F, error) {
+	output, err := s.processZeroCopy(input)
+	if err != nil || len(output) == 0 {
+		return output, err
+	}
+	// processZeroCopy may return a slice that aliases the input (at factor==1,
+	// a passthrough) or the internal s.outputBuf; Process guarantees owned
+	// memory that stays valid across subsequent Process/Flush calls, so copy
+	// unconditionally.
+	result := make([]F, len(output))
+	copy(result, output)
+	return result, nil
+}
+
+// processChunk processes a single chunk of input data.
+// This is the simple path for small inputs.
+// Optimized with half-band detection, ConvolveValidMulti and Interleave2.
+func (s *DFTStage[F]) processChunk(history, output []F, numInputProcessable, factor, tapsPerPhase int) {
+	// Ensure phase buffers are large enough. growStableLen adds growth slack
+	// when it must reallocate, matching the buffer policy used elsewhere in
+	// this file so one-sample chunk jitter does not trigger repeated reallocs.
+	for phase := range factor {
+		s.phaseBufs[phase] = growStableLen(s.phaseBufs[phase], numInputProcessable)
+	}
+
+	historySlice := history[:numInputProcessable+tapsPerPhase-1]
+
+	// Half-band optimization: Phase 0 is a passthrough (single tap ≈ 1.0)
+	// Skip convolution for Phase 0, just copy with offset - saves ~50% compute
+	if s.isHalfBand && factor == halfBandFactor {
+		// Phase 0: direct copy from history (passthrough)
+		offset := s.phase0TapOffset
+		scale := s.phase0TapScale
+		phase0Buf := s.phaseBufs[0]
+		for i := range numInputProcessable {
+			phase0Buf[i] = historySlice[i+offset] * scale
+		}
+
+		// Phase 1: still needs convolution
+		s.ops.ConvolveValid(s.phaseBufs[1], historySlice, s.polyCoeffs[1])
+
+		// Interleave using SIMD
+		s.ops.Interleave2(output, s.phaseBufs[0], s.phaseBufs[1])
+	} else {
+		// Standard path: ConvolveValidMulti for all phases
+		s.ops.ConvolveValidMulti(s.phaseBufs, historySlice, s.polyCoeffs)
+
+		// Interleave phase outputs
+		if factor == halfBandFactor {
+			s.ops.Interleave2(output, s.phaseBufs[0], s.phaseBufs[1])
+		} else {
+			for i := range numInputProcessable {
+				outBase := i * factor
+				for phase := range factor {
+					output[outBase+phase] = s.phaseBufs[phase][i]
+				}
+			}
+		}
+	}
+}
+
+// processChunked processes input in L2-cache-friendly chunks.
+// For large inputs, this provides better cache utilization than processing all at once.
+// Optimized with half-band detection, ConvolveValidMulti and Interleave2.
+func (s *DFTStage[F]) processChunked(history, output []F, numInputProcessable, factor, tapsPerPhase int) {
+	chunkSize := l2CacheChunkSize
+
+	// Ensure phase buffers are large enough for chunk processing
+	for phase := range factor {
+		if cap(s.phaseBufs[phase]) < chunkSize {
+			s.phaseBufs[phase] = make([]F, chunkSize)
+		}
+	}
+
+	// Cache half-band parameters for the loop
+	isHalfBand := s.isHalfBand && factor == halfBandFactor
+	offset := s.phase0TapOffset
+	scale := s.phase0TapScale
+
+	// Process in chunks
+	for chunkStart := 0; chunkStart < numInputProcessable; chunkStart += chunkSize {
+		chunkEnd := min(chunkStart+chunkSize, numInputProcessable)
+		chunkLen := chunkEnd - chunkStart
+
+		// Slice of history for this chunk (includes tapsPerPhase-1 extra for convolution)
+		historySlice := history[chunkStart : chunkEnd+tapsPerPhase-1]
+
+		// Resize phase buffers for this chunk
+		for phase := range factor {
+			s.phaseBufs[phase] = s.phaseBufs[phase][:chunkLen]
+		}
+
+		// Half-band optimization: Phase 0 passthrough saves ~50% compute
+		if isHalfBand {
+			// Phase 0: direct copy from history (passthrough)
+			phase0Buf := s.phaseBufs[0]
+			for i := range chunkLen {
+				phase0Buf[i] = historySlice[i+offset] * scale
+			}
+
+			// Phase 1: still needs convolution
+			s.ops.ConvolveValid(s.phaseBufs[1], historySlice, s.polyCoeffs[1])
+
+			// Interleave using SIMD
+			outOffset := chunkStart * halfBandFactor
+			s.ops.Interleave2(output[outOffset:outOffset+chunkLen*halfBandFactor], s.phaseBufs[0], s.phaseBufs[1])
+		} else {
+			// Standard path: ConvolveValidMulti for all phases
+			s.ops.ConvolveValidMulti(s.phaseBufs, historySlice, s.polyCoeffs)
+
+			// Interleave results directly into output
+			outOffset := chunkStart * factor
+			if factor == halfBandFactor {
+				s.ops.Interleave2(output[outOffset:outOffset+chunkLen*halfBandFactor], s.phaseBufs[0], s.phaseBufs[1])
+			} else {
+				for i := range chunkLen {
+					outBase := outOffset + i*factor
+					for phase := range factor {
+						output[outBase+phase] = s.phaseBufs[phase][i]
+					}
+				}
+			}
+		}
+	}
+}
+
+// Flush returns any remaining buffered samples.
+//
+// A stage that was never fed has nothing to drain: padding zeros through a
+// stage with no real input would emit a phantom window of zeros. The guard is
+// the fed flag, not len(history), because the history starts prefilled.
+func (s *DFTStage[F]) Flush() ([]F, error) {
+	if s.factor == 1 || !s.fed {
+		return []F{}, nil
+	}
+
+	// The stream owes factor outputs per real input sample, in total: the
+	// samples still pending in history, plus the raw outputs the start-up
+	// skip has dropped so far. Padding T-prefill zeros makes every real
+	// sample the centre of a complete window; the pad also yields up to
+	// factor-1 surplus outputs (skip < factor), which are truncated so the
+	// total length is exactly factor times the input length.
+	owed := (len(s.history)-s.prefill)*s.factor + s.skip - s.skipLeft
+	zeros := make([]F, s.tapsPerPhase-s.prefill)
+	out, err := s.Process(zeros)
+	if err == nil && len(out) > owed {
+		out = out[:owed]
+	}
+	// Flush is terminal: after draining, return the stage to its fresh state.
+	// Otherwise the padding zeros stay in the delay line, so a second Flush
+	// would emit more windows and a post-flush Process would convolve new
+	// audio against leftover zeros instead of starting a clean stream.
+	// Reset() is the authoritative fresh-state definition (it re-establishes
+	// the prefill); calling it keeps Flush aligned with it automatically.
+	s.Reset()
+	return out, err
+}
+
+// Reset returns the stage to its just-constructed state: history holds the
+// alignment prefill and the start-up skip is pending again.
+func (s *DFTStage[F]) Reset() {
+	s.history = s.history[:s.prefill]
+	clear(s.history)
+	s.skipLeft = s.skip
+	s.fed = false
+}
+
+// =============================================================================
+// DFT Decimation Stage - soxr-style integer ratio downsampling
+// =============================================================================
+
+// DFTDecimationStage implements integer-ratio downsampling using FIR filtering
+// followed by decimation. This matches soxr's approach for integer downsample
+// ratios like 96kHz→48kHz (2:1) or 192kHz→48kHz (4:1).
+//
+// The key insight from soxr is that for integer ratio downsampling:
+// - Use Fn = decimation_factor to normalize filter frequencies
+// - Filter cutoff is at output Nyquist (not input Nyquist)
+// - This achieves 150+ dB anti-aliasing attenuation
+//
+// Type parameter F controls the precision of sample processing.
+type DFTDecimationStage[F simdops.Float] struct {
+	factor int // Decimation factor (e.g., 2 for 96→48)
+
+	// FIR filter coefficients (stored in reversed order for convolution)
+	coeffs  []F
+	numTaps int
+
+	// Input history buffer
+	history []F
+
+	// Decimation state - which input sample to output next
+	decimPhase int
+
+	// Pre-allocated output buffer
+	outputBuf []F
+
+	// SIMD operations for type F
+	ops *simdops.Ops[F]
+
+	// Time alignment. numTaps is odd, so the group delay (numTaps-1)/2 is a
+	// whole number of input samples. Starting the delay line with that many
+	// zeros makes output o the filter response centred on input sample
+	// o*factor, instead of letting the stream run that far early.
+	prefill int
+	// fed is set by the first non-empty Process and cleared by Reset; Flush
+	// uses it because the prefilled history is never empty.
+	fed bool
+}
+
+// designDecimationLowpass designs the lowpass used by the decimation recipe
+// (always in float64 for precision). fn is soxr's Fn: the factor by which the
+// stage's input Nyquist is divided to place the stopband at the output
+// Nyquist. The result is the prototype in forward order.
+//
+// soxr filter design for decimation (from SOXR_FILTER_ANALYSIS.md):
+//
+//	Fn = max(preL, preM) = factor (for pure decimation, preL=1, preM=factor)
+//	Fp = quality passband end (relative to input Nyquist before normalization)
+//	Fs = 1.0 (stopband at output Nyquist, relative to input Nyquist)
+//
+// After normalization by Fn:
+//
+//	Fp_norm = Fp / Fn
+//	Fs_norm = 1.0 / Fn
+//
+// In our filter design convention (0.5 = Nyquist of the current rate):
+// cutoff = (Fs_norm - trBW) * 0.5, so for Fn=2 the cutoff sits just below
+// 50% of the INPUT Nyquist, which is the OUTPUT Nyquist.
+func designDecimationLowpass(fn float64, quality Quality) ([]float64, error) {
+	// soxrFp: Passband end (relative to input Nyquist = 1.0)
+	// soxrFs: Stopband start (at input Nyquist = output Nyquist after decimation)
+	soxrFp := qualityToPassbandEnd(quality)
+	soxrFs := 1.0
+
+	// Normalize by Fn
+	FpNorm := soxrFp / fn
+	FsNorm := soxrFs / fn
+
+	// Transition bandwidth
+	trBW := transitionBandwidthHalf * (FsNorm - FpNorm)
+
+	// Cutoff frequency (in our normalization where 0.5 = Nyquist)
+	// soxr: Fc = Fs_norm - tr_bw
+	Fc := FsNorm - trBW
+
+	// Convert to our filter design convention (0.5 = Nyquist)
+	cutoff := Fc * nyquistFraction // Scale to 0-0.5 range
+
+	attenuation := qualityToAttenuation(quality)
+
+	// Use auto filter design with transition bandwidth scaled to our convention
+	transitionBW := trBW * nyquistFraction // Scale to 0-0.5 range
+	coeffs, err := filter.DesignLowPassFilterAuto(cutoff, transitionBW, attenuation, 1.0)
+	if err != nil {
+		return nil, fmt.Errorf("failed to design decimation filter: %w", err)
+	}
+	return coeffs, nil
+}
+
+// NewDFTDecimationStage creates a DFT decimation stage for integer ratio downsampling.
+//
+// This implements soxr's approach for integer downsampling ratios:
+//   - Design filter with Fn = factor (normalization to output Nyquist)
+//   - Fp = 0.913 (passband at 91.3% of output Nyquist)
+//   - Fs = 1.0 (stopband starts at output Nyquist)
+//   - After filtering, decimate by taking every 'factor'-th sample
+//
+// For 96kHz→48kHz (factor=2):
+//   - Filter cutoff at ~22 kHz (just below output Nyquist of 24 kHz)
+//   - Achieves 150+ dB anti-aliasing attenuation
+func NewDFTDecimationStage[F simdops.Float](factor int, quality Quality) (*DFTDecimationStage[F], error) {
+	if factor < 1 {
+		return nil, fmt.Errorf("decimation factor must be >= 1: %d", factor)
+	}
+
+	ops := simdops.For[F]()
+
+	if factor == 1 {
+		// No decimation needed, pass-through
+		return &DFTDecimationStage[F]{factor: 1, ops: ops}, nil
+	}
+
+	coeffs, err := designDecimationLowpass(float64(factor), quality)
+	if err != nil {
+		return nil, err
+	}
+
+	// Convert coefficients to target precision F and reverse for convolution
+	numTaps := len(coeffs)
+	reversedCoeffs := make([]F, numTaps)
+	for i, c := range coeffs {
+		reversedCoeffs[numTaps-1-i] = F(c)
+	}
+
+	st := &DFTDecimationStage[F]{
+		factor:     factor,
+		coeffs:     reversedCoeffs,
+		numTaps:    numTaps,
+		history:    make([]F, 0, numTaps*historyBufferMultiplier),
+		decimPhase: 0,
+		ops:        ops,
+		prefill:    groupDelaySamples(numTaps),
+	}
+	st.Reset()
+	return st, nil
+}
+
+// Process filters and decimates the input samples.
+//
+// The algorithm:
+// 1. Append input to history buffer
+// 2. For each position where we have enough samples:
+//   - Compute filtered output using FIR convolution
+//   - If this position aligns with decimation phase, output the sample
+//
+// 3. Advance decimation phase
+// processZeroCopy is the allocation-free internal path. The returned slice
+// aliases s.outputBuf and is only valid until the next call.
+func (s *DFTDecimationStage[F]) processZeroCopy(input []F) ([]F, error) { //nolint:unparam // error kept for symmetry with Process
+	if s.factor == 1 {
+		// Pass-through
+		return input, nil
+	}
+
+	if len(input) == 0 {
+		return []F{}, nil
+	}
+	s.fed = true
+
+	// Append input to history (stable growth avoids steady-state realloc on input jitter)
+	s.history = appendStable(s.history, input)
+
+	numAvailable := len(s.history)
+	if numAvailable < s.numTaps {
+		return []F{}, nil
+	}
+
+	// Number of input positions we can compute filtered output for
+	numFilterable := numAvailable - s.numTaps + 1
+
+	// Calculate how many decimated outputs we'll produce
+	// Starting from decimPhase, we output every 'factor'-th filtered sample
+	numOutput := 0
+	for i := s.decimPhase; i < numFilterable; i += s.factor {
+		numOutput++
+	}
+
+	if numOutput == 0 {
+		return []F{}, nil
+	}
+
+	// Allocate output buffer (stable growth avoids steady-state realloc on jitter)
+	s.outputBuf = growStableLen(s.outputBuf, numOutput)
+
+	// Filter and decimate
+	outIdx := 0
+	for pos := s.decimPhase; pos < numFilterable && outIdx < numOutput; pos += s.factor {
+		// Compute FIR filter output at this position
+		// Coefficients are reversed, so we can use direct dot product
+		var sum F
+		histSlice := s.history[pos : pos+s.numTaps]
+		// Use SIMD dot product (always available)
+		sum = s.ops.DotProductUnsafe(histSlice, s.coeffs)
+		s.outputBuf[outIdx] = sum
+		outIdx++
+	}
+
+	// Update decimation phase for next call
+	// The phase represents the offset into the decimation cycle. After consuming
+	// numFilterable samples, the buffer shifts and the new phase becomes
+	// (oldPhase - consumed) mod factor. We use (x%f+f)%f to handle Go's
+	// negative modulo behavior (Go returns negative for negative dividend).
+	s.decimPhase = ((s.decimPhase-numFilterable)%s.factor + s.factor) % s.factor
+
+	consumed := numFilterable
+	// Shift history - keep only what we need for next call
+	if consumed > 0 {
+		remaining := len(s.history) - consumed
+		if remaining > 0 {
+			copy(s.history[:remaining], s.history[consumed:])
+		}
+		s.history = s.history[:remaining]
+	}
+
+	return s.outputBuf[:outIdx], nil
+}
+
+// Process resamples input through the DFT decimation stage. The returned
+// slice is owned by the caller and remains valid across subsequent calls.
+func (s *DFTDecimationStage[F]) Process(input []F) ([]F, error) {
+	output, err := s.processZeroCopy(input)
+	if err != nil || len(output) == 0 {
+		return output, err
+	}
+	// processZeroCopy may return a slice that aliases the input (at factor==1,
+	// a passthrough) or the internal s.outputBuf; Process guarantees owned
+	// memory that stays valid across subsequent Process/Flush calls, so copy
+	// unconditionally. Returning s.outputBuf directly caused the
+	// TestResampler_BufferIntegrity failures for 96 to 48.
+	result := make([]F, len(output))
+	copy(result, output)
+	return result, nil
+}
+
+// Flush returns any remaining buffered samples.
+func (s *DFTDecimationStage[F]) Flush() ([]F, error) {
+	if s.factor == 1 || !s.fed {
+		return []F{}, nil
+	}
+
+	// Output o is centred on input sample o*factor, so the last real sample
+	// needs prefill (the group delay) zeros after it to complete its window.
+	// That yields ceil(n/factor) outputs in total with no truncation: the
+	// first output after the pad would need a window centred past the end of
+	// the stream.
+	zeros := make([]F, s.numTaps-1-s.prefill)
+	out, err := s.Process(zeros)
+	// Flush is terminal: after draining, return the stage to its fresh state.
+	// Otherwise the padding zeros stay in the delay line, so a second Flush
+	// would emit more windows and a post-flush Process would convolve new
+	// audio against leftover zeros instead of starting a clean stream.
+	// Reset() is the authoritative fresh-state definition (prefilled history,
+	// decimPhase, fed); calling it keeps Flush aligned with it automatically.
+	s.Reset()
+	return out, err
+}
+
+// Reset returns the stage to its just-constructed state: history holds the
+// alignment prefill and decimation restarts at the first sample.
+func (s *DFTDecimationStage[F]) Reset() {
+	s.history = s.history[:s.prefill]
+	clear(s.history)
+	s.decimPhase = 0
+	s.fed = false
+}

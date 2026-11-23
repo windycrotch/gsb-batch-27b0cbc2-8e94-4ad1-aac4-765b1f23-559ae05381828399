@@ -1,0 +1,395 @@
+// SPDX-FileCopyrightText: 2025 Tomi P. Hakala
+// SPDX-License-Identifier: LGPL-2.1-or-later
+
+package engine
+
+import (
+	"fmt"
+	"math"
+
+	"github.com/tphakala/go-audio-resampler/internal/simdops"
+)
+
+// =============================================================================
+// Polyphase Stage - soxr-style integer division/modulo algorithm
+// =============================================================================
+
+// PolyphaseStage implements polyphase FIR resampling using soxr's algorithm.
+//
+// Type parameter F controls the precision of sample processing.
+//
+// This uses sub-phase coefficient interpolation matching soxr's poly-fir.h:
+// - Fixed-point phase accumulator with 32-bit fractional precision
+// - Cubic polynomial interpolation between phases: coef(x) = a + x*(b + x*(c + x*d))
+// - This provides smooth coefficient transitions and excellent THD at high frequencies
+type PolyphaseStage[F simdops.Float] struct {
+	// Filter coefficients with cubic interpolation support
+	// polyCoeffs[phase][tap] - base coefficient (a)
+	// polyCoeffsB/C/D[phase][tap] - cubic interpolation coefficients
+	polyCoeffs  [][]F
+	polyCoeffsB [][]F // Linear coefficient (b)
+	polyCoeffsC [][]F // Quadratic coefficient (c)
+	polyCoeffsD [][]F // Cubic coefficient (d)
+
+	numPhases    int // L in soxr
+	tapsPerPhase int // Number of taps per phase
+
+	// Phase accumulator - fixed-point with 32-bit fractional precision (like soxr)
+	// at = integer_part * (1 << phaseFracBits) + fractional_part
+	at   int64 // Current position in fixed-point
+	step int64 // Step per output sample in fixed-point
+
+	// Phase extraction constants
+	phaseFracBits int // Number of bits for sub-phase interpolation
+
+	// Input history buffer
+	history []F
+
+	// Pre-allocated output buffer for reduced allocations
+	outputBuf []F
+
+	// SIMD operations for type F
+	ops *simdops.Ops[F]
+
+	// Statistics
+	samplesIn  int64
+	samplesOut int64
+
+	// Time alignment. The prototype has protoLen taps, so its group delay is
+	// gd = (protoLen-1)/2 phase units (rounded down when protoLen-1 is odd; the
+	// residual half unit is at most 1/(2*numPhases) stage-input samples). An
+	// output at phase position P then corresponds to input time
+	// (P - at0)/numPhases when the delay line starts with prefill zeros and
+	// the accumulator starts at at0, where
+	//
+	//	prefill = tapsPerPhase - 1 - gd/numPhases
+	//	at0     = (gd % numPhases) << phaseFracBits
+	//
+	// at0 is a whole number of phase units, so for exact-rational ratios the
+	// sub-phase fraction stays 0 and the cubic interpolation banks stay
+	// unused (see the getCoeff comment in NewPolyphaseStage).
+	prefill int   // zeros placed in history at construction and Reset
+	at0     int64 // initial accumulator position, fixed point
+	// fed is set by the first non-empty Process and cleared by Reset; Flush
+	// uses it because the prefilled history is never empty.
+	fed bool
+}
+
+// buildCubicInterpBanks builds the four Catmull-Rom sub-phase interpolation
+// coefficient banks from a prototype coefficient accessor. getCoeff(phase, tap)
+// returns the prototype coefficient for that phase and tap and applies the
+// caller's boundary-indexing policy for out-of-range phases. Taps are stored
+// reversed for the dot-product kernels. Shared by NewPolyphaseStage and the
+// phase-wrap measurement test so the interpolation formula lives in one place.
+func buildCubicInterpBanks[F simdops.Float](numPhases, tapsPerPhase int, getCoeff func(phase, tap int) float64) (a, b, c, d [][]F) {
+	a = make([][]F, numPhases)
+	b = make([][]F, numPhases)
+	c = make([][]F, numPhases)
+	d = make([][]F, numPhases)
+
+	for phase := range numPhases {
+		a[phase] = make([]F, tapsPerPhase)
+		b[phase] = make([]F, tapsPerPhase)
+		c[phase] = make([]F, tapsPerPhase)
+		d[phase] = make([]F, tapsPerPhase)
+
+		for tap := range tapsPerPhase {
+			// Get coefficients from adjacent phases for cubic interpolation
+			// f0 = current phase, f1 = next phase, fm1 = previous phase, f2 = next-next phase
+			f0 := getCoeff(phase, tap)
+			f1 := getCoeff(phase+1, tap)
+			fm1 := getCoeff(phase-1, tap)
+			f2 := getCoeff(phase+cubicPhaseOffset, tap)
+
+			// Compute cubic interpolation coefficients (Catmull-Rom style)
+			// These allow smooth interpolation: f(x) = a + b*x + c*x² + d*x³
+			av := f0
+			cv := cubicCenterCoeff*(f1+fm1) - f0
+			dv := (1.0 / cubicDivisor) * (f2 - f1 + fm1 - f0 - cubicCMultiplier*cv)
+			bv := f1 - f0 - dv - cv
+
+			// Store in REVERSED order for correct convolution direction
+			revTap := tapsPerPhase - 1 - tap
+			a[phase][revTap] = F(av)
+			b[phase][revTap] = F(bv)
+			c[phase][revTap] = F(cv)
+			d[phase][revTap] = F(dv)
+		}
+	}
+	return a, b, c, d
+}
+
+// NewPolyphaseStage creates a polyphase resampling stage.
+//
+// Parameters:
+//   - ratio: Output/input ratio for this stage (e.g., 1.0884 for 88.2→96 kHz)
+//   - totalIORatio: Total input/output ratio (e.g., 0.459 for 44.1→96 kHz)
+//     This is used to correctly set Fp1 for anti-imaging filter design.
+//   - hasPreStage: Whether this polyphase stage is preceded by a DFT pre-stage.
+//     This affects the Fn/Fs calculation (soxr uses different formulas).
+//   - quality: Quality level
+func NewPolyphaseStage[F simdops.Float](ratio, totalIORatio float64, hasPreStage bool, quality Quality) (*PolyphaseStage[F], error) {
+	if ratio <= 0 {
+		return nil, fmt.Errorf("ratio must be positive: %f", ratio)
+	}
+
+	ops := simdops.For[F]()
+
+	// Find rational approximation for the ratio
+	// We want: ratio ≈ L / step (output samples per input sample)
+	// So: step / L ≈ 1 / ratio
+	numPhases, _ := findRationalApprox(ratio)
+
+	// Design polyphase filter bank (always in float64 for precision)
+	// Pass totalIORatio and hasPreStage for correct Fp1/Fn calculation (soxr uses total ratio)
+	filterBank, err := designPolyphaseFilter(numPhases, ratio, totalIORatio, hasPreStage, quality)
+	if err != nil {
+		return nil, fmt.Errorf("failed to design polyphase filter: %w", err)
+	}
+
+	tapsPerPhase := filterBank.tapsPerPhase
+
+	// Sub-phase interpolation configuration (matching soxr's poly-fir.h)
+	// We use 16 bits for sub-phase precision (65536 sub-phases per phase)
+	// This provides excellent THD at high frequencies while keeping integer math fast
+	const phaseFracBits = 16
+
+	// Compute step as a true fixed-point number with full fractional precision
+	// step = (1/ratio) * numPhases * (1 << phaseFracBits)
+	// This is CRITICAL: the integer step from findRationalApprox would lose
+	// fractional precision and make sub-phase interpolation useless (frac would
+	// always be 0), so it is intentionally discarded above.
+	phaseFracScale := float64(int64(1) << phaseFracBits)
+	step := int64(math.Round((1.0 / ratio) * float64(numPhases) * phaseFracScale))
+
+	// getCoeff samples the prototype for cubic sub-phase interpolation of the
+	// polyphase banks. filterBank.coeffs is the flat prototype
+	// (coeffs[tap*numPhases + phase] == prototype[tap*numPhases + phase]), so the
+	// coefficient adjacent to a phase boundary is the neighbour in this FLAT
+	// array: the right neighbour of (tap t, phase L-1) is coeffs[t*L + L], i.e.
+	// phase 0 of tap t+1, and the left neighbour of (tap t, phase 0) is
+	// coeffs[t*L - 1], i.e. phase L-1 of tap t-1. Boundary policy: positions
+	// before the first or after the last prototype sample have no data, so they
+	// clamp to 0.0 (the natural tails of a finite impulse response).
+	//
+	// This must NOT wrap phase within the same tap (phase % numPhases). Wrapping
+	// picks a prototype sample numPhases-1 positions away at each boundary, which
+	// injects a large discontinuity into the interpolated coefficient. That error
+	// is invisible for exact-rational ratios (e.g. 44100<->48000 == 80/147, where
+	// the fixed-point sub-phase x is identically 0 so the B/C/D banks are never
+	// consulted), but for ratios with active sub-phase interpolation it collapses
+	// THD+N by a large margin: the committed measurement (phase_wrap_measure_test.go)
+	// reads -54.46 dB wrapped versus -140.72 dB flat at 44100 -> 64000, an 86.26 dB
+	// improvement, with similar magnitude at other active-interpolation ratios
+	// measured during the investigation but not committed as tests.
+	getCoeff := func(phase, tap int) float64 {
+		idx := tap*numPhases + phase
+		if idx < 0 || idx >= len(filterBank.coeffs) {
+			return 0.0
+		}
+		return filterBank.coeffs[idx]
+	}
+
+	// polyCoeffs = a (base), polyCoeffsB = b (linear), polyCoeffsC = c (quadratic), polyCoeffsD = d (cubic);
+	// evaluated as coef(x) = a + x*(b + x*(c + x*d)) where x ∈ [0, 1)
+	polyCoeffs, polyCoeffsB, polyCoeffsC, polyCoeffsD := buildCubicInterpBanks[F](numPhases, tapsPerPhase, getCoeff)
+
+	// Group delay in phase units, rounded down (see the alignment comment on
+	// the PolyphaseStage fields): whole input samples go to the prefill, the
+	// remaining whole phase units to the initial accumulator position.
+	gdInt := groupDelaySamples(filterBank.protoLen)
+	prefill := tapsPerPhase - 1 - gdInt/numPhases
+	st := &PolyphaseStage[F]{
+		prefill:       prefill,
+		at0:           int64(gdInt%numPhases) << phaseFracBits,
+		polyCoeffs:    polyCoeffs,
+		polyCoeffsB:   polyCoeffsB,
+		polyCoeffsC:   polyCoeffsC,
+		polyCoeffsD:   polyCoeffsD,
+		numPhases:     numPhases,
+		tapsPerPhase:  tapsPerPhase,
+		at:            0,
+		step:          step,
+		phaseFracBits: phaseFracBits,
+		history:       make([]F, 0, tapsPerPhase*historyBufferMultiplier),
+		ops:           ops,
+	}
+	st.Reset()
+	return st, nil
+}
+
+// Process resamples input using soxr's polyphase algorithm with cubic coefficient interpolation.
+//
+// This implements the core loop from soxr's poly-fir.h with sub-phase interpolation:
+//
+//	for i = 0; at < num_in * L * (1<<fracBits); i++, at += step {
+//	    div := at >> (fracBits + phaseBits)      // Input sample index
+//	    phase := (at >> fracBits) & phaseMask    // Integer phase index
+//	    x := (at & fracMask) / (1<<fracBits)     // Fractional phase [0, 1)
+//	    output[i] = convolve_interpolated(input[div:], coeffs[phase], x)
+//	}
+//
+// The cubic interpolation formula per coefficient: coef(x) = a + x*(b + x*(c + x*d))
+// processZeroCopy is the allocation-free internal path. The returned slice
+// aliases s.outputBuf and is only valid until the next call.
+func (s *PolyphaseStage[F]) processZeroCopy(input []F) ([]F, error) { //nolint:unparam // error kept for symmetry with Process
+	if len(input) == 0 {
+		return []F{}, nil
+	}
+
+	s.samplesIn += int64(len(input))
+	s.fed = true
+
+	// Append input to history.
+	// appendStable grows with headroom so steady-state streaming does not
+	// reallocate when the run length jitters by a sample between calls.
+	s.history = appendStable(s.history, input)
+
+	numIn := len(s.history) - s.tapsPerPhase + 1
+	if numIn <= 0 {
+		return []F{}, nil
+	}
+
+	// Calculate number of output samples
+	// at is in fixed-point: integer_phase * (1 << phaseFracBits) + fractional
+	// limit = numIn * numPhases * (1 << phaseFracBits)
+	numPhases64 := int64(s.numPhases)
+	phaseFracBits := s.phaseFracBits
+	limit := int64(numIn) * numPhases64 << phaseFracBits
+	numOut := int((limit - s.at + s.step - 1) / s.step)
+	if numOut <= 0 {
+		return []F{}, nil
+	}
+
+	// Reuse output buffer to reduce allocations. growStableLen adds headroom
+	// when it must grow so that numOut jitter between calls (driven by the
+	// fixed-point at/step accumulator) does not reallocate in the steady state.
+	s.outputBuf = growStableLen(s.outputBuf, numOut)
+
+	// Hoist invariants out of the loop for better optimization.
+	polyCoeffs := s.polyCoeffs
+	polyCoeffsB := s.polyCoeffsB
+	polyCoeffsC := s.polyCoeffsC
+	polyCoeffsD := s.polyCoeffsD
+	history := s.history
+	numPhases := s.numPhases
+	tapsPerPhase := s.tapsPerPhase
+	step := s.step
+	histLen := len(history)
+
+	// The four coefficient banks are allocated together with identical length
+	// (numPhases) in NewPolyphaseStage, so this never fires; it guards the fused
+	// kernel below against a malformed bank set by producing no output rather than
+	// risking an out-of-range access, matching the pre-fusion behaviour.
+	if len(polyCoeffs) < numPhases || len(polyCoeffsB) < numPhases ||
+		len(polyCoeffsC) < numPhases || len(polyCoeffsD) < numPhases {
+		return []F{}, nil
+	}
+
+	// The output buffer is sized to numOut; the kernel writes at most that many.
+	out := s.outputBuf[:numOut]
+
+	// Run the whole block through the fused polyphase cubic kernel (internal/simdops):
+	// the block form of a per-output CubicInterpDot loop. It steps the div/phase/frac
+	// accumulator internally and stops at the first output whose tapsPerPhase window
+	// would run past the history, exactly like the per-output loop it replaces, so
+	// outIdx and the returned accumulator are bit-identical to that form. On amd64 and
+	// arm64 the inner cubic dot is inlined (AVX+FMA / NEON) under the same CPU-feature
+	// gate as CubicInterpDot; elsewhere it is a pure-Go loop over CubicInterpDotUnsafe.
+	outIdx, at := s.ops.ResampleCubic(out, history, polyCoeffs, polyCoeffsB, polyCoeffsC, polyCoeffsD, s.at, step, numPhases, tapsPerPhase, phaseFracBits)
+
+	// Trim output to actual size produced
+	output := s.outputBuf[:outIdx]
+
+	// Consume processed samples from history. The accumulator can overshoot
+	// limit by up to one step at severe downsampling ratios, pointing past the
+	// fully available input positions; cap at numIn so the delay line always
+	// retains tapsPerPhase-1 samples and the rebase below matches the trim.
+	consumed := min(int((at>>phaseFracBits)/numPhases64), numIn)
+	if consumed > 0 {
+		copy(s.history, s.history[consumed:])
+		s.history = s.history[:histLen-consumed]
+	}
+
+	// Save remainder for next call; may legitimately point past the retained
+	// history when the ratio is severe, the next call's input covers it.
+	s.at = at - int64(consumed)*numPhases64<<phaseFracBits
+
+	s.samplesOut += int64(len(output))
+
+	return output, nil
+}
+
+// Process resamples input through the polyphase stage. The returned
+// slice is owned by the caller and remains valid across subsequent calls.
+func (s *PolyphaseStage[F]) Process(input []F) ([]F, error) {
+	output, err := s.processZeroCopy(input)
+	if err != nil || len(output) == 0 {
+		return output, err
+	}
+	// Return a copy to prevent caller's slice from being corrupted
+	result := make([]F, len(output))
+	copy(result, output)
+	return result, nil
+}
+
+// Flush returns any remaining buffered samples.
+func (s *PolyphaseStage[F]) Flush() ([]F, error) {
+	// A stage that was never fed has nothing to drain: padding zeros through
+	// it would emit a phantom window of zero-valued samples. The guard is the
+	// fed flag, not len(history), because the history starts prefilled.
+	// Matches the sibling DFTStage.Flush.
+	if !s.fed {
+		return []F{}, nil
+	}
+
+	// Outputs owed to the stream: every position whose content time is before
+	// the end of the real input, i.e. at < lim (the end of the real input in
+	// accumulator units, shifted by the initial offset at0). This is the same
+	// count a stage without alignment would produce. Everything is relative to
+	// the retained history, so it does not grow with stream length.
+	lim := int64(len(s.history)-s.prefill)*int64(s.numPhases)<<s.phaseFracBits + s.at0
+	owed := 0
+	if lim > s.at {
+		owed = int((lim - s.at + s.step - 1) / s.step)
+	}
+
+	// Padding tapsPerPhase-prefill zeros completes the window of the last
+	// real sample (gd/numPhases zeros past the centre, plus the rest of the
+	// window). The pad can also yield a few outputs past the end of the real
+	// input; they are truncated to owed. historyBufferMultiplier is a buffer
+	// pre-allocation constant, not a flush-padding amount.
+	zeros := make([]F, s.tapsPerPhase-s.prefill)
+	out, err := s.Process(zeros)
+	if err == nil && len(out) > owed {
+		out = out[:owed]
+	}
+	// Flush is terminal: after draining, return the stage to its fresh state.
+	// Otherwise the padding zeros stay in the delay line, so a second Flush
+	// would emit more windows and a post-flush Process would convolve new
+	// audio against leftover zeros instead of starting a clean stream.
+	// Reset() is the authoritative fresh-state definition (phase accumulator,
+	// prefilled history, and sample counters); calling it keeps Flush aligned
+	// with it automatically.
+	s.Reset()
+	return out, err
+}
+
+// Reset returns the stage to its just-constructed state: the accumulator is
+// back at its initial alignment offset and history holds the prefill.
+func (s *PolyphaseStage[F]) Reset() {
+	s.at = s.at0
+	s.history = s.history[:s.prefill]
+	clear(s.history)
+	s.samplesIn = 0
+	s.samplesOut = 0
+	s.fed = false
+}
+
+// GetStatistics returns processing statistics.
+func (s *PolyphaseStage[F]) GetStatistics() map[string]int64 {
+	return map[string]int64{
+		"samplesIn":  s.samplesIn,
+		"samplesOut": s.samplesOut,
+	}
+}

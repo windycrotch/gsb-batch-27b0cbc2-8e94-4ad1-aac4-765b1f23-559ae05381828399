@@ -1,0 +1,295 @@
+// SPDX-FileCopyrightText: 2025 Tomi P. Hakala
+// SPDX-License-Identifier: LGPL-2.1-or-later
+
+// Package resampler provides the only pure Go high-quality audio resampling library.
+//
+// This library is a complete Go reimplementation based on libsoxr (the SoX Resampler
+// library) by Rob Sykes, delivering professional-grade sample rate conversion with
+// no CGO dependencies. It works anywhere Go runs: Linux, macOS, Windows, ARM,
+// WebAssembly, and more.
+//
+// # Features
+//
+//   - 100% Pure Go - No CGO, no external C libraries, cross-compiles effortlessly
+//   - Multiple quality presets from quick/low-latency to very high quality mastering
+//   - Selectable float32/float64 precision paths with type-safe SIMD operations
+//   - Polyphase FIR filtering with cubic coefficient interpolation
+//   - Kaiser window design for optimal stopband attenuation
+//   - SIMD acceleration (AVX2/SSE) via github.com/tphakala/simd for both precisions
+//   - Multi-channel support for stereo, surround, and multi-channel audio (up to 256 channels)
+//   - Parallel channel processing for ~1.7x speedup on stereo, up to 8x on 7.1 surround
+//   - Streaming API for processing audio in chunks with proper state management
+//   - Quality validated against libsoxr reference implementation
+//
+// # Quick Start
+//
+// For simple one-shot resampling (float64):
+//
+//	output, err := resampler.ResampleMono(input, 44100, 48000, resampler.QualityHigh)
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
+//
+// For float32 audio data (common in real-time applications):
+//
+//	output, err := resampler.ResampleMonoFloat32(input, 44100, 48000, resampler.QualityHigh)
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
+//
+// For streaming resampling with a reusable resampler (one mono channel; for
+// multi-channel audio call [Resampler.ProcessMulti] per chunk and, at
+// end-of-stream, [MultiFlusher.FlushMulti] via a type assertion on the
+// resampler, as shown in the [MultiFlusher] example):
+//
+//	config := &resampler.Config{
+//	    InputRate:  44100,
+//	    OutputRate: 48000,
+//	    Channels:   1,
+//	    Quality:    resampler.QualitySpec{Preset: resampler.QualityHigh},
+//	}
+//	r, err := resampler.New(config)
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
+//
+//	// Process audio chunks
+//	for chunk := range audioChunks {
+//	    output, err := r.Process(chunk)
+//	    if err != nil {
+//	        log.Fatal(err)
+//	    }
+//	    writeOutput(output)
+//	}
+//
+//	// Flush remaining samples at end of stream
+//	final, err := r.Flush()
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
+//	writeOutput(final)
+//
+// # Zero-Allocation Streaming
+//
+// For allocation-sensitive workloads, [SimpleResampler.ProcessInto] writes into
+// caller-provided buffers:
+//
+//	r, err := resampler.NewEngine(48000, 32000, resampler.QualityMedium)
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
+//	out := make([]float64, r.EstimateOutput(len(input)))
+//	n, err := r.ProcessInto(input, out)
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
+//	use(out[:n]) // Only out[:n] is valid
+//
+// Contract:
+//   - [SimpleResampler.EstimateOutput] returns a conservative upper bound.
+//   - [SimpleResampler.ProcessInto] returns [ErrBufferTooSmall] if output is
+//     undersized.
+//   - On [ErrBufferTooSmall], processing state is not advanced, so callers can
+//     retry with a larger buffer.
+//   - Data beyond output[:n] is unspecified.
+//
+// The same contract is available for float32 audio via
+// [SimpleResamplerFloat32.ProcessInto] and [SimpleResamplerFloat32.EstimateOutput],
+// which run on the float32-native engine and are likewise zero-allocation once
+// warm.
+//
+// # Latency and Real-Time Streaming
+//
+// Output is time-aligned with the input for every preset: output sample n
+// corresponds to input time n/ratio (position n/ratio in input samples, where
+// ratio is outputRate/inputRate), as with libsoxr and sox rate. Each filter
+// stage starts as if the stream were preceded by silence, so the first samples
+// of a stream carry the filter's onset ramp, and a signal is neither shifted
+// early nor late.
+//
+// A streaming resampler has a startup deficit: the internal filter needs a
+// few samples of history before it can emit correctly filtered output, so
+// the first Process calls in a stream withhold roughly [SimpleResampler.Latency]
+// (or [SimpleResamplerFloat32.Latency]) samples that later calls make up.
+// Callers that need a fixed number of output samples per callback, such as
+// a portaudio or miniaudio audio callback, should sit a small FIFO between
+// the resampler and the callback, primed with Latency() samples of silence.
+// Latency() is the filters' group delay and matches the measured deficit to
+// within about 2 samples, so priming with it keeps callbacks fed in practice;
+// any 1-2 sample shortfall self-heals as the deficit-driven buffer sizing
+// catches up. Because output is time-aligned, a FIFO primed with Latency()
+// zeros delays the delivered stream by exactly that many samples:
+//
+//	r, err := resampler.NewEngineFloat32(44100, 48000, resampler.QualityHigh)
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
+//	fifo := make([]float32, r.Latency()) // prime with the startup deficit
+//	for chunk := range audioChunks {
+//	    out, err := r.Process(chunk)
+//	    if err != nil {
+//	        log.Fatal(err)
+//	    }
+//	    fifo = append(fifo, out...)
+//	    // deliver fixed-size slices from fifo to the audio callback here
+//	}
+//
+// [SimpleResampler.Flush] and [SimpleResamplerFloat32.Flush] are
+// end-of-stream only. Flush pushes padding through the filter to drain its
+// tail, so calling it once per chunk instead of once at the very end
+// injects that padding into the middle of the stream and produces audible
+// clicks at every chunk boundary. Call Flush exactly once, after the last
+// Process call for the stream; a second Flush call is a no-op that returns
+// an empty slice. [SimpleResampler.Reset] and [SimpleResamplerFloat32.Reset]
+// discard all filter state and are for starting an unrelated stream, never
+// for use between chunks of the same stream.
+//
+// Each SimpleResampler or SimpleResamplerFloat32 processes one channel, so
+// a multi-channel stream keeps one persistent instance per channel alive
+// for the duration of the stream. See examples/streaming for the complete,
+// runnable FIFO pattern.
+//
+// # Quality Presets
+//
+// The library provides several quality presets for common use cases:
+//
+//   - [QualityQuick]: 8-bit precision (~54 dB), lowest CPU usage. Suitable for preview
+//     or real-time with low CPU. Cubic interpolation only, like libsoxr's QQ: it has
+//     no anti-alias filter when downsampling.
+//   - [QualityLow]: 16-bit precision (~102 dB). Good for speech and low-bandwidth audio.
+//   - [QualityMedium]: 16-bit precision (~102 dB). Suitable for general music playback.
+//   - [QualityHigh]: 20-bit precision (~126 dB). Recommended for studio production and
+//     high-quality streaming. Matches libsoxr HQ preset.
+//   - [QualityVeryHigh]: 28-bit precision (~175 dB). For mastering and archival applications.
+//     Matches libsoxr VHQ preset.
+//
+// Custom quality settings can be specified using [QualitySpec] with
+// [QualityCustom] preset.
+//
+// # Convenience Functions
+//
+// The package provides convenience constructors for common sample rate conversions:
+//
+//   - [NewCDtoDAT]: 44.1kHz to 48kHz (CD to DAT/DVD)
+//   - [NewDATtoCD]: 48kHz to 44.1kHz (DAT/DVD to CD)
+//   - [NewCDtoHiRes]: 44.1kHz to 88.2kHz (CD to high-resolution)
+//   - [NewSimple]: Simple mono resampler with high quality defaults
+//   - [NewStereo]: Stereo resampler with configurable quality
+//   - [NewMultiChannel]: Multi-channel resampler
+//
+// # Float32 vs Float64 Precision
+//
+// The library provides two precision paths:
+//
+// Float64 (default): Maximum precision for mastering, archival, and critical applications.
+// Use [NewEngine], [SimpleResampler], [ResampleMono], and [ResampleStereo].
+//
+// Float32: ~2x SIMD throughput with 32-bit precision. Ideal for real-time applications,
+// game audio, streaming, and when memory bandwidth is a concern.
+// Use [NewEngineFloat32], [SimpleResamplerFloat32], [ResampleMonoFloat32], and [ResampleStereoFloat32].
+//
+// The float32 path provides a fully consistent API where both Process and Flush
+// return []float32, eliminating type conversion overhead:
+//
+//	r, err := resampler.NewEngineFloat32(44100, 48000, resampler.QualityHigh)
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
+//	for chunk := range audioChunks {
+//	    output, err := r.Process(chunk)  // []float32 in, []float32 out
+//	    if err != nil {
+//	        log.Fatal(err)
+//	    }
+//	    writeOutput(output)
+//	}
+//	final, err := r.Flush()  // Returns []float32 (not []float64!)
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
+//	writeOutput(final)
+//
+// Helper functions for float32 stereo interleaving are also provided:
+// [InterleaveToStereoFloat32] and [DeinterleaveFromStereoFloat32].
+//
+// # Architecture
+//
+// The library implements a multi-stage resampling architecture similar to libsoxr:
+//
+//	Input -> [DFT Pre-Stage] -> [Polyphase FIR] -> Output
+//	              (2x)            (fine ratio)
+//
+// Integer upsampling (2x, 3x) uses a single DFT stage and integer downsampling
+// (96kHz→48kHz) a single DFT decimation stage whose lowpass sits at the output
+// Nyquist. Non-integer ratios (44.1kHz→48kHz) use a 2x DFT pre-stage combined
+// with a polyphase stage. When upsampling, the pre-stage is the anti-imaging
+// filter; when downsampling, it is the anti-alias lowpass at the output Nyquist
+// and the polyphase stage only interpolates. The pre-stage filter grows with the
+// input/output ratio and is capped at 8191 taps, so the preset's stopband is only
+// guaranteed up to the ratio that cap supports (QualityHigh was measured meeting
+// its stopband at 17.4:1 and reaching only -42 dB at 34.8:1); see the README
+// section "Downsampling anti-aliasing".
+// Polyphase decomposition reduces computation by processing only the needed
+// output phases. Cubic coefficient interpolation provides smooth sub-phase
+// transitions for excellent high-frequency THD performance.
+//
+// # Stereo Processing
+//
+// For stereo audio, use [ResampleStereo] for one-shot processing or configure
+// a multi-channel resampler:
+//
+//	leftOut, rightOut, err := resampler.ResampleStereo(
+//	    leftChannel, rightChannel,
+//	    44100, 48000,
+//	    resampler.QualityHigh,
+//	)
+//
+// For float32 stereo audio, use [ResampleStereoFloat32]:
+//
+//	leftOut, rightOut, err := resampler.ResampleStereoFloat32(
+//	    leftChannel, rightChannel,
+//	    44100, 48000,
+//	    resampler.QualityHigh,
+//	)
+//
+// Helper functions [InterleaveToStereo] and [DeinterleaveFromStereo] are provided
+// for converting between interleaved and planar audio formats. Float32 variants
+// [InterleaveToStereoFloat32] and [DeinterleaveFromStereoFloat32] are also available.
+//
+// # Parallel Processing
+//
+// For multi-channel audio (stereo, 5.1, 7.1), channels can be processed
+// concurrently for significant performance gains:
+//
+//	config := &resampling.Config{
+//	    InputRate:      44100,
+//	    OutputRate:     48000,
+//	    Channels:       2,
+//	    Quality:        resampling.QualitySpec{Preset: resampling.QualityHigh},
+//	    EnableParallel: true,  // Process channels concurrently
+//	}
+//
+// Parallel processing is safe because each channel maintains independent state.
+// Benchmarks show ~1.7x speedup for stereo and up to 8x for 7.1 surround audio.
+// Mono audio is unaffected as there are no channels to parallelize.
+//
+// # Thread Safety
+//
+// Individual [Resampler] instances are safe for concurrent use by multiple
+// goroutines when processing different channels via [Resampler.ProcessMulti].
+// However, calls to [Resampler.Process] and [Resampler.Flush] on the same
+// instance should be serialized.
+//
+// # Attribution
+//
+// This library is based on libsoxr (https://sourceforge.net/projects/soxr/)
+// by Rob Sykes, licensed under LGPL-2.1. The following components were derived
+// from libsoxr:
+//
+//   - Multi-stage resampling pipeline (DFT pre-stage + polyphase)
+//   - Polyphase filter bank decomposition
+//   - Quality preset parameters and filter specifications
+//   - Integer phase arithmetic for polyphase interpolation
+//
+// The Kaiser window filter design follows well-established DSP literature,
+// particularly the work of James Kaiser on optimal window functions.
+package resampler

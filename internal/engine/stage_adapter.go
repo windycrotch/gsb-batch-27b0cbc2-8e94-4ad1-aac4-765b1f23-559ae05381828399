@@ -1,0 +1,190 @@
+// SPDX-FileCopyrightText: 2025 Tomi P. Hakala
+// SPDX-License-Identifier: LGPL-2.1-or-later
+
+package engine
+
+import (
+	"github.com/tphakala/go-audio-resampler/internal/pipeline"
+	"github.com/tphakala/go-audio-resampler/internal/simdops"
+	"github.com/tphakala/simd/cpu"
+)
+
+// Constants for stage adapter calculations.
+const (
+	// Latency calculation divisor (half the filter length for symmetric FIR).
+	latencyDivisor = 2
+
+	// Byte sizes for float types.
+	bytesPerFloat32 = 4
+	bytesPerFloat64 = 8
+)
+
+// StageAdapter wraps a Resampler to implement the pipeline.Stage interface.
+// This allows the engine.Resampler to be used in the resample package's
+// multi-stage pipeline architecture.
+//
+// Type parameter F controls the precision of sample processing.
+type StageAdapter[F simdops.Float] struct {
+	*Resampler[F]
+}
+
+// NewStageAdapter creates a StageAdapter wrapping the given Resampler.
+func NewStageAdapter[F simdops.Float](r *Resampler[F]) *StageAdapter[F] {
+	return &StageAdapter[F]{Resampler: r}
+}
+
+// GetRatio returns the resampling ratio.
+func (s *StageAdapter[F]) GetRatio() float64 {
+	return s.Resampler.GetRatio()
+}
+
+// GetLatency returns the stage latency in samples.
+// This is the delay due to FIR filter buffering.
+//
+// This is a filter group-delay heuristic in the input domain, kept for
+// stage-level diagnostics. Latency reporting flows through StartupDeficit
+// (promoted from the embedded Resampler); streaming users priming a FIFO
+// with silence should use the engine Resampler.Latency() accessor, which
+// reports the startup deficit in output samples.
+func (s *StageAdapter[F]) GetLatency() int {
+	latency := 0
+
+	// DFT stage latency: half the filter length (taps * factor for polyphase)
+	if s.preStage != nil && s.preStage.factor > 1 {
+		latency += (s.preStage.tapsPerPhase * s.preStage.factor) / latencyDivisor
+	}
+
+	// Polyphase stage latency
+	if s.polyphaseStage != nil {
+		latency += s.polyphaseStage.tapsPerPhase / latencyDivisor
+	}
+
+	// DFT decimation stage latency
+	if s.decimationStage != nil {
+		latency += s.decimationStage.numTaps / latencyDivisor
+	}
+
+	// Cubic interpolation stage latency
+	if s.cubicStage != nil {
+		latency += cubicLatencySamples
+	}
+
+	return latency
+}
+
+// GetMinInput returns the minimum input size for processing.
+func (s *StageAdapter[F]) GetMinInput() int {
+	// Need at least 1 sample to start processing
+	return 1
+}
+
+// GetMemoryUsage returns approximate memory usage in bytes.
+func (s *StageAdapter[F]) GetMemoryUsage() int64 {
+	var usage int64
+
+	// Determine bytes per element based on type
+	var zero F
+	bytesPerElement := int64(bytesPerFloat32)
+	if _, ok := any(zero).(float64); ok {
+		bytesPerElement = bytesPerFloat64
+	}
+
+	// DFT stage memory
+	if s.preStage != nil {
+		// Polyphase coefficients: factor phases * tapsPerPhase
+		for _, phase := range s.preStage.polyCoeffs {
+			usage += int64(len(phase)) * bytesPerElement
+		}
+		usage += int64(cap(s.preStage.history)) * bytesPerElement
+	}
+
+	// Polyphase stage memory
+	if s.polyphaseStage != nil {
+		// Phase-first layout: polyCoeffs[phase][tap]. All four cubic-interpolation
+		// coefficient banks (a, b, c, d) are the same shape and must all be
+		// counted; summing only polyCoeffs undercounts the coefficients by 4x.
+		for _, bank := range [][][]F{
+			s.polyphaseStage.polyCoeffs,
+			s.polyphaseStage.polyCoeffsB,
+			s.polyphaseStage.polyCoeffsC,
+			s.polyphaseStage.polyCoeffsD,
+		} {
+			for _, phase := range bank {
+				usage += int64(len(phase)) * bytesPerElement
+			}
+		}
+		usage += int64(cap(s.polyphaseStage.history)) * bytesPerElement
+	}
+
+	// Decimation stage memory
+	if s.decimationStage != nil {
+		usage += int64(len(s.decimationStage.coeffs)) * bytesPerElement
+		usage += int64(cap(s.decimationStage.history)) * bytesPerElement
+	}
+
+	// Cubic interpolation stage memory (symmetry with GetLatency).
+	if s.cubicStage != nil {
+		usage += s.cubicStage.GetMemoryUsage()
+	}
+
+	return usage
+}
+
+// GetFilterLength returns the total filter length.
+func (s *StageAdapter[F]) GetFilterLength() int {
+	length := 0
+
+	if s.preStage != nil && s.preStage.factor > 1 {
+		// Original filter length = tapsPerPhase * factor
+		length += s.preStage.tapsPerPhase * s.preStage.factor
+	}
+
+	if s.polyphaseStage != nil {
+		length += s.polyphaseStage.tapsPerPhase * s.polyphaseStage.numPhases
+	}
+
+	return length
+}
+
+// GetPhases returns the number of polyphase filter phases.
+func (s *StageAdapter[F]) GetPhases() int {
+	if s.polyphaseStage != nil {
+		return s.polyphaseStage.numPhases
+	}
+	return 0
+}
+
+// GetSIMDInfo returns SIMD optimization info.
+func (s *StageAdapter[F]) GetSIMDInfo() string {
+	return cpu.Info()
+}
+
+// ProcessZeroCopy processes input with zero-copy semantics on the float64 path.
+// For StageAdapter[float64], the returned slice aliases internal buffers and is
+// only valid until the next processing call.
+//
+// For non-float64 adapters, this method falls back to conversion plus the
+// allocating Process path and returns an owned []float64 copy.
+func (s *StageAdapter[F]) ProcessZeroCopy(input []float64) ([]float64, error) {
+	r, ok := any(s.Resampler).(*Resampler[float64])
+	if ok {
+		return r.ProcessZeroCopy(input)
+	}
+
+	// float32 adapter fallback: convert input/output types and use allocating path.
+	typedInput := make([]F, len(input))
+	for i, sample := range input {
+		typedInput[i] = F(sample)
+	}
+	typedOutput, err := s.Resampler.Process(typedInput) //nolint:staticcheck // explicit embedded field for clarity
+	if err != nil {
+		return nil, err
+	}
+	output := make([]float64, len(typedOutput))
+	for i, sample := range typedOutput {
+		output[i] = float64(sample)
+	}
+	return output, nil
+}
+
+var _ pipeline.ZeroCopyProcessor = (*StageAdapter[float64])(nil)

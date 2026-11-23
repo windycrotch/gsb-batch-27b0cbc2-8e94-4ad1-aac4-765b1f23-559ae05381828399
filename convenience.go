@@ -1,0 +1,565 @@
+// SPDX-FileCopyrightText: 2025 Tomi P. Hakala
+// SPDX-License-Identifier: LGPL-2.1-or-later
+
+package resampler
+
+import (
+	"github.com/tphakala/go-audio-resampler/internal/engine"
+)
+
+// Common sample rates for convenience functions.
+const (
+	// RateCD is the CD quality sample rate (Red Book standard).
+	RateCD = 44100
+
+	// RateDAT is the DAT/DVD sample rate.
+	RateDAT = 48000
+
+	// RateHiRes88 is the high-resolution 2x CD sample rate.
+	RateHiRes88 = 88200
+
+	// RateHiRes96 is the high-resolution 2x DAT sample rate.
+	RateHiRes96 = 96000
+
+	// RateHiRes176 is the very high resolution 4x CD sample rate.
+	RateHiRes176 = 176400
+
+	// RateHiRes192 is the very high resolution 4x DAT sample rate.
+	RateHiRes192 = 192000
+
+	// RateTelephony is the telephony (PSTN narrowband) sample rate.
+	RateTelephony = 8000
+
+	// RateVoIP is the VoIP wideband sample rate.
+	RateVoIP = 16000
+
+	// RateSpeech is the speech recognition common sample rate.
+	RateSpeech = 22050
+
+	// RateVideo is the video production sample rate (matches many video formats).
+	RateVideo = 48000
+)
+
+// NewCDtoDAT creates a resampler for CD (44.1kHz) to DAT (48kHz) conversion.
+// This is one of the most common professional audio conversions.
+func NewCDtoDAT(quality QualityPreset) (Resampler, error) {
+	return New(&Config{
+		InputRate:  RateCD,
+		OutputRate: RateDAT,
+		Channels:   1,
+		Quality:    QualitySpec{Preset: quality},
+	})
+}
+
+// NewDATtoCD creates a resampler for DAT (48kHz) to CD (44.1kHz) conversion.
+func NewDATtoCD(quality QualityPreset) (Resampler, error) {
+	return New(&Config{
+		InputRate:  RateDAT,
+		OutputRate: RateCD,
+		Channels:   1,
+		Quality:    QualitySpec{Preset: quality},
+	})
+}
+
+// NewCDtoHiRes creates a resampler for CD (44.1kHz) to high-res (88.2kHz) conversion.
+func NewCDtoHiRes(quality QualityPreset) (Resampler, error) {
+	return New(&Config{
+		InputRate:  RateCD,
+		OutputRate: RateHiRes88,
+		Channels:   1,
+		Quality:    QualitySpec{Preset: quality},
+	})
+}
+
+// NewHiRestoCD creates a resampler for high-res (88.2kHz) to CD (44.1kHz) conversion.
+func NewHiRestoCD(quality QualityPreset) (Resampler, error) {
+	return New(&Config{
+		InputRate:  RateHiRes88,
+		OutputRate: RateCD,
+		Channels:   1,
+		Quality:    QualitySpec{Preset: quality},
+	})
+}
+
+// NewSimple creates a simple mono resampler with sensible defaults.
+// Uses QualityHigh for professional-grade audio quality.
+func NewSimple(inputRate, outputRate float64) (Resampler, error) {
+	return New(&Config{
+		InputRate:  inputRate,
+		OutputRate: outputRate,
+		Channels:   1,
+		Quality:    QualitySpec{Preset: QualityHigh},
+	})
+}
+
+// NewStereo creates a stereo resampler with the specified quality.
+func NewStereo(inputRate, outputRate float64, quality QualityPreset) (Resampler, error) {
+	return New(&Config{
+		InputRate:  inputRate,
+		OutputRate: outputRate,
+		Channels:   stereoChannels,
+		Quality:    QualitySpec{Preset: quality},
+	})
+}
+
+// NewMultiChannel creates a multi-channel resampler.
+func NewMultiChannel(inputRate, outputRate float64, channels int, quality QualityPreset) (Resampler, error) {
+	return New(&Config{
+		InputRate:  inputRate,
+		OutputRate: outputRate,
+		Channels:   channels,
+		Quality:    QualitySpec{Preset: quality},
+	})
+}
+
+// SimpleResampler provides a simplified interface for basic resampling tasks.
+// It wraps the engine.Resampler directly for maximum performance.
+// Uses float64 precision for maximum quality.
+//
+// Streaming pattern: keep one persistent SimpleResampler per channel, call
+// Process once per chunk of input, and call Flush once at the end of the
+// stream.
+type SimpleResampler struct {
+	engine *engine.Resampler[float64]
+}
+
+// NewEngine creates a SimpleResampler using the engine directly.
+// This bypasses the pipeline infrastructure for simpler use cases.
+// Uses float64 precision for maximum quality.
+func NewEngine(inputRate, outputRate float64, quality QualityPreset) (*SimpleResampler, error) {
+	engineQuality := presetToEngineQuality(quality)
+	r, err := engine.NewResampler[float64](inputRate, outputRate, engineQuality)
+	if err != nil {
+		return nil, err
+	}
+	return &SimpleResampler{engine: r}, nil
+}
+
+// Process resamples one chunk of a single (mono) audio channel.
+// The output length varies from call to call: early calls may withhold up
+// to Latency() samples while the internal filter primes, so len(output)
+// does not track len(input)*GetRatio() on a per-call basis. The returned
+// slice is owned by the caller; it is never aliased by the resampler and
+// stays valid after subsequent calls.
+func (r *SimpleResampler) Process(input []float64) ([]float64, error) {
+	return r.engine.Process(input)
+}
+
+// ProcessInto resamples input into the caller-provided output buffer.
+// It writes up to len(output) samples and returns the number of valid samples;
+// callers should consume output[:n]. The buffer tail beyond n is undefined.
+//
+// If output is too small, ProcessInto returns ErrBufferTooSmall before any
+// processing state is advanced, so callers can retry with a larger buffer.
+func (r *SimpleResampler) ProcessInto(input, output []float64) (int, error) {
+	required := r.EstimateOutput(len(input))
+	if len(output) < required {
+		return 0, ErrBufferTooSmall
+	}
+
+	result, err := r.engine.ProcessZeroCopy(input)
+	if err != nil {
+		return 0, err
+	}
+	if len(output) < len(result) {
+		panic("go-audio-resampler: EstimateOutput underestimated actual output length")
+	}
+	copy(output, result)
+	return len(result), nil
+}
+
+// EstimateOutput returns the maximum number of output samples that
+// processing inputLen input samples may produce.
+func (r *SimpleResampler) EstimateOutput(inputLen int) int {
+	return int(float64(inputLen)*r.engine.GetRatio()) + estimateOutputMargin
+}
+
+// Flush drains the remaining buffered samples at end-of-stream. It is
+// end-of-stream only: pushing padding through the filter on every chunk
+// instead of just the last one creates audible edge transients.
+// Flush is terminal. After it returns, the instance behaves like a fresh
+// one for output purposes: a second Flush call returns an empty slice, and
+// a subsequent Process call produces output bit-identical to a fresh
+// instance. GetStatistics counters are cumulative and are not reset by
+// Flush.
+func (r *SimpleResampler) Flush() ([]float64, error) {
+	return r.engine.Flush()
+}
+
+// Reset discards all filter state, returning the resampler to its
+// just-constructed condition. It is for starting an unrelated stream, not
+// for use between chunks of one continuous stream: calling it mid-stream
+// destroys the filter's history and causes audible clicks.
+func (r *SimpleResampler) Reset() {
+	r.engine.Reset()
+}
+
+// GetRatio returns the resampling ratio (outputRate / inputRate).
+func (r *SimpleResampler) GetRatio() float64 {
+	return r.engine.GetRatio()
+}
+
+// GetStatistics returns processing statistics.
+func (r *SimpleResampler) GetStatistics() map[string]int64 {
+	return r.engine.GetStatistics()
+}
+
+// Latency returns the resampler's startup deficit in output samples: the
+// number of samples early Process calls withhold while the internal filter
+// primes. It equals the filters' group delay, and output is time-aligned
+// (output sample n corresponds to input time n/ratio), so priming a FIFO with
+// this many samples of silence delays the delivered stream by exactly that
+// many samples. Real-time users feeding fixed-size output buffers should
+// prime their FIFO with this many samples of silence.
+func (r *SimpleResampler) Latency() int {
+	return r.engine.Latency()
+}
+
+// presetToEngineQuality converts a QualityPreset to engine.Quality.
+func presetToEngineQuality(preset QualityPreset) engine.Quality {
+	switch preset {
+	case QualityQuick:
+		return engine.QualityQuick
+	case QualityLow:
+		return engine.QualityLow
+	case QualityMedium:
+		return engine.QualityMedium
+	case QualityHigh, QualityVeryHigh:
+		return engine.QualityHigh
+	default:
+		return engine.QualityMedium
+	}
+}
+
+// ResampleMono is a convenience function for one-shot mono resampling.
+// It creates a resampler, processes the input, flushes, and returns the
+// result. Use this when:
+//   - You have the entire input available upfront (not streaming)
+//   - float64 precision is required (mastering, archival)
+//
+// For real-time or chunked streaming, use NewEngine with Process per chunk
+// instead; see the streaming example.
+func ResampleMono(input []float64, inputRate, outputRate float64, quality QualityPreset) ([]float64, error) {
+	r, err := NewEngine(inputRate, outputRate, quality)
+	if err != nil {
+		return nil, err
+	}
+
+	return resampleAll(r, input)
+}
+
+// resampleAll runs a complete one-shot resample (Process followed by Flush) on
+// the given engine and returns the concatenated output. The engine's Process and
+// Flush return owned (non-aliasing) buffers, so the result stays valid even if
+// the engine is subsequently Reset and reused for another channel.
+func resampleAll(r *SimpleResampler, input []float64) ([]float64, error) {
+	output, err := r.Process(input)
+	if err != nil {
+		return nil, err
+	}
+
+	flushed, err := r.Flush()
+	if err != nil {
+		return nil, err
+	}
+
+	return append(output, flushed...), nil
+}
+
+// ResampleStereo is a convenience function for one-shot stereo resampling.
+// Input is expected as [left, right] channels.
+func ResampleStereo(left, right []float64, inputRate, outputRate float64, quality QualityPreset) (leftOut, rightOut []float64, err error) {
+	// Build the engine once and reuse it across both channels so the polyphase
+	// filter bank is only designed a single time. Reset() between channels
+	// clears the streaming state (history, phase, buffered tail) so the right
+	// channel is processed exactly as a fresh engine would, keeping the output
+	// bit-identical to two independent ResampleMono calls.
+	r, err := NewEngine(inputRate, outputRate, quality)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	leftOut, err = resampleAll(r, left)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	r.Reset()
+
+	rightOut, err = resampleAll(r, right)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return leftOut, rightOut, nil
+}
+
+// InterleaveToStereo converts two mono channels to interleaved stereo.
+// Output format: [L0, R0, L1, R1, L2, R2, ...]
+func InterleaveToStereo(left, right []float64) []float64 {
+	minLen := min(len(left), len(right))
+	result := make([]float64, minLen*stereoChannels)
+	for i := range minLen {
+		result[i*stereoChannels] = left[i]
+		result[i*stereoChannels+1] = right[i]
+	}
+	return result
+}
+
+// DeinterleaveFromStereo converts interleaved stereo to two mono channels.
+// Input format: [L0, R0, L1, R1, L2, R2, ...]
+func DeinterleaveFromStereo(interleaved []float64) (left, right []float64) {
+	numSamples := len(interleaved) / stereoChannels
+	left = make([]float64, numSamples)
+	right = make([]float64, numSamples)
+	for i := range numSamples {
+		left[i] = interleaved[i*stereoChannels]
+		right[i] = interleaved[i*stereoChannels+1]
+	}
+	return left, right
+}
+
+// =============================================================================
+// Float32 Native API
+// =============================================================================
+//
+// The following types and functions provide a float32-native resampling path.
+// Use these when working with float32 audio data for:
+//   - ~2x SIMD throughput (256-bit SIMD processes 8×float32 vs 4×float64)
+//   - Reduced memory bandwidth
+//   - Consistent float32 throughout the pipeline (no type conversions)
+//
+// For maximum precision (mastering, archival), use the float64 API instead.
+
+// SimpleResamplerFloat32 provides a simplified float32-native interface for
+// basic resampling tasks. It wraps the engine.Resampler[float32] directly
+// for maximum performance with float32 audio data.
+//
+// Unlike using ProcessFloat32 on the main Resampler interface (where Flush
+// returns float64), SimpleResamplerFloat32 keeps everything in float32,
+// eliminating type conversion overhead.
+//
+// Streaming pattern: keep one persistent SimpleResamplerFloat32 per channel,
+// call Process once per chunk of input, and call Flush once at the end of
+// the stream.
+//
+// Example:
+//
+//	r, err := resampler.NewEngineFloat32(44100, 48000, resampler.QualityHigh)
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
+//	for chunk := range audioChunks {
+//	    output, err := r.Process(chunk)  // []float32 in, []float32 out
+//	    if err != nil {
+//	        log.Fatal(err)
+//	    }
+//	    writeOutput(output)
+//	}
+//	final, err := r.Flush()  // Returns []float32!
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
+//	writeOutput(final)
+type SimpleResamplerFloat32 struct {
+	engine *engine.Resampler[float32]
+}
+
+// NewEngineFloat32 creates a SimpleResamplerFloat32 using the engine directly.
+// This bypasses the pipeline infrastructure for simpler use cases.
+// Uses float32 precision throughout for ~2x SIMD throughput compared to float64.
+//
+// Parameters:
+//   - inputRate: Input sample rate in Hz (e.g., 44100)
+//   - outputRate: Output sample rate in Hz (e.g., 48000)
+//   - quality: Quality preset controlling filter design and precision
+//
+// For maximum precision, use NewEngine (float64) instead.
+func NewEngineFloat32(inputRate, outputRate float64, quality QualityPreset) (*SimpleResamplerFloat32, error) {
+	engineQuality := presetToEngineQuality(quality)
+	r, err := engine.NewResampler[float32](inputRate, outputRate, engineQuality)
+	if err != nil {
+		return nil, err
+	}
+	return &SimpleResamplerFloat32{engine: r}, nil
+}
+
+// Process resamples one chunk of a single (mono) audio channel.
+// Input and output are both float32, with no type conversion overhead.
+// The output length varies from call to call: early calls may withhold up
+// to Latency() samples while the internal filter primes, so len(output)
+// does not track len(input)*GetRatio() on a per-call basis. The returned
+// slice is owned by the caller; it is never aliased by the resampler and
+// stays valid after subsequent calls.
+func (r *SimpleResamplerFloat32) Process(input []float32) ([]float32, error) {
+	return r.engine.Process(input)
+}
+
+// ProcessInto resamples input into the caller-provided output buffer (float32).
+// It is the float32 mirror of SimpleResampler.ProcessInto: it writes up to
+// len(output) samples, returns the count, and returns ErrBufferTooSmall before
+// advancing state if output is too small to hold EstimateOutput(len(input))
+// samples. Because the underlying engine is float32-native, there is no float64
+// round-trip, so this path performs zero allocations once internal buffers have
+// warmed up. Use it for streaming float32 audio without per-call allocations.
+func (r *SimpleResamplerFloat32) ProcessInto(input, output []float32) (int, error) {
+	required := r.EstimateOutput(len(input))
+	if len(output) < required {
+		return 0, ErrBufferTooSmall
+	}
+
+	result, err := r.engine.ProcessZeroCopy(input)
+	if err != nil {
+		return 0, err
+	}
+	if len(output) < len(result) {
+		panic("go-audio-resampler: EstimateOutput underestimated actual output length")
+	}
+	copy(output, result)
+	return len(result), nil
+}
+
+// EstimateOutput returns an upper bound on the number of output samples that
+// ProcessInto will produce for an input of inputLen samples. It mirrors
+// SimpleResampler.EstimateOutput; callers use it to size the output buffer.
+func (r *SimpleResamplerFloat32) EstimateOutput(inputLen int) int {
+	return int(float64(inputLen)*r.engine.GetRatio()) + estimateOutputMargin
+}
+
+// Flush drains the remaining buffered samples as float32 at end-of-stream.
+// Unlike the main Resampler.Flush() which returns float64, this returns
+// float32 for a consistent float32 workflow.
+//
+// Flush is end-of-stream only: pushing padding through the filter on every
+// chunk instead of just the last one creates audible edge transients (issue
+// #51). Flush is terminal. After it returns, the instance behaves like a
+// fresh one for output purposes: a second Flush call returns an empty
+// slice, and a subsequent Process call produces output bit-identical to a
+// fresh instance. GetStatistics counters are cumulative and are not reset
+// by Flush.
+func (r *SimpleResamplerFloat32) Flush() ([]float32, error) {
+	return r.engine.Flush()
+}
+
+// Reset discards all filter state, returning the resampler to its
+// just-constructed condition. It is for starting an unrelated stream, not
+// for use between chunks of one continuous stream: calling it mid-stream
+// destroys the filter's history and causes audible clicks.
+func (r *SimpleResamplerFloat32) Reset() {
+	r.engine.Reset()
+}
+
+// GetRatio returns the resampling ratio (outputRate / inputRate).
+func (r *SimpleResamplerFloat32) GetRatio() float64 {
+	return r.engine.GetRatio()
+}
+
+// GetStatistics returns processing statistics including samples processed.
+func (r *SimpleResamplerFloat32) GetStatistics() map[string]int64 {
+	return r.engine.GetStatistics()
+}
+
+// Latency returns the resampler's startup deficit in output samples: the
+// number of samples early Process calls withhold while the internal filter
+// primes. It equals the filters' group delay, and output is time-aligned
+// (output sample n corresponds to input time n/ratio), so priming a FIFO with
+// this many samples of silence delays the delivered stream by exactly that
+// many samples. Real-time users feeding fixed-size output buffers should
+// prime their FIFO with this many samples of silence.
+func (r *SimpleResamplerFloat32) Latency() int {
+	return r.engine.Latency()
+}
+
+// ResampleMonoFloat32 is a convenience function for one-shot mono resampling
+// with float32 samples. It creates a resampler, processes the input, flushes,
+// and returns the result.
+//
+// This is the float32 equivalent of ResampleMono. Use this when:
+//   - Your audio data is already in float32 format
+//   - You want ~2x SIMD throughput compared to float64
+//   - You have the entire input available upfront (not streaming)
+//
+// For real-time or chunked streaming, use NewEngineFloat32 with Process per
+// chunk instead; see the streaming example.
+//
+// For maximum precision (mastering, archival), use ResampleMono instead.
+func ResampleMonoFloat32(input []float32, inputRate, outputRate float64, quality QualityPreset) ([]float32, error) {
+	r, err := NewEngineFloat32(inputRate, outputRate, quality)
+	if err != nil {
+		return nil, err
+	}
+
+	return resampleAllFloat32(r, input)
+}
+
+// resampleAllFloat32 is the float32 counterpart of resampleAll.
+func resampleAllFloat32(r *SimpleResamplerFloat32, input []float32) ([]float32, error) {
+	output, err := r.Process(input)
+	if err != nil {
+		return nil, err
+	}
+
+	flushed, err := r.Flush()
+	if err != nil {
+		return nil, err
+	}
+
+	return append(output, flushed...), nil
+}
+
+// ResampleStereoFloat32 is a convenience function for one-shot stereo resampling
+// with float32 samples. Input is expected as [left, right] channels.
+//
+// This is the float32 equivalent of ResampleStereo.
+func ResampleStereoFloat32(left, right []float32, inputRate, outputRate float64, quality QualityPreset) (leftOut, rightOut []float32, err error) {
+	// Reuse one engine across both channels (see ResampleStereo) so the filter
+	// bank is designed once; Reset() between channels keeps the right channel
+	// bit-identical to an independent ResampleMonoFloat32 call.
+	r, err := NewEngineFloat32(inputRate, outputRate, quality)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	leftOut, err = resampleAllFloat32(r, left)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	r.Reset()
+
+	rightOut, err = resampleAllFloat32(r, right)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return leftOut, rightOut, nil
+}
+
+// InterleaveToStereoFloat32 converts two mono float32 channels to interleaved stereo.
+// Output format: [L0, R0, L1, R1, L2, R2, ...]
+//
+// This is the float32 equivalent of InterleaveToStereo.
+func InterleaveToStereoFloat32(left, right []float32) []float32 {
+	minLen := min(len(left), len(right))
+	result := make([]float32, minLen*stereoChannels)
+	for i := range minLen {
+		result[i*stereoChannels] = left[i]
+		result[i*stereoChannels+1] = right[i]
+	}
+	return result
+}
+
+// DeinterleaveFromStereoFloat32 converts interleaved stereo float32 to two mono channels.
+// Input format: [L0, R0, L1, R1, L2, R2, ...]
+//
+// This is the float32 equivalent of DeinterleaveFromStereo.
+func DeinterleaveFromStereoFloat32(interleaved []float32) (left, right []float32) {
+	numSamples := len(interleaved) / stereoChannels
+	left = make([]float32, numSamples)
+	right = make([]float32, numSamples)
+	for i := range numSamples {
+		left[i] = interleaved[i*stereoChannels]
+		right[i] = interleaved[i*stereoChannels+1]
+	}
+	return left, right
+}

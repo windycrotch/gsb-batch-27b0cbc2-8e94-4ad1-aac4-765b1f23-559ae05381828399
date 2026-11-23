@@ -1,0 +1,406 @@
+// SPDX-FileCopyrightText: 2025 Tomi P. Hakala
+// SPDX-License-Identifier: LGPL-2.1-or-later
+
+package engine
+
+import (
+	"fmt"
+	"math"
+
+	"github.com/tphakala/go-audio-resampler/internal/simdops"
+)
+
+// Resampler implements high-quality audio resampling using soxr-style
+// multi-stage architecture.
+//
+// Type parameter F must be float32 or float64, controlling the precision
+// of internal processing. Use float32 for ~2x SIMD throughput, float64
+// for maximum precision.
+//
+// Architecture (matching soxr):
+//   - Integer ratios (e.g., 2×): Single DFT stage
+//   - Integer downsampling: DFT decimation stage
+//   - Non-integer ratios (e.g., CD→DAT): 2x DFT pre-stage + Polyphase stage.
+//     When downsampling, the pre-stage is the anti-alias lowpass at the target
+//     Nyquist and the polyphase stage only interpolates (rejects images).
+//
+// The polyphase stage uses integer division/modulo for phase calculation,
+// exactly matching soxr's poly-fir0.h algorithm.
+type Resampler[F simdops.Float] struct {
+	// Configuration
+	inputRate  float64
+	outputRate float64
+	ratio      float64 // outputRate / inputRate
+
+	// Stages
+	cubicStage      *CubicStage[F]         // Optional cubic interpolation stage (for QualityQuick)
+	preStage        *DFTStage[F]           // Optional pre-upsampling stage
+	decimationStage *DFTDecimationStage[F] // Optional decimation stage (for integer downsampling)
+	polyphaseStage  *PolyphaseStage[F]     // Main polyphase resampling stage
+
+	// SIMD operations for type F
+	ops *simdops.Ops[F]
+
+	// Statistics
+	samplesIn  int64
+	samplesOut int64
+}
+
+// NewResampler creates a new resampler for the given sample rates.
+//
+// This implements soxr's multi-stage architecture:
+//   - For integer ratios: Uses only a DFT stage (upsampling) or DFT decimation stage
+//   - For non-integer ratios: Uses DFT pre-stage (2×) + polyphase stage. For
+//     downsampling the pre-stage carries the anti-alias lowpass at the target
+//     Nyquist (see [NewDFTAntiAliasStage]).
+func NewResampler[F simdops.Float](inputRate, outputRate float64, quality Quality) (*Resampler[F], error) {
+	if !(inputRate > 0) || !(outputRate > 0) {
+		return nil, fmt.Errorf("sample rates must be positive finite numbers: input=%f, output=%f", inputRate, outputRate)
+	}
+
+	ratio := outputRate / inputRate
+
+	// Validate ratio bounds to prevent memory exhaustion and integer overflow.
+	// Following SOXR's pattern: ratios between 1/256 and 256 are practical for audio.
+	// Extreme ratios can cause: (1) integer overflow in output size calculation,
+	// (2) memory exhaustion from attempting to allocate huge output buffers.
+	// The checks are expressed positively so a NaN ratio (e.g. from Inf/Inf)
+	// fails validation instead of silently passing every comparison.
+	const minRatio = 1.0 / 256.0 // 256x downsampling
+	const maxRatio = 256.0       // 256x upsampling
+	if !(ratio >= minRatio && ratio <= maxRatio) {
+		return nil, fmt.Errorf("resampling ratio %.6f out of valid range [%.6f, %.0f]", ratio, minRatio, maxRatio)
+	}
+	ops := simdops.For[F]()
+
+	r := &Resampler[F]{
+		inputRate:  inputRate,
+		outputRate: outputRate,
+		ratio:      ratio,
+		ops:        ops,
+	}
+
+	// QualityQuick uses cubic interpolation (matching SOXR_QQ)
+	if quality == QualityQuick {
+		cubicStage := NewCubicStage[F](ratio)
+		r.cubicStage = cubicStage
+		return r, nil
+	}
+
+	// Determine architecture based on ratio
+	// Upsampling uses the DFT stage as an anti-imaging filter. Downsampling by
+	// an integer ratio uses a DFT decimation stage; downsampling by a
+	// non-integer ratio uses a 2x DFT pre-stage designed as the anti-alias
+	// filter, then the polyphase stage (below).
+	if ratio >= 1.0 {
+		// UPSAMPLING (ratio >= 1.0)
+		if isIntegerRatio(ratio) {
+			// Integer ratio: single DFT stage
+			intRatio := int(math.Round(ratio))
+			dftStage, err := NewDFTStage[F](intRatio, quality)
+			if err != nil {
+				return nil, fmt.Errorf("failed to create DFT stage: %w", err)
+			}
+			r.preStage = dftStage
+			// No polyphase stage needed
+		} else {
+			// Non-integer upsampling: DFT pre-stage + polyphase stage
+			// Pre-upsample by 2× to get better working ratio for polyphase
+			preUpsampleFactor := 2
+			intermediateRate := inputRate * float64(preUpsampleFactor)
+
+			// Create DFT pre-stage (2× upsampling)
+			dftStage, err := NewDFTStage[F](preUpsampleFactor, quality)
+			if err != nil {
+				return nil, fmt.Errorf("failed to create DFT pre-stage: %w", err)
+			}
+			r.preStage = dftStage
+
+			// Create polyphase stage for remaining ratio
+			// Polyphase operates on pre-upsampled signal
+			polyphaseRatio := outputRate / intermediateRate
+			// Pass total io_ratio for correct Fp1 calculation (soxr uses total ratio)
+			totalIORatio := inputRate / outputRate
+			// hasPreStage = true because we have a DFT pre-stage
+			polyStage, err := NewPolyphaseStage[F](polyphaseRatio, totalIORatio, true, quality)
+			if err != nil {
+				return nil, fmt.Errorf("failed to create polyphase stage: %w", err)
+			}
+			r.polyphaseStage = polyStage
+		}
+	} else {
+		// DOWNSAMPLING (ratio < 1.0)
+		// soxr uses different approaches based on the ratio:
+		// - Integer ratios (2:1, 3:1, 4:1): DFT decimation stage
+		// - Non-integer ratios: 2x DFT pre-stage + polyphase filtering
+		//
+		// For integer ratios, DFT decimation achieves 150+ dB anti-aliasing
+		// because it uses a very long filter with cutoff at output Nyquist.
+		ioRatio := inputRate / outputRate // e.g., 2.0 for 96→48
+
+		if isIntegerRatio(ioRatio) && ioRatio >= 2.0 {
+			// Integer ratio downsampling: use DFT decimation stage
+			// This matches soxr's approach for 96→48, 192→48, etc.
+			decimFactor := int(math.Round(ioRatio))
+			decimStage, err := NewDFTDecimationStage[F](decimFactor, quality)
+			if err != nil {
+				return nil, fmt.Errorf("failed to create DFT decimation stage: %w", err)
+			}
+			r.decimationStage = decimStage
+			// No polyphase stage needed for integer decimation
+		} else {
+			// Non-integer downsampling: 2x DFT pre-stage + polyphase stage, as
+			// libsoxr lays out ratios in (1, 1.5] (cr.c:319-321, preM=0, preL=2).
+			// The pre-stage is the anti-alias lowpass: its stopband sits at the
+			// target Nyquist (cr.c:383-387, Fn1 = arbM/arbL = 2*in/out). The
+			// polyphase stage after it only interpolates and rejects images, so
+			// without this design nothing would attenuate content between the
+			// target Nyquist and the input Nyquist.
+			//
+			// Example for 48kHz → 44.1kHz:
+			//   Pre-stage: 2x upsample (48 → 96 kHz), lowpass at 22.05 kHz
+			//   Polyphase: 96 → 44.1 kHz (ratio = 0.459375)
+			preUpsampleFactor := 2
+			intermediateRate := inputRate * float64(preUpsampleFactor)
+
+			// Create the DFT pre-stage (2× upsampling) as the anti-alias filter
+			dftStage, err := NewDFTAntiAliasStage[F](preUpsampleFactor, float64(preUpsampleFactor)*ioRatio, quality)
+			if err != nil {
+				return nil, fmt.Errorf("failed to create DFT anti-alias pre-stage: %w", err)
+			}
+			r.preStage = dftStage
+
+			// Create polyphase stage for decimation from intermediate rate
+			// Polyphase operates on pre-upsampled signal
+			polyphaseRatio := outputRate / intermediateRate
+			// totalIORatio is input/output ratio relative to ORIGINAL rates
+			totalIORatio := ioRatio
+			// hasPreStage = false because soxr uses preM=0 for upsampling pre-stages.
+			// When the pre-stage is upsampling (not downsampling), the polyphase
+			// filter design treats it as if there's no pre-stage in terms of
+			// frequency normalization (Fn=1, not Fn=2*mult).
+			polyStage, err := NewPolyphaseStage[F](polyphaseRatio, totalIORatio, false, quality)
+			if err != nil {
+				return nil, fmt.Errorf("failed to create polyphase stage: %w", err)
+			}
+			r.polyphaseStage = polyStage
+		}
+	}
+
+	return r, nil
+}
+
+// Process resamples the input samples. The returned slice is owned by the
+// caller and stays valid across subsequent Process, ProcessZeroCopy, and Flush
+// calls.
+//
+// This is the copying convenience form of [Resampler.ProcessZeroCopy]: it runs
+// the same zero-copy stage pipeline and copies only the final result into
+// freshly owned memory. A multi-stage conversion (an upsampling pre-stage
+// feeding a decimation or polyphase stage) therefore no longer copies the
+// intermediate stage output to owned memory just to hand it to the next stage;
+// the intermediate flows through zero-copy and only the caller-owned result is
+// copied.
+func (r *Resampler[F]) Process(input []F) ([]F, error) {
+	output, err := r.ProcessZeroCopy(input)
+	if err != nil {
+		return nil, err
+	}
+	if len(output) == 0 {
+		return []F{}, nil
+	}
+
+	// ProcessZeroCopy returns a slice aliasing internal stage buffers (or the
+	// input slice at a passthrough ratio), valid only until the next call. Copy
+	// it into owned memory so the caller's result survives later calls.
+	result := make([]F, len(output))
+	copy(result, output)
+	return result, nil
+}
+
+// ProcessZeroCopy resamples input using the zero-copy internal path.
+// The returned slice aliases internal buffers and is only valid until the
+// next Process, ProcessZeroCopy, or Flush call.
+func (r *Resampler[F]) ProcessZeroCopy(input []F) ([]F, error) {
+	if len(input) == 0 {
+		return []F{}, nil
+	}
+
+	r.samplesIn += int64(len(input))
+
+	if r.cubicStage != nil {
+		// Zero-copy path: the returned slice may alias the cubic stage's
+		// internal output buffer, matching the ProcessZeroCopy contract.
+		output, err := r.cubicStage.processZeroCopy(input)
+		if err != nil {
+			return nil, fmt.Errorf("cubic stage processing failed: %w", err)
+		}
+		r.samplesOut += int64(len(output))
+		return output, nil
+	}
+
+	intermediate := input
+	var err error
+	if r.preStage != nil {
+		intermediate, err = r.preStage.processZeroCopy(input)
+		if err != nil {
+			return nil, fmt.Errorf("pre-stage processing failed: %w", err)
+		}
+	}
+
+	output := intermediate
+	if r.decimationStage != nil {
+		output, err = r.decimationStage.processZeroCopy(intermediate)
+		if err != nil {
+			return nil, fmt.Errorf("decimation stage processing failed: %w", err)
+		}
+	} else if r.polyphaseStage != nil {
+		output, err = r.polyphaseStage.processZeroCopy(intermediate)
+		if err != nil {
+			return nil, fmt.Errorf("polyphase stage processing failed: %w", err)
+		}
+	}
+
+	r.samplesOut += int64(len(output))
+	return output, nil
+}
+
+// Flush returns any remaining buffered samples.
+func (r *Resampler[F]) Flush() ([]F, error) {
+	// QualityQuick cubic stage holds a cubicLatencySamples-sample tail; drain it.
+	// The samplesOut accounting at the bottom of this method is on the FIR
+	// path only, so this branch must account for its own emitted tail:
+	// otherwise GetStatistics undercounts by the tail length now that cubic
+	// Flush emits a real tail instead of always being empty.
+	if r.cubicStage != nil {
+		output, err := r.cubicStage.Flush()
+		if err != nil {
+			return nil, err
+		}
+		r.samplesOut += int64(len(output))
+		return output, nil
+	}
+
+	var output []F
+	var err error
+
+	// Flush pre-stage
+	if r.preStage != nil {
+		intermediate, flushErr := r.preStage.Flush()
+		if flushErr != nil {
+			return nil, flushErr
+		}
+
+		// If we have a polyphase stage, process the flushed samples
+		if r.polyphaseStage != nil && len(intermediate) > 0 {
+			output, err = r.polyphaseStage.Process(intermediate)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			output = intermediate
+		}
+	}
+
+	// Flush decimation stage (for integer downsampling)
+	if r.decimationStage != nil {
+		decimFlush, err := r.decimationStage.Flush()
+		if err != nil {
+			return nil, err
+		}
+		output = append(output, decimFlush...)
+	}
+
+	// Flush polyphase stage
+	if r.polyphaseStage != nil {
+		polyFlush, err := r.polyphaseStage.Flush()
+		if err != nil {
+			return nil, err
+		}
+		output = append(output, polyFlush...)
+	}
+
+	r.samplesOut += int64(len(output))
+	return output, nil
+}
+
+// Reset clears internal state.
+func (r *Resampler[F]) Reset() {
+	if r.cubicStage != nil {
+		r.cubicStage.Reset()
+	}
+	if r.preStage != nil {
+		r.preStage.Reset()
+	}
+	if r.decimationStage != nil {
+		r.decimationStage.Reset()
+	}
+	if r.polyphaseStage != nil {
+		r.polyphaseStage.Reset()
+	}
+	r.samplesIn = 0
+	r.samplesOut = 0
+}
+
+// GetRatio returns the resampling ratio.
+func (r *Resampler[F]) GetRatio() float64 {
+	return r.ratio
+}
+
+// GetStatistics returns processing statistics.
+func (r *Resampler[F]) GetStatistics() map[string]int64 {
+	return map[string]int64{
+		"samplesIn":  r.samplesIn,
+		"samplesOut": r.samplesOut,
+	}
+}
+
+// StartupDeficit returns the startup deficit in output samples, un-rounded.
+// Output is time-aligned (output sample n corresponds to input time n/ratio),
+// so the deficit is exactly the filters' group delay: each FIR stage starts
+// with half a window of implicit zeros and withholds output only until the
+// rest of the window has real input. It exists so multi-stage pipelines can accumulate each stage's fractional
+// deficit and round once at the end, avoiding the per-stage rounding error
+// that accrues when every stage rounds to an integer before summing. Latency
+// wraps this with math.Ceil.
+func (r *Resampler[F]) StartupDeficit() float64 {
+	if r.cubicStage != nil {
+		return r.cubicStage.StartupDeficit()
+	}
+	deficitIn := 0.0
+	if r.preStage != nil && r.preStage.factor > 1 {
+		deficitIn += float64(r.preStage.groupDelay) / float64(r.preStage.factor)
+	}
+	if r.decimationStage != nil && r.decimationStage.factor > 1 {
+		deficitIn += float64(r.decimationStage.prefill)
+	}
+	if r.polyphaseStage != nil {
+		intermediateFactor := 1.0
+		if r.preStage != nil && r.preStage.factor > 1 {
+			intermediateFactor = float64(r.preStage.factor)
+		}
+		// Group delay of the polyphase prototype in phase units: the whole
+		// samples of the prefill complement plus the initial phase offset.
+		ps := r.polyphaseStage
+		d := float64((ps.tapsPerPhase-1-ps.prefill)*ps.numPhases) + float64(ps.at0>>ps.phaseFracBits)
+		deficitIn += d / float64(ps.numPhases) / intermediateFactor
+	}
+	return deficitIn * r.ratio
+}
+
+// Latency returns the startup deficit in output samples: how many samples
+// the first Process calls withhold while the filter delay lines prime. It
+// equals the filters' group delay, and output is time-aligned, so priming a
+// FIFO with this many samples of silence delays the delivered stream by
+// exactly that many samples. Real-time consumers should prime their output
+// FIFO with this many samples of silence to keep fixed-size callbacks fed.
+func (r *Resampler[F]) Latency() int {
+	return int(math.Ceil(r.StartupDeficit()))
+}
+
+// isIntegerRatio checks if the ratio is an integer (within tolerance).
+func isIntegerRatio(ratio float64) bool {
+	const tolerance = 1e-9
+	rounded := math.Round(ratio)
+	return math.Abs(ratio-rounded) < tolerance && rounded >= 1.0
+}
