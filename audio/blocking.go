@@ -2,20 +2,22 @@ package audio
 
 import (
 	"github.com/gordonklaus/portaudio"
+	"sync"
 
-	"github.com/sqweek/sqribe/log"
 	. "github.com/sqweek/sqribe/core/types"
+	"github.com/sqweek/sqribe/log"
 )
 
 type blockingOps struct {
-	buf []int16
-	pos int
-	writes int
+	mu         sync.Mutex
+	buf        []int16
+	pos        int
+	writes     int
 	frameDelay FrameN
 }
 
 func blockOps(channels int) *blockingOps {
-	return &blockingOps{buf: make([]int16, 1024 * channels)}
+	return &blockingOps{buf: make([]int16, 1024*channels)}
 }
 
 func (block *blockingOps) Open(params portaudio.StreamParameters) (s *portaudio.Stream, err error) {
@@ -29,6 +31,8 @@ func (block *blockingOps) Open(params portaudio.StreamParameters) (s *portaudio.
 }
 
 func (block *blockingOps) Append(wav []int16) int {
+	block.mu.Lock()
+	defer block.mu.Unlock()
 	src := wav
 	for len(src) > 0 {
 		n := copy(block.buf[block.pos:], src)
@@ -44,15 +48,19 @@ func (block *blockingOps) Append(wav []int16) int {
 }
 
 func (block *blockingOps) Prepare() {
+	block.mu.Lock()
 	block.pos = 0
 	block.writes = 0
+	block.mu.Unlock()
 }
 
 func (block *blockingOps) Started() {
 }
 
 func (block *blockingOps) Index() (FrameN, bool) {
-	written := FrameN((block.writes * len(block.buf) + block.pos) / Channels)
+	block.mu.Lock()
+	written := FrameN((block.writes*len(block.buf) + block.pos) / Channels)
+	block.mu.Unlock()
 	if written < block.frameDelay {
 		return 0, true
 	}

@@ -1,9 +1,9 @@
 package main
 
 import (
+	"image"
 	"image/color"
 	"image/draw"
-	"image"
 
 	"github.com/skelterjohn/go.wde"
 
@@ -12,21 +12,21 @@ import (
 )
 
 type MixVolume struct {
-	Gain float64
+	Gain  float64
 	Muted bool
 }
 
 type MixConfig struct {
 	Master, Midi, Wave MixVolume
-	MuteMetronome bool
-	Staff map[*score.Staff]*StaffMix
-	preSolo map[*score.Staff]bool // records Muted status of staves before entering solo
+	MuteMetronome      bool
+	Staff              map[*score.Staff]*StaffMix
+	preSolo            map[*score.Staff]bool // records Muted status of staves before entering solo
 }
 
 type StaffMix struct {
-	Voice int
+	Voice    int
 	Velocity int
-	Muted bool
+	Muted    bool
 }
 
 var Mixer MixConfig
@@ -66,22 +66,24 @@ func (m *MixConfig) IsSolo(s *score.Staff) bool {
 }
 
 func (m *MixConfig) ToggleSolo(s *score.Staff) {
-	if m.IsSolo(s) {
-		for staff, mix := range m.Staff {
-			old := false
-			if m.preSolo != nil {
-				old, _ = m.preSolo[staff] // old remains false if staff not present in map
+	withMixerLock(func() {
+		if m.IsSolo(s) {
+			for staff, mix := range m.Staff {
+				old := false
+				if m.preSolo != nil {
+					old, _ = m.preSolo[staff] // old remains false if staff not present in map
+				}
+				mix.Muted = old
 			}
-			mix.Muted = old
+			m.preSolo = nil
+		} else {
+			m.preSolo = make(map[*score.Staff]bool)
+			for staff, mix := range m.Staff {
+				m.preSolo[staff] = mix.Muted
+				mix.Muted = (staff != s)
+			}
 		}
-		m.preSolo = nil
-	} else {
-		m.preSolo = make(map[*score.Staff]bool)
-		for staff, mix := range m.Staff {
-			m.preSolo[staff] = mix.Muted
-			mix.Muted = (staff != s)
-		}
-	}
+	})
 }
 
 type VolLayout struct {
@@ -91,13 +93,13 @@ type VolLayout struct {
 func (v *VolLayout) layout(r image.Rectangle) {
 	v.r = r
 	v.icon = centerV(leftH(box(16, 16), r), r)
-	v.slide = image.Rectangle{image.Pt(v.icon.Max.X + 1, r.Min.Y), r.Max}
+	v.slide = image.Rectangle{image.Pt(v.icon.Max.X+1, r.Min.Y), r.Max}
 }
 
 type MixWidget struct {
 	ImageWidget
 	mLevel, wLevel float64
-	layout struct {
+	layout         struct {
 		master, midi, wave VolLayout
 	}
 }
@@ -115,15 +117,14 @@ func (m *MixWidget) Levels(mid, wav float64) {
 }
 
 func (m *MixWidget) Toggle(mute *bool) {
-	toggle(mute)
+	withMixerLock(func() { toggle(mute) })
 	m.refresh <- m
 }
 
 func (m *MixWidget) AdjustGain(gain *float64, δ float64) {
-	(*gain) += δ
+	withMixerLock(func() { (*gain) += δ })
 	m.refresh <- m
 }
-
 
 func (m *MixWidget) LeftClick(mouse image.Point) {
 	m.click(mouse, -0.1)
@@ -143,11 +144,10 @@ func (m *MixWidget) click(mouse image.Point, δ float64) {
 	}
 }
 
-
 func (m *MixWidget) Draw(screen wde.Image, r image.Rectangle) {
 	dst, changed := m.Img(r)
 	if changed {
-		hbox := leftH(box(r.Dx(), (r.Dy() - 2) / 3), r)
+		hbox := leftH(box(r.Dx(), (r.Dy()-2)/3), r)
 		m.layout.master.layout(topV(hbox, r))
 		m.layout.midi.layout(centerV(hbox, r))
 		m.layout.wave.layout(botV(hbox, r))

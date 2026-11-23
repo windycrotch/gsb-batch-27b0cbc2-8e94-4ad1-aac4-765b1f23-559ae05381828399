@@ -1,105 +1,187 @@
 package main
 
 import (
-	"math"
+	"context"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sqweek/sqribe/audio"
 	"github.com/sqweek/sqribe/log"
 	"github.com/sqweek/sqribe/midi"
+	"github.com/sqweek/sqribe/playback"
 	"github.com/sqweek/sqribe/score"
+	"github.com/sqweek/sqribe/wave"
 
 	. "github.com/sqweek/sqribe/core/types"
 )
 
-type Samples struct {
-	buf []int16
-	frame, f0, fN FrameN
-}
+/* This file is the application glue around the deterministic playback engine
+** in github.com/sqweek/sqribe/playback. All concurrency, loop wrapping, event
+** alignment and shutdown logic lives in that package; here we only adapt the
+** global G.* services to its interfaces and keep the GUI feedback loop. */
 
-type BeatEv struct {
-	Frame FrameN
-	Next *BeatEv
-}
+// player is the single engine instance, configured once an audio output exists.
+var player *playback.Player
 
-type MidiOff struct {
-	End FrameN
-	Pitch uint8
-	Chan uint8
-}
-
-type MidiEv struct {
-	Start FrameN
-	Mix *StaffMix
-	Off MidiOff
-	Next *MidiEv
-}
-
-func midilst(f0, fN, fcur FrameN) (*MidiEv, *MidiEv) {
-	var evcur, evhead *MidiEv
-	evtail := &evhead
-	next := G.score.Iter(FrameRange{f0, fN})
-	var sn score.StaffNote
-	for next != nil {
-		sn, next = next()
-		start, _ := G.score.ToFrame(G.score.Beatf(sn.Note))
-		end, _ := G.score.ToFrame(G.score.EndBeatf(sn.Note))
-		if end <= f0 {
-			continue
-		} else if start > fN {
-			break
-		}
-		if start < f0 {
-			start = f0
-		}
-		if end > fN {
-			end = fN
-		}
-
-		mix := Mixer.For(sn.Staff)
-		*evtail = &MidiEv{start, mix, MidiOff{end, sn.Note.Pitch, 255}, nil}
-		if start >= fcur && evcur == nil {
-			evcur = *evtail
-		}
-		evtail = &((*evtail).Next)
+// playState mirrors the engine state for legacy call sites (UI key handling).
+// Reads go through playStateVal() rather than touching a raw global.
+func playStateVal() playback.State {
+	if player == nil {
+		return playback.StateStopped
 	}
-	return evhead, evcur
+	return player.State()
 }
 
-func beatlst(f0, fN, fcur FrameN) (*BeatEv, *BeatEv) {
-	var bcur, bhead *BeatEv
-	btail := &bhead
-	for _, frame := range G.score.BeatFrames() {
-		if frame < f0 {
-			continue
-		} else if frame > fN {
-			break
-		}
-		*btail = &BeatEv{frame, nil}
-		if frame > fcur && bcur == nil {
-			bcur = *btail
-		}
-		btail = &((*btail).Next)
+// ---- SampleSource adapter ----
+
+type waveSource struct{}
+
+func (waveSource) Frames(ctx context.Context, f0, fN FrameN) ([]int16, error) {
+	return G.wav.FramesCtx(ctx, f0, fN)
+}
+
+func (waveSource) ToSample(f FrameN) SampleN { return G.wav.ToSample(f) }
+func (waveSource) ToFrame(s SampleN) FrameN  { return G.wav.ToFrame(s) }
+func (waveSource) Channels() int             { return G.wav.Channels }
+
+// ---- AudioSink adapter ----
+
+type deviceSink struct{}
+
+func (deviceSink) Start(f0 FrameN) error { return audio.Play(f0) }
+func (deviceSink) Append(s []int16) error {
+	audio.Append(s)
+	return nil
+}
+func (deviceSink) Rewind(f0 FrameN) {
+	// audio.Play on an already-running stream advances the position baseline
+	if err := audio.Play(f0); err != nil {
+		log.AU.Println("rewind failed:", err)
 	}
-	return bhead, bcur
+}
+func (deviceSink) Stop()                        { audio.Stop() }
+func (deviceSink) PlayingFrame() (FrameN, bool) { return audio.PlayingFrame() }
+
+// ---- Synth adapter ----
+
+// synthAdapter wraps the global Synth and tracks held notes itself so
+// AllNotesOff can release every note even though fluidsynth has no direct
+// "all off" call. All access happens on the engine's feeder goroutine.
+type synthAdapter struct {
+	held map[noteKey]struct{}
 }
 
-// linear interpolation between 'from' -> zero -> 'to'
-func crossfade(from, to []int16, steps FrameN) []int16 {
-	nchan := FrameN(len(from))
-	out := make([]int16, nchan*steps)
-	for i := FrameN(0); i < steps; i++ {
-		α := 1.0 - float64(i + 1)/float64(steps + 1)
-		for j := FrameN(0); j < nchan; j++ {
-			if α > 0.5 {
-				out[nchan*i + j] = int16(float64(from[j]) * 2 * (α - 0.5))
-			} else {
-				out[nchan*i + j] = int16(float64(to[j]) * 2 * (0.5 - α))
+type noteKey struct {
+	ch, pitch uint8
+}
+
+func newSynthAdapter() *synthAdapter {
+	return &synthAdapter{held: make(map[noteKey]struct{})}
+}
+
+func (a *synthAdapter) NoteOn(ch, pitch, vel uint8) {
+	Synth.NoteOn(ch, pitch, vel)
+	a.held[noteKey{ch, pitch}] = struct{}{}
+}
+
+func (a *synthAdapter) NoteOff(ch, pitch uint8) {
+	Synth.NoteOff(ch, pitch)
+	delete(a.held, noteKey{ch, pitch})
+}
+
+func (a *synthAdapter) Inst(inst uint8) uint8 { return Synth.Inst(inst) }
+
+func (a *synthAdapter) WriteFrames(buf []int16) { Synth.WriteFrames(buf) }
+
+func (a *synthAdapter) AllNotesOff() {
+	for k := range a.held {
+		Synth.NoteOff(k.ch, k.pitch)
+		delete(a.held, k)
+	}
+}
+
+// ---- EventSource adapter ----
+
+// scoreEvents builds engine event snapshots under the score's serialised
+// Snapshot lock and reads mixer state under mixerMu, so mid-playback edits
+// never produce a torn view.
+type scoreEvents struct {
+	mixerMu *sync.RWMutex
+}
+
+func (e scoreEvents) Beats(f0, fN FrameN) []FrameN {
+	var out []FrameN
+	G.score.Snapshot(func(s *score.Score) {
+		for _, f := range s.BeatFrames() {
+			if f < f0 {
+				continue
 			}
+			if f > fN {
+				break
+			}
+			out = append(out, f)
 		}
-	}
+	})
 	return out
 }
+
+func (e scoreEvents) Notes(f0, fN FrameN) []playback.NoteEvent {
+	var out []playback.NoteEvent
+	G.score.Snapshot(func(s *score.Score) {
+		next := s.Iter(FrameRange{f0, fN})
+		var sn score.StaffNote
+		for next != nil {
+			sn, next = next()
+			start, _ := s.ToFrame(s.Beatf(sn.Note))
+			end, _ := s.ToFrame(s.EndBeatf(sn.Note))
+			if end <= f0 {
+				continue
+			}
+			if start < f0 {
+				start = f0
+			}
+			if end > fN {
+				end = fN
+			}
+			mix := Mixer.For(sn.Staff)
+			out = append(out, playback.NoteEvent{
+				Start:    start,
+				End:      end,
+				Pitch:    sn.Note.Pitch,
+				Inst:     uint8(mix.Voice),
+				Velocity: uint8(mix.Velocity),
+				Muted:    mix.Muted,
+			})
+		}
+	})
+	return out
+}
+
+func (e scoreEvents) Levels() playback.MixLevels {
+	e.mixerMu.RLock()
+	defer e.mixerMu.RUnlock()
+	return playback.MixLevels{
+		Master:        Mixer.Master.Gain,
+		Midi:          Mixer.Midi.Gain,
+		Wave:          Mixer.Wave.Gain,
+		MuteMidi:      Mixer.Midi.Muted,
+		MuteWave:      Mixer.Wave.Muted,
+		MuteMetronome: Mixer.MuteMetronome,
+	}
+}
+
+// mixerMu guards the Mixer fields read during playback against UI mutations.
+var mixerMu sync.RWMutex
+
+// withMixerLock runs a mixer mutation under the same lock the engine reads with.
+func withMixerLock(fn func()) {
+	mixerMu.Lock()
+	defer mixerMu.Unlock()
+	fn()
+}
+
+// PlayChange / coalescing retained for the score subscription plumbing.
 
 type PlayChange struct {
 	beat, note bool
@@ -118,13 +200,13 @@ func (pc *PlayChange) Update(event interface{}) {
 	}
 }
 
-func coalesced(out chan PlayChange) chan interface{} {
+func coalesced(out chan playback.Change) chan interface{} {
 	in := make(chan interface{})
 	go coalesce(in, out)
 	return in
 }
 
-func coalesce(in chan interface{}, out chan PlayChange) {
+func coalesce(in chan interface{}, out chan playback.Change) {
 	defer close(out)
 	changes := PlayChange{}
 	for in != nil {
@@ -143,36 +225,45 @@ func coalesce(in chan interface{}, out chan PlayChange) {
 				} else {
 					in = nil
 				}
-			case out <- changes:
+			case out <- playback.Change{Beat: changes.beat, Note: changes.note}:
 				changes = PlayChange{}
 			}
 		}
 	}
 }
 
-const (
-	STOPPED = iota
-	PLAYING
-	STOPPING
-)
+// subKey uniquely identifies one session's score subscription so concurrent
+// sessions cannot clobber each other's plumb entries.
+type subKey struct{ id uint64 }
 
-/* globally mutable state... that's not thinking with channels :S */
-var playState int = STOPPED
+var subKeyCounter uint64
+
+func newSubKey() *subKey {
+	id := atomic.AddUint64(&subKeyCounter, 1)
+	return &subKey{id: id}
+}
+
+func initPlayer() {
+	if player != nil {
+		return
+	}
+	player = playback.NewPlayer(waveSource{}, deviceSink{}, newSynthAdapter(), scoreEvents{mixerMu: &mixerMu})
+}
 
 func playToggle() {
-	switch playState {
-	case PLAYING:
+	switch playStateVal() {
+	case playback.StatePlaying:
 		log.AU.Println("stopping playback")
-		playState = STOPPING
+		stopPlayback()
 		return
-	case STOPPING:
+	case playback.StateStopping:
 		return /* in transition; do nothing */
 	}
 
 	if G.wav == nil {
 		return
 	}
-	playState = PLAYING
+	initPlayer()
 	rng, loop := G.ww.SelectedTimeRange(), true
 	if rng.MinFrame() >= rng.MaxFrame() {
 		rng, loop = G.ww.WaveRange(), false
@@ -181,194 +272,85 @@ func playToggle() {
 	if cursor < rng.MinFrame() || cursor > rng.MaxFrame() {
 		cursor = rng.MinFrame()
 	}
-	play(rng, cursor, loop)
+	startPlayback(rng, cursor, loop)
 }
 
-func play(rng TimeRange, startPos FrameN, loop bool) {
+func startPlayback(rng TimeRange, startPos FrameN, loop bool) {
 	log.AU.Println("starting loop", rng.MinFrame(), rng.MaxFrame(), " @", startPos)
+	// a unique key per session ensures a stale feedback loop can never
+	// unsubscribe a newer session's score subscription.
+	subKey := newSubKey()
+	scorechan := make(chan playback.Change, 16)
+	in := coalesced(scorechan)
+	G.plumb.score.Sub(subKey, in)
 
-	/* wave sample prefetch thread */
-	sampch := make(chan Samples, 25)
+	forwardDone := make(chan struct{})
 	go func() {
-		bufsiz := FrameN(2048) // must be multiple of 64
-		var s Samples
-		s.frame = startPos
-		for playState == PLAYING {
-			/* re-evaluate f0/fN each iteration in case a bounding beat moves */
-			s.f0, s.fN = rng.MinFrame(), rng.MaxFrame()
-			if s.frame + bufsiz > s.fN {
-				// pad to nearest 64th frame, minimum 20 frames
-				nfPad := 19 + (64 - ((s.fN - s.frame + 1) + 19) % 64)
-				wave := G.wav.Frames(s.frame, s.fN)
-				frame0 := G.wav.Frames(s.f0, s.f0)
-				s.buf = make([]int16, len(wave) + int(nfPad)*len(frame0))
-				copy(s.buf, wave)
-				copy(s.buf[len(wave):], crossfade(wave[len(wave) - len(frame0):], frame0, nfPad))
-				if !loop {
-					playState = STOPPING
-				}
-			} else {
-				s.buf = G.wav.Frames(s.frame, s.frame + bufsiz - 1)
-			}
-			nf := G.wav.ToFrame(SampleN(len(s.buf)))
-			sampch <- s
-			s.frame += nf
-			if s.frame >= s.fN {
-				s.frame = s.f0
+		defer close(forwardDone)
+		for c := range scorechan {
+			if player != nil {
+				player.NotifyChange(c)
 			}
 		}
-		close(sampch)
 	}()
-	if err := audio.Play(startPos); err != nil {
-		log.AU.Println("couldn't start stream:", err)
-		playState = STOPPED
+	teardown := func() {
+		G.plumb.score.Unsub(subKey)
+		<-forwardDone
+	}
+
+	err := player.Start(playback.Range{Min: rng.MinFrame(), Max: rng.MaxFrame()}, startPos, loop)
+	if err != nil {
+		log.AU.Println("couldn't start playback:", err)
+		teardown()
 		return
 	}
-	scorechan := make(chan PlayChange)
-	G.plumb.score.Sub(&playState, coalesced(scorechan))
-
-	var mpeak, wpeak float64 = 0, 0
-	/* synth & sample feeding thread */
-	go func() {
-		var in Samples
-		var cutoff FrameN
-		woodblock := Synth.Inst(midi.InstWoodblock)
-		bhead, bev := beatlst(rng.MinFrame(), rng.MaxFrame(), startPos)
-		bon := false
-		nf := FrameN(64)
-		bufsiz := int(G.wav.ToSample(nf))
-		mbuf := make([]int16, bufsiz)
-		evhead, mev := midilst(rng.MinFrame(), rng.MaxFrame(), startPos)
-		offlist := make([]MidiOff, 0, 32)
-		for playState == PLAYING {
-			if len(in.buf) == 0 {
-				prevframe := in.frame
-				in = <-sampch
-				if len(in.buf) < bufsiz || len(in.buf) % bufsiz != 0 {
-					log.AU.Println("stopping: prefetch samples sent in non-64 frame multiple", len(in.buf))
-					playState = STOPPING
-					break
-				}
-				select {
-				case changed := <-scorechan:
-					start := time.Now()
-					if changed.beat {
-						bhead, bev = beatlst(in.f0, in.fN, in.frame)
-					}
-					if changed.note || changed.beat {
-						evhead, mev = midilst(in.f0, in.fN, in.frame)
-					}
-					log.AU.Printf("playback change processed in %v (beats:%t notes:%t)", time.Now().Sub(start), changed.beat, changed.note)
-				default:
-				}
-				if prevframe > in.frame {
-					/* we just looped back around */
-					mev = evhead
-					bev = bhead
-					audio.Play(in.frame)
-				}
-				cutoff = in.frame
-			}
-			buf := in.buf[:bufsiz]
-			in.buf = in.buf[bufsiz:]
-			cutoff += nf
-
-			/* turn notes off first so notes at the same pitch directly following
-			** one another don't get truncated */
-			for j := len(offlist) - 1; j >= 0; j-- {
-				// XXX sorted list might be simpler?
-				if offlist[j].End < cutoff {
-					Synth.NoteOff(offlist[j].Chan, offlist[j].Pitch)
-					if j == len(offlist) - 1 {
-						offlist = offlist[:j]
-					} else {
-						copy(offlist[j:], offlist[j+1:])
-					}
-				}
-			}
-			/* metronome */
-			if bon {
-				Synth.NoteOff(woodblock, midi.PitchF6)
-				bon = false
-			} else if !Mixer.MuteMetronome {
-				for bev != nil && bev.Frame < cutoff {
-					if !bon {
-						Synth.NoteOn(woodblock, midi.PitchF6, 120)
-						bon = true
-					}
-					bev = bev.Next
-				}
-			}
-			/* user placed notes */
-			for mev != nil && mev.Start < cutoff {
-				if !mev.Mix.Muted {
-					mev.Off.Chan = Synth.Inst(uint8(mev.Mix.Voice))
-					Synth.NoteOn(mev.Off.Chan, mev.Off.Pitch, uint8(mev.Mix.Velocity))
-					offlist = append(offlist, mev.Off)
-				}
-				mev = mev.Next
-			}
-
-			Synth.WriteFrames(mbuf)
-			α, β := 0.0, 0.0
-			if !Mixer.Wave.Muted {
-				α = Mixer.Wave.Gain
-			}
-			if !Mixer.Midi.Muted {
-				β = Mixer.Midi.Gain
-			}
-			γ := Mixer.Master.Gain
-			agc := 1.0
-			for j := 0; j < bufsiz; j++ {
-				w, m := γ * α * float64(buf[j]), γ * β * float64(mbuf[j])
-				wpeak = math.Max(wpeak, math.Abs(w))
-				mpeak = math.Max(mpeak, math.Abs(m))
-				if math.Abs(agc*(w + m)) > 32700 {
-					f := math.Abs(w + m) / 32700
-					for k := j - 1; k >= 0; k-- {
-						mbuf[k] = int16(float64(mbuf[k]) / f)
-					}
-					agc /= f
-				}
-				mbuf[j] = int16(agc*(w + m))
-			}
-			if agc != 1.0 {
-				Mixer.Master.Gain = γ * agc
-			}
-			audio.Append(mbuf)
-		}
-		for _, ev := range(offlist) {
-			Synth.NoteOff(ev.Chan, ev.Pitch)
-		}
-		for _ = range(sampch) {
-			// drain channel
-		}
-		G.plumb.score.Unsub(&playState)
-		audio.Stop()
-		playState = STOPPED
-	}()
-	//TODO wait for ring buffer to fill up a bit before kicking off audio
-	/* gui feedback thread */
-	go func() {
-		for {
-			f, playing := audio.PlayingFrame()
-			if !playing {
-				if playState == PLAYING && f != 0 {
-					/* we think we're playing, but the audio callback hasn't
-					 * run for awhile. just stop. */
-					log.AU.Println("stopping: lost audio callback")
-					playState = STOPPING
-				}
-				break
-			}
-			G.ww.SetCursorByFrame(f, !loop)
-			m, w := mpeak, wpeak
-			mpeak, wpeak = 0, 0
-			G.mixw.Levels(m/32700, w/32700)
-			time.Sleep(66 * time.Millisecond)
-		}
-	}()
+	go feedbackLoop(loop, teardown)
 }
 
+func stopPlayback() {
+	// the feedback loop observes the device stop and performs the matching
+	// subscription teardown; here we only halt the engine.
+	player.Stop()
+}
 
+/* feedbackLoop drives the GUI cursor and level meters while a session runs. It
+** exits as soon as the device reports it has stopped, and asks the engine to
+** wind down if the audio callback was lost unexpectedly. */
+func feedbackLoop(loop bool, teardown func()) {
+	defer teardown()
+	var mpeak, wpeak float64
+	for {
+		f, playing := audio.PlayingFrame()
+		if !playing {
+			if player != nil && player.State() == playback.StatePlaying && f != 0 {
+				log.AU.Println("stopping: lost audio callback")
+				player.Stop()
+			}
+			return
+		}
+		G.ww.SetCursorByFrame(f, !loop)
+		peaks := player.Peaks()
+		if peaks.Midi > mpeak {
+			mpeak = peaks.Midi
+		}
+		if peaks.Wave > wpeak {
+			wpeak = peaks.Wave
+		}
+		G.mixw.Levels(mpeak/32700, wpeak/32700)
+		mpeak, wpeak = 0, 0
+		time.Sleep(66 * time.Millisecond)
+	}
+}
 
+// SetLoopRange applies a range adjustment (e.g. the user dragging the time
+// axis) to the running engine. Returns false when nothing is playing.
+func SetLoopRange(rng TimeRange) bool {
+	if player == nil {
+		return false
+	}
+	return player.SetRange(playback.Range{Min: rng.MinFrame(), Max: rng.MaxFrame()})
+}
+
+// silence unused import guards if midi is only referenced elsewhere
+var _ = midi.InstWoodblock
+var _ = wave.ErrCacheEOF

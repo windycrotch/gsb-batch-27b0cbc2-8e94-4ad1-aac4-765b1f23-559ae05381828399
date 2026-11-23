@@ -15,7 +15,7 @@ type BeatPoint interface {
 
 type BeatPt struct {
 	beat *BeatRef
-	α float64
+	α    float64
 }
 
 func (pt BeatPt) Beat() *BeatRef {
@@ -42,38 +42,38 @@ type UndoableOp interface {
 }
 
 type request struct {
-	op ScoreOp
+	op     ScoreOp
 	result chan interface{}
 }
 
 type historyItem struct {
-	op UndoableOp
+	op     UndoableOp
 	change interface{}
 }
 
 type Score struct {
 	BeatList
-	staves []*Staff
+	staves  []*Staff
 	beatLen *big.Rat
-	plumb *plumb.Port
+	plumb   *plumb.Port
 
 	updates chan request
 	history []historyItem
-	undone int // counter of number steps currently undone (for redo)
+	undone  int // counter of number steps currently undone (for redo)
 
 	quantApply chan chan bool
-	quantCalc chan chan QuantizeBeats
+	quantCalc  chan chan QuantizeBeats
 }
 
 type Measure struct {
-	nbeats int /* length of measure */
-	notes []Note /* sorted temporally */
+	nbeats int    /* length of measure */
+	notes  []Note /* sorted temporally */
 }
 
 func MkScore(plumb *plumb.Port) *Score {
-	score := Score {
+	score := Score{
 		beatLen: big.NewRat(1, 4),
-		plumb: plumb,
+		plumb:   plumb,
 		updates: make(chan request),
 		history: make([]historyItem, 0, 32),
 	}
@@ -83,13 +83,13 @@ func MkScore(plumb *plumb.Port) *Score {
 			req.result <- change
 			if op, ok := req.op.(UndoableOp); ok && change != nil {
 				if score.undone != 0 {
-					score.history = score.history[0:len(score.history) - score.undone]
+					score.history = score.history[0 : len(score.history)-score.undone]
 					score.undone = 0
 				}
 				if len(score.history) == cap(score.history) {
 					// forget oldest change
 					copy(score.history[0:], score.history[1:])
-					score.history = score.history[:len(score.history) - 1]
+					score.history = score.history[:len(score.history)-1]
 				}
 				score.history = append(score.history, historyItem{op, change})
 			}
@@ -114,6 +114,26 @@ func (score *Score) Unsub(origin interface{}) {
 	score.plumb.Unsub(origin)
 }
 
+/* Snapshot runs fn against the score from the serialised update goroutine, so
+** callers that read the linked beat list and staff notes (e.g. the playback
+** engine rebuilding its event tables mid-playback) cannot race an editing
+** operation. It blocks until the snapshot has been taken. The supplied closure
+** must not retain score pointers beyond the call or block on other goroutines. */
+func (score *Score) Snapshot(fn func(s *Score)) {
+	result := make(chan interface{}, 1)
+	score.updates <- request{op: snapshotOp{fn}, result: result}
+	<-result
+}
+
+type snapshotOp struct {
+	fn func(s *Score)
+}
+
+func (op snapshotOp) apply(s *Score) interface{} {
+	op.fn(s)
+	return nil
+}
+
 /* returns true if the op actually changed something */
 func (score *Score) update(op ScoreOp) bool {
 	req := request{op, make(chan interface{})}
@@ -134,14 +154,14 @@ func (score *Score) Undo() bool {
 	return score.update(&UndoOp{})
 }
 
-type UndoOp struct {}
+type UndoOp struct{}
 
 func (op *UndoOp) apply(score *Score) interface{} {
 	if score.undone >= len(score.history) {
 		return nil // nothing left to undo
 	}
 	score.undone++
-	item := score.history[len(score.history) - score.undone]
+	item := score.history[len(score.history)-score.undone]
 	item.op.undo(score)
 	return item.change
 }
@@ -156,7 +176,7 @@ func (op *RedoOp) apply(score *Score) interface{} {
 	if score.undone == 0 {
 		return false
 	}
-	item := score.history[len(score.history) - score.undone]
+	item := score.history[len(score.history)-score.undone]
 	item.op.apply(score)
 	score.undone--
 	return item.change

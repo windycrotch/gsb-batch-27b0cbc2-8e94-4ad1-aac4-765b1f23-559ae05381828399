@@ -1,13 +1,14 @@
 package main
 
 import (
+	"fmt"
 	"image"
 	"math/big"
-	"fmt"
 
 	"github.com/skelterjohn/go.wde"
 
 	"github.com/sqweek/sqribe/midi"
+	"github.com/sqweek/sqribe/playback"
 	"github.com/sqweek/sqribe/score"
 	"github.com/sqweek/sqribe/wave"
 
@@ -26,7 +27,7 @@ const (
 	VIEWPOS
 	LAYOUT
 	MAXBIT
-	RESET // clears layout state - not included in EVERYTHING
+	RESET                 // clears layout state - not included in EVERYTHING
 	EVERYTHING changeMask = MAXBIT - 1
 )
 
@@ -69,19 +70,19 @@ func (p *noteProspect) mkNote(sc *score.Score, duration *big.Rat) (*score.Note, 
 
 type noteDrag struct {
 	Δpitch int8
-	Δbeat *big.Rat
+	Δbeat  *big.Rat
 }
 
 type mouseState struct {
-	cursor wde.Cursor
-	dragFn DragFn
-	note *noteProspect
-	ndelta *noteDrag
+	cursor     wde.Cursor
+	dragFn     DragFn
+	note       *noteProspect
+	ndelta     *noteDrag
 	rectSelect *image.Rectangle
 }
 
 type FramePos struct {
-	f0 FrameN
+	f0   FrameN
 	ppix int
 }
 
@@ -89,29 +90,29 @@ type WaveWidget struct {
 	WidgetCore
 
 	/* data related state */
-	wav *wave.Waveform
-	score *score.Score
+	wav      *wave.Waveform
+	score    *score.Score
 	iolisten <-chan *wave.Chunk
 
 	/* view related state */
-	pos FramePos
+	pos       FramePos
 	selection TimeRange
-	rect WaveLayout
-	notesel map[*score.Note]*score.Staff
-	snarf map[*score.Staff] []*score.Note // the cut/copy buffer
+	rect      WaveLayout
+	notesel   map[*score.Note]*score.Staff
+	snarf     map[*score.Staff][]*score.Note // the cut/copy buffer
 	pasteMode bool
-	beatdrag map[*score.BeatRef]FrameN
+	beatdrag  map[*score.BeatRef]FrameN
 
 	/* renderer related state */
 	renderstate struct {
-		img *image.RGBA
-		waveRulers *image.RGBA
-		changed changeMask
-		cursor *image.RGBA
+		img         *image.RGBA
+		waveRulers  *image.RGBA
+		changed     changeMask
+		cursor      *image.RGBA
 		cursorPrevX int
 	}
 	mouse struct {
-		pos image.Point
+		pos   image.Point
 		state *mouseState
 	}
 	cursorX int
@@ -138,6 +139,10 @@ func (ww *WaveWidget) changed(mask changeMask, ev interface{}) {
 func (ww *WaveWidget) SelectAudio(sel TimeRange) {
 	ww.selection = sel
 	G.plumb.selection.C <- sel
+	// keep a running loop aligned with the latest selection immediately
+	if player != nil && player.State() == playback.StatePlaying {
+		SetLoopRange(sel)
+	}
 	ww.changed(SELXN, sel)
 }
 
@@ -181,7 +186,7 @@ func (ww *WaveWidget) SetWaveform(wav *wave.Waveform) *wave.Waveform {
 				if chunk == nil {
 					ww.ScrollPixels(0)
 				} else {
-					frng:= ww.pos.Range(ww.rect.wave.Dx())
+					frng := ww.pos.Range(ww.rect.wave.Dx())
 					s0, sN := wav.SampleRange(frng.MinFrame(), frng.MaxFrame())
 					if chunk.Intersects(s0, sN) {
 						ww.changed(WAV, chunk)
@@ -190,7 +195,7 @@ func (ww *WaveWidget) SetWaveform(wav *wave.Waveform) *wave.Waveform {
 			}
 		}()
 	}
-	ww.changed(WAV | VIEWPOS, wav)
+	ww.changed(WAV|VIEWPOS, wav)
 	return old
 }
 
@@ -240,7 +245,7 @@ func (ww *WaveWidget) SetScore(sc *score.Score) *score.Score {
 		G.plumb.selection.Sub(&sc, selxn)
 		sc.InitQuantizer(selxn)
 	}
-	ww.changed(SCALE | LAYOUT, sc)
+	ww.changed(SCALE|LAYOUT, sc)
 	return old
 }
 
@@ -260,7 +265,7 @@ func (ww *WaveWidget) SelectedNotes() []score.StaffNote {
 }
 
 func (pos *FramePos) Range(dx int) FrameRange {
-	return FrameRange{pos.f0, pos.f0 + FrameN(pos.ppix * dx)}
+	return FrameRange{pos.f0, pos.f0 + FrameN(pos.ppix*dx)}
 }
 
 func (ww *WaveWidget) SetCursorByFrame(frame FrameN, follow bool) {
@@ -279,7 +284,7 @@ func (ww *WaveWidget) WaveRange() TimeRange {
 }
 
 func (ww *WaveWidget) FrameAtCursor() FrameN {
-       return ww.pos.FrameAtDx(ww.cursorX - ww.rect.wave.Min.X)
+	return ww.pos.FrameAtDx(ww.cursorX - ww.rect.wave.Min.X)
 }
 
 func (ww *WaveWidget) FrameAtPixel(x int) FrameN {
@@ -287,14 +292,14 @@ func (ww *WaveWidget) FrameAtPixel(x int) FrameN {
 }
 
 func (pos *FramePos) FrameAtDx(dx int) FrameN {
-	return pos.f0 + FrameN(dx * pos.ppix + pos.ppix/2)
+	return pos.f0 + FrameN(dx*pos.ppix+pos.ppix/2)
 }
 
 func (pos *FramePos) DxAtFrame(frame FrameN) int {
-	return int(frame - pos.f0) / pos.ppix
+	return int(frame-pos.f0) / pos.ppix
 }
 
-func (ww *WaveWidget) areAllSelected(notes... score.StaffNote) bool {
+func (ww *WaveWidget) areAllSelected(notes ...score.StaffNote) bool {
 	for _, sn := range notes {
 		if _, ok := ww.notesel[sn.Note]; !ok {
 			return false
@@ -303,7 +308,7 @@ func (ww *WaveWidget) areAllSelected(notes... score.StaffNote) bool {
 	return true
 }
 
-func (ww *WaveWidget) toggleNotes(clear bool, notes... score.StaffNote) {
+func (ww *WaveWidget) toggleNotes(clear bool, notes ...score.StaffNote) {
 	allSelected := !clear && ww.areAllSelected(notes...)
 	if allSelected {
 		ww.deselectNotes(notes...)
@@ -312,7 +317,7 @@ func (ww *WaveWidget) toggleNotes(clear bool, notes... score.StaffNote) {
 	}
 }
 
-func (ww *WaveWidget) deselectNotes(notes... score.StaffNote) {
+func (ww *WaveWidget) deselectNotes(notes ...score.StaffNote) {
 	newsel := make(map[*score.Note]*score.Staff)
 	for note, staff := range ww.notesel {
 		newsel[note] = staff
@@ -323,7 +328,7 @@ func (ww *WaveWidget) deselectNotes(notes... score.StaffNote) {
 	ww.notesel = newsel
 }
 
-func (ww *WaveWidget) selectNotes(clear bool, notes... score.StaffNote) {
+func (ww *WaveWidget) selectNotes(clear bool, notes ...score.StaffNote) {
 	newsel := make(map[*score.Note]*score.Staff)
 	if !clear {
 		for note, staff := range ww.notesel {
@@ -353,7 +358,7 @@ func (ww *WaveWidget) noteAtPixel(staff *score.Staff, pos image.Point) *notePros
 }
 
 func (ww *WaveWidget) noteAtPixelWithMid(staff *score.Staff, pos image.Point, mid int) *noteProspect {
-	noteY := snapto(pos.Y, mid, yspacing / 2)
+	noteY := snapto(pos.Y, mid, yspacing/2)
 	delta := (mid - noteY) / (yspacing / 2)
 
 	frame := ww.FrameAtPixel(pos.X)
@@ -387,7 +392,7 @@ func (ww *WaveWidget) calcMouseState(pos image.Point) *mouseState {
 	if staff, slayout := ww.staffContaining(pos); staff != nil {
 		state.note = ww.noteAtPixelWithMid(staff, pos, slayout.Mid())
 	} else {
-		state.note = nil;
+		state.note = nil
 	}
 	return state
 }
@@ -397,7 +402,7 @@ func (ww *WaveWidget) ScrollToFrame(f FrameN) int {
 }
 
 func (ww *WaveWidget) ScrollToPixel(x int) int {
-	return ww.ScrollPixels(x - ww.rect.wave.Min.X - int(0.05 * float64(ww.rect.wave.Dx())))
+	return ww.ScrollPixels(x - ww.rect.wave.Min.X - int(0.05*float64(ww.rect.wave.Dx())))
 }
 
 func (ww *WaveWidget) Scroll(amount float64) int {
@@ -409,13 +414,13 @@ func (ww *WaveWidget) ScrollPixels(dx int) int {
 		return 0
 	}
 	shift := FrameN(dx * ww.pos.ppix)
-	target := ww.wav.Clip(ww.pos.f0 + shift, FrameN((ww.rect.wave.Dx() + 1) * ww.pos.ppix))
+	target := ww.wav.Clip(ww.pos.f0+shift, FrameN((ww.rect.wave.Dx()+1)*ww.pos.ppix))
 	if target == ww.pos.f0 {
 		return 0
 	}
 	ww.pos.f0 = target
 	ww.mouse.state = nil
-	ww.changed(WAV | CURSOR | VIEWPOS, &ww.pos)
+	ww.changed(WAV|CURSOR|VIEWPOS, &ww.pos)
 	return int(target - ww.pos.f0)
 }
 
@@ -432,7 +437,7 @@ func (ww *WaveWidget) Zoom(factor float64) float64 {
 		fpp = 1
 	}
 	if wav := ww.wav; wav != nil && ww.rect.wave.Dx() > 0 {
-		max_frames := (12*1024*1024 / 10 / 2 / 2) * 9
+		max_frames := (12 * 1024 * 1024 / 10 / 2 / 2) * 9
 		max_fpp := int(max_frames / ww.rect.wave.Dx())
 		if fpp > max_fpp {
 			fpp = max_fpp
@@ -444,10 +449,10 @@ func (ww *WaveWidget) Zoom(factor float64) float64 {
 		x := ww.mouse.pos.X
 		frameAtMouse := ww.FrameAtPixel(x)
 		dx := x - ww.rect.wave.Min.X
-		ww.pos.f0 = frameAtMouse - FrameN(dx * fpp)
+		ww.pos.f0 = frameAtMouse - FrameN(dx*fpp)
 		ww.pos.ppix = fpp
 		ww.mouse.state = nil
-		ww.changed(WAV | CURSOR | VIEWPOS, &ww.pos)
+		ww.changed(WAV|CURSOR|VIEWPOS, &ww.pos)
 	}
 	return delta
 }
@@ -459,7 +464,7 @@ func (ww *WaveWidget) CapturePos() (FrameN, int) {
 func (ww *WaveWidget) RestorePos(f0 FrameN, ppix int) {
 	ww.pos.f0 = f0
 	ww.pos.ppix = ppix
-	ww.changed(WAV | CURSOR | VIEWPOS, &ww.pos)
+	ww.changed(WAV|CURSOR|VIEWPOS, &ww.pos)
 }
 
 func (ww *WaveWidget) IsMinimised(staff *score.Staff) bool {
@@ -472,7 +477,7 @@ func (ww *WaveWidget) RestoreStaffView(minimised map[*score.Staff]bool) {
 }
 
 func (ww *WaveWidget) Snarf() {
-	snarf := make(map[*score.Staff] []*score.Note)
+	snarf := make(map[*score.Staff][]*score.Note)
 	for note, staff := range ww.notesel {
 		snarf[staff] = score.Merge(snarf[staff], note.Dup())
 	}
@@ -503,7 +508,7 @@ func (ww *WaveWidget) beatFrame(beat *score.BeatRef) FrameN {
 func (ww *WaveWidget) ToFrame(pt score.BeatPoint) FrameN {
 	b1 := pt.Beat()
 	f1, f2 := ww.beatFrame(b1), ww.beatFrame(b1.LNext())
-	return f1 + FrameN(pt.Offsetf() * float64(f2 - f1))
+	return f1 + FrameN(pt.Offsetf()*float64(f2-f1))
 }
 
 func (ww *WaveWidget) Status() string {

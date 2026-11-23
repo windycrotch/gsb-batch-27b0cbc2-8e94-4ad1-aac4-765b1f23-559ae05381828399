@@ -13,6 +13,7 @@ import (
 	_ "github.com/skelterjohn/go.wde/init"
 	"github.com/sqweek/sqribe/audio"
 	"github.com/sqweek/sqribe/log"
+	"github.com/sqweek/sqribe/playback"
 	"github.com/sqweek/sqribe/score"
 )
 
@@ -127,7 +128,7 @@ func event(win wde.Window, redraw chan Widget, done chan bool, wg *sync.WaitGrou
 				G.score.RemoveNotes(G.ww.SelectedNotes()...)
 				G.ww.SetPasteMode(true)
 			case e.Chord == "control+o":
-				if playState == STOPPED {
+				if playStateVal() == playback.StateStopped {
 					var err error
 					var f string
 					if err = save(); err == nil {

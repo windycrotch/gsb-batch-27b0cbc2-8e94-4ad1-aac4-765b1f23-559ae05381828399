@@ -110,7 +110,7 @@ func (ld *PendingLoad) Pivot() {
 		erri := <-ld.wavDone // wait for audio to finish loading
 		switch err := erri.(type) {
 		case wave.IOError:
-			alert(err.Error())
+			alert("%s", err.Error())
 		case wave.DecodeError:
 			 /* some mp3s apparently contain stupid stuff like ID3 tags in the middle of
 			 * the last data frame, so a user alert is not raised here... */
