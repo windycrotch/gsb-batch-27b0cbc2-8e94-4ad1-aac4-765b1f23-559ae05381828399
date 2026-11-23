@@ -1,6 +1,7 @@
 package db
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 
@@ -71,19 +72,35 @@ func (db *BoltDB) Get(keys []model.EncodedKey) (map[model.EncodedKey][]model.Tab
 	return res, errors.Wrap(err, "an error occurred when reading from bolt")
 }
 
-// Set stores the list of (key, value) into the bolt file
+// Set stores the list of (key, value) into the bolt file.
+// Writes are idempotent: a (key, value) pair that is already stored for the
+// same song is skipped instead of being appended again. Values belonging to
+// other songs sharing the same key are always kept, so cross-song data can
+// never be lost by the de-duplication.
 func (db *BoltDB) Set(batch map[model.EncodedKey]model.TableValue) error {
 	err := db.Update(func(tx *bbolt.Tx) error {
 		b := tx.Bucket(db.fingerprintBucket)
 
 		for k, v := range batch {
-			// We append the value to the existing array
-			// this is because multiple songs can have the same keys
-			// TODO: check if the value is not already in the database array to avoid having a same value multiple times
 			rawKey := k.Bytes()
+			rawValue := v.Bytes()
 			existing := b.Get(rawKey)
 
-			if err := b.Put(rawKey, append(existing, v.Bytes()...)); err != nil {
+			// Skip the write if this exact record already belongs to a song.
+			// Multiple songs can still share the same key: their records are
+			// appended to the value list as long as they differ.
+			if containsTableValue(existing, rawValue) {
+				continue
+			}
+
+			// Copy the existing records into a fresh slice instead of appending
+			// to the bbolt-managed buffer directly: b.Get returns a read-only
+			// view over the memory mapped file that must never be modified.
+			updated := make([]byte, 0, len(existing)+len(rawValue))
+			updated = append(updated, existing...)
+			updated = append(updated, rawValue...)
+
+			if err := b.Put(rawKey, updated); err != nil {
 				return errors.Wrapf(err, "error setting (key: %v, val: %v)", k, v)
 			}
 		}
@@ -91,6 +108,17 @@ func (db *BoltDB) Set(batch map[model.EncodedKey]model.TableValue) error {
 	})
 
 	return errors.Wrap(err, "an error occurred when writing to bolt")
+}
+
+// containsTableValue reports whether the serialized value list raw contains
+// the serialized TableValue rawValue (each record is model.TableValueSize bytes).
+func containsTableValue(raw, rawValue []byte) bool {
+	for off := 0; off+model.TableValueSize <= len(raw); off += model.TableValueSize {
+		if bytes.Equal(raw[off:off+model.TableValueSize], rawValue) {
+			return true
+		}
+	}
+	return false
 }
 
 // GetSongID does a song name => songID lookup in the database
@@ -136,20 +164,27 @@ func (db *BoltDB) GetSong(songID uint32) (string, error) {
 	return name, errors.Wrap(err, "an error occurred when reading from bolt")
 }
 
-// SetSong stores a song name in the database and returns it's song ID
-// It first checks if the song is not already stored in the database
+// SetSong stores a song name in the database and returns its song ID.
+// It is idempotent: if the song is already registered, its existing ID is
+// returned and no new ID is ever allocated. The lookup and the registration
+// happen in a single transaction so concurrent calls for the same song cannot
+// create duplicate registrations.
 func (db *BoltDB) SetSong(song string) (uint32, error) {
-	// First check if we haven't the song in the db already
-	id, err := db.GetSongID(song)
-	if err == nil {
-		return id, nil
-	}
-
 	var songID uint32
-	err = db.Update(func(tx *bbolt.Tx) error {
+
+	err := db.Update(func(tx *bbolt.Tx) error {
 		b, err := tx.CreateBucketIfNotExists(db.songBucket)
 		if err != nil {
-			return errors.Wrapf(err, "error creating bucket")
+			return errors.Wrap(err, "error creating bucket")
+		}
+
+		// Reuse the existing ID when the song is already registered.
+		c := b.Cursor()
+		for k, v := c.First(); k != nil; k, v = c.Next() {
+			if string(v) == song {
+				songID = binary.LittleEndian.Uint32(k)
+				return nil
+			}
 		}
 
 		id, err := b.NextSequence()
@@ -158,9 +193,7 @@ func (db *BoltDB) SetSong(song string) (uint32, error) {
 		}
 
 		songID = uint32(id)
-		rawKey := itob(songID)
-
-		return errors.Wrap(b.Put(rawKey, []byte(song)), "error setting song")
+		return errors.Wrap(b.Put(itob(songID), []byte(song)), "error setting song")
 	})
 
 	return songID, errors.Wrap(err, "an error occurred when writing to bolt")
