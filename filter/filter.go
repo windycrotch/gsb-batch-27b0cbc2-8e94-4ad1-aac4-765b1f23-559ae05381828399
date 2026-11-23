@@ -64,19 +64,33 @@ type filterWithOpts struct {
 }
 
 func (t *filterWithOpts) With(key string, value expr.Expr) Filter {
+	// Copy the options into a fresh slice so the parent filter's options are never
+	// mutated through a shared backing array.
+	opts := make([]OptionValue, len(t.opts)+1)
+	copy(opts, t.opts)
+	opts[len(t.opts)] = OptionValue{Key: key, Val: value}
 	return &filterWithOpts{
 		name:    t.name,
 		outputs: t.outputs,
-		opts:    append(t.opts, OptionValue{Key: key, Val: value}),
+		opts:    opts,
 	}
 }
 
 func (t *filterWithOpts) String() string {
-	opts := make(map[string]string)
+	// Build the options deterministically in insertion order. If the same key is set
+	// multiple times, the last value wins but the key keeps its original position.
+	var keyvals []string
+	positions := make(map[string]int, len(t.opts))
 	for _, optValue := range t.opts {
-		opts[optValue.Key] = optValue.Val.String()
+		pair := fmt.Sprintf("%s=%s", optValue.Key, formatTransformOptionValue(optValue.Val.String()))
+		if pos, ok := positions[optValue.Key]; ok {
+			keyvals[pos] = pair
+		} else {
+			positions[optValue.Key] = len(keyvals)
+			keyvals = append(keyvals, pair)
+		}
 	}
-	return formatTransform(t.name, opts)
+	return formatTransform(t.name, keyvals)
 }
 
 func (t *filterWithOpts) Outputs() int {
@@ -84,22 +98,11 @@ func (t *filterWithOpts) Outputs() int {
 }
 
 // formatTransform formats a filter transform so that it conforms to the FFMpeg format
-func formatTransform(filterName string, opts map[string]string) string {
-	optsStr := formatTransformOptions(opts)
-	if len(optsStr) == 0 {
+func formatTransform(filterName string, keyvals []string) string {
+	if len(keyvals) == 0 {
 		return filterName
 	}
-	return fmt.Sprintf("%s=%s", filterName, optsStr)
-}
-
-// formatTransformOptions converts a map of keys and values into a string of options
-func formatTransformOptions(opts map[string]string) string {
-	var keyvals []string
-	for k, v := range opts {
-		pair := fmt.Sprintf("%s=%s", k, formatTransformOptionValue(v))
-		keyvals = append(keyvals, pair)
-	}
-	return strings.Join(keyvals, ":")
+	return fmt.Sprintf("%s=%s", filterName, strings.Join(keyvals, ":"))
 }
 
 // formatTransformOptionValue formats a single value to ensure it's properly escaped and quote-wrapped

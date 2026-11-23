@@ -76,9 +76,20 @@ func (p *implRunner) CommandString() (string, error) {
 }
 
 // Run executes the transcoding process and blocks the calling thread until the process is completed or failed.
-// If a chanProgress is provided, it will receive progress updates during the process's execution. When the process
-// completes, the progress channel will be closed automatically.
+//
+// If a progress callback is provided, it is invoked once per progress update emitted by FFmpeg, in
+// the exact order FFmpeg produced them. On success, the final invocation carries Done=true. If the
+// process fails or the context is canceled, no Done=true callback is ever delivered, and no callback
+// is invoked after Run returns.
+//
+// If ctx is canceled, Run kills the process, stops delivering progress updates, and returns the
+// context's error (context.Canceled or context.DeadlineExceeded), which is distinguishable from an
+// FFmpeg failure via errors.Is. An FFmpeg failure is returned as *FfmpegError.
 func (p *implRunner) Run(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	// Generate the FFmpeg arguments
 	args, err := p.runnable.RunnableArgs()
 	if err != nil {
@@ -106,6 +117,10 @@ func (p *implRunner) Run(ctx context.Context) error {
 	// Capture and buffer stderr
 	var stderrBuf []byte
 
+	// The last parsed progress state, retained so the terminal Done=true callback can be
+	// delivered by Run itself once the process is known to have succeeded.
+	var lastProgress Progress
+
 	// Parse the output into progress reports on the channel
 	// Also make sure we collect all of stderr before returning any error
 	var wg sync.WaitGroup
@@ -113,7 +128,7 @@ func (p *implRunner) Run(ctx context.Context) error {
 	go func() {
 		defer wg.Done()
 		if p.progressCallback != nil {
-			p.reportFFmpegProgress(stdout)
+			lastProgress = p.reportFFmpegProgress(ctx, stdout)
 		} else {
 			io.Copy(io.Discard, stdout)
 		}
@@ -129,28 +144,45 @@ func (p *implRunner) Run(ctx context.Context) error {
 	}
 
 	// Wait for the process to end
-	err = cmd.Wait()
+	waitErr := cmd.Wait()
 
-	// Wait for the error log to finish
+	// Wait for the output parsers to finish. This guarantees no progress callback is
+	// still in flight (or will ever be invoked) after Run returns.
 	wg.Wait()
 
+	// Cancellation takes precedence over the process's own exit status: if the context
+	// is done, the run was interrupted, so report the cancellation and never emit a
+	// completion callback.
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+
 	// If the process errored, return the error
-	if err != nil {
-		// If the context triggered the process to be killed, we want to see the context's error
-		// instead of the process's error
-		if ctx != nil && ctx.Err() != nil {
-			return ctx.Err()
-		}
+	if waitErr != nil {
 		return &FfmpegError{
 			ExitCode: cmd.ProcessState.ExitCode(),
 			Logs:     strings.Split(strings.TrimSpace(string(stderrBuf)), "\n"),
-			child:    err,
+			child:    waitErr,
 		}
+	}
+
+	// The process succeeded. Deliver the terminal Done=true callback as the very last
+	// progress update, synchronously, so it is guaranteed to be ordered after every
+	// other update and to never occur for a failed or canceled run.
+	if p.progressCallback != nil {
+		lastProgress.Done = true
+		lastProgress.Elapsed = time.Since(lastProgress.Started)
+		p.progressCallback(lastProgress)
 	}
 	return nil
 }
 
-func (p *implRunner) reportFFmpegProgress(processOutput io.Reader) {
+// reportFFmpegProgress parses FFmpeg's machine-readable progress stream, invoking the
+// progress callback once per update block, in stream order. Intermediate ("continue")
+// updates are delivered as they arrive, unless the context has been canceled. The
+// terminal ("end") update is withheld and its state returned, so the caller can deliver
+// it only after confirming the process exited successfully.
+func (p *implRunner) reportFFmpegProgress(ctx context.Context, processOutput io.Reader) Progress {
 	// Initialize the progress to empty
 	var progress Progress
 	progress.Started = time.Now()
@@ -190,10 +222,24 @@ func (p *implRunner) reportFFmpegProgress(processOutput io.Reader) {
 			progress.Done = (value == "end")
 		}
 
-		// If the key is "progress", send the current progress to the handler
-		if key == "progress" {
-			progress.Elapsed = time.Since(progress.Started)
-			p.progressCallback(progress)
+		// If the key is "progress", a complete update block has been received
+		if key != "progress" {
+			continue
 		}
+
+		// Withhold the terminal update: Run delivers it only on success
+		if progress.Done {
+			continue
+		}
+
+		// Once the context is canceled, no further updates may be delivered. Keep
+		// draining the stream so the process is never blocked on a full pipe.
+		if ctx.Err() != nil {
+			continue
+		}
+
+		progress.Elapsed = time.Since(progress.Started)
+		p.progressCallback(progress)
 	}
+	return progress
 }
