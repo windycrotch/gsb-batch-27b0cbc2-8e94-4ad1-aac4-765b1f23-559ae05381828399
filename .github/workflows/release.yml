@@ -1,0 +1,111 @@
+name: release
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: patch (default), minor, major, or an explicit stable version
+        required: false
+        default: patch
+        type: string
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+concurrency:
+  group: release
+  cancel-in-progress: false
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - id: version
+        env:
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ inputs.version }}
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if [[ "$EVENT" == workflow_dispatch ]]; then
+            [[ "$REF" == refs/heads/main ]] || { echo 'Release from main only.' >&2; exit 1; }
+            VERSION="${VERSION:-patch}"
+            case "$VERSION" in
+              patch|minor|major)
+                latest=$(gh api --paginate "repos/$GH_REPO/tags" --jq '.[].name' |
+                  sed -nE 's/^v((0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*))$/\1/p' |
+                  sort -t . -k1,1n -k2,2n -k3,3n | tail -n 1)
+                IFS=. read -r major minor patch <<< "${latest:-0.0.0}"
+                case "$VERSION" in
+                  patch) patch=$((patch + 1)) ;;
+                  minor) minor=$((minor + 1)); patch=0 ;;
+                  major) major=$((major + 1)); minor=0; patch=0 ;;
+                esac
+                VERSION="$major.$minor.$patch"
+                ;;
+            esac
+            TAG="v$VERSION"
+          fi
+          [[ "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          echo "Releasing $TAG"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+  build:
+    needs: version
+    uses: ./.github/workflows/distribution.yml
+    with:
+      version: ${{ needs.version.outputs.version }}
+  release:
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: peep-distribution
+          path: dist
+      - name: Assemble checksummed release assets
+        run: |
+          mkdir assets
+          cp dist/*.tar.gz dist/distribution/npm-tarballs/*.tgz assets/
+          cp dist/distribution/homebrew/peep.rb dist/distribution/aur/PKGBUILD assets/
+          cp dist/distribution/aur/.SRCINFO assets/peep.SRCINFO
+          cd assets
+          sha256sum -- *.tar.gz *.tgz peep.rb PKGBUILD peep.SRCINFO > checksums.txt
+      - name: Create immutable tag for manual release
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: v${{ needs.version.outputs.version }}
+          SHA: ${{ github.sha }}
+        run: |
+          # A retry may reuse this tag only at the original commit. Never move tags.
+          existing=$(gh api "repos/$GH_REPO/git/matching-refs/tags/$TAG" --jq ".[] | select(.ref == \"refs/tags/$TAG\") | .object.sha")
+          if test -n "$existing"; then
+            test "$existing" = "$SHA" || { echo 'Version tag belongs to another commit.' >&2; exit 1; }
+          else
+            gh api --method POST "repos/$GH_REPO/git/refs" -f ref="refs/tags/$TAG" -f sha="$SHA"
+          fi
+      - name: Publish versioned release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: v${{ needs.version.outputs.version }}
+        run: gh release create "$TAG" assets/* --verify-tag --title "peep $TAG" --generate-notes
+  publish:
+    needs: [version, release]
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Start package publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.version.outputs.version }}
+        # Keep publish.yml as the initiating workflow for npm's trusted identity.
+        run: gh workflow run publish.yml --repo "$GH_REPO" --ref "v$VERSION" -f version="$VERSION" -f channel=all

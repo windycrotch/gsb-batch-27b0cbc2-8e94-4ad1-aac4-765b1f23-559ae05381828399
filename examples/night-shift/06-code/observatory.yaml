@@ -1,0 +1,11 @@
+station: North Ridge
+shift: night
+instruments:
+  - name: optical telescope
+    state: tracking
+  - name: radio receiver
+    state: listening
+archive:
+  images: ../01-images
+  recordings: ../04-audiobook
+  checksum: sha256

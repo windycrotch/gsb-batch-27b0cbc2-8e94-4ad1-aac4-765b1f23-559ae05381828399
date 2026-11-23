@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 520 156" role="img" aria-labelledby="title desc">
+<title id="title">peep</title><desc id="desc">A mint terminal window with curious eyes, beside a rounded peep wordmark.</desc>
+<rect width="520" height="156" rx="28" fill="#101722"/>
+<g transform="translate(18 14)">
+<path d="M28 36h72v56H28z" fill="none" stroke="#58d6be" stroke-width="5" stroke-linejoin="round"/>
+<path d="M28 47h72" stroke="#58d6be" stroke-width="3"/><circle cx="36" cy="41.5" r="2" fill="#f4c070"/>
+<rect x="39" y="58" width="20" height="25" rx="10" fill="#58d6be"/><rect x="69" y="58" width="20" height="25" rx="10" fill="#58d6be"/>
+<circle cx="52" cy="69" r="5" fill="#101722"/><circle cx="82" cy="69" r="5" fill="#101722"/>
+</g>
+<!-- Outlined wordmark: no installed font required. -->
+<g fill="none" stroke="#e4eee9" stroke-width="10" stroke-linecap="round" stroke-linejoin="round">
+<path d="M166 110V58m0 22c0-31 40-31 40-8s-40 24-40 1"/>
+<path d="M229 74h39c0-30-40-28-40 0s27 29 39 15"/>
+<path d="M292 74h39c0-30-40-28-40 0s27 29 39 15"/>
+<path d="M355 110V58m0 22c0-31 40-31 40-8s-40 24-40 1"/>
+</g>
+<path d="M428 94h36" stroke="#58d6be" stroke-width="8" stroke-linecap="round"/>
+</svg>

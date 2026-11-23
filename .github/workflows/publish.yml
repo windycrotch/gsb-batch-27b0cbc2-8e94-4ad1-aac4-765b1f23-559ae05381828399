@@ -1,0 +1,128 @@
+name: publish packages
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Existing stable release version, without v
+        required: true
+        type: string
+      channel:
+        description: Distribution channel
+        required: true
+        type: choice
+        options: [all, npm, homebrew, aur]
+permissions:
+  contents: read
+concurrency:
+  group: publish-${{ inputs.channel }}
+  cancel-in-progress: false
+jobs:
+  npm:
+    if: inputs.channel == 'all' || inputs.channel == 'npm'
+    runs-on: ubuntu-latest
+    environment: distribution
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          registry-url: https://registry.npmjs.org
+      - run: bash scripts/fetch-release.sh "$VERSION" tmp/release
+        env:
+          VERSION: ${{ inputs.version }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+      - run: bash scripts/distribution.sh publish-npm tmp/release "$VERSION"
+        env:
+          VERSION: ${{ inputs.version }}
+          # Optional for initial publication; subsequent releases use npm OIDC.
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+  homebrew:
+    if: inputs.channel == 'all' || inputs.channel == 'homebrew'
+    runs-on: ubuntu-latest
+    environment: distribution
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash scripts/fetch-release.sh "$VERSION" tmp/release
+        env:
+          VERSION: ${{ inputs.version }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+      - name: Update Homebrew tap
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          test -n "$GH_TOKEN"
+          gh auth setup-git
+          gh repo clone lancekrogers/homebrew-tap tmp/tap
+          cd tmp/tap
+          if test -f Formula/peep.rb && cmp -s ../release/peep.rb Formula/peep.rb; then
+            echo "Homebrew already contains this release."
+            exit 0
+          fi
+          branch="peep-$VERSION"
+          if git show-ref --verify --quiet "refs/remotes/origin/$branch"; then
+            git switch --track -c "$branch" "origin/$branch"
+          else
+            git switch -c "$branch"
+          fi
+          mkdir -p Formula
+          cp ../release/peep.rb Formula/peep.rb
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add Formula/peep.rb
+          if ! git diff --cached --quiet; then
+            git commit -m "peep $VERSION"
+          fi
+          git push origin "$branch"
+          existing=$(gh pr list --repo lancekrogers/homebrew-tap --head "$branch" --state open --json url --jq '.[0].url // empty')
+          if test -n "$existing"; then
+            echo "Homebrew update already has a pull request: $existing"
+          else
+            existing=$(gh pr create --repo lancekrogers/homebrew-tap --head "peep-$VERSION" --title "peep $VERSION" --body "Install peep $VERSION from verified release archives. Includes embedded Mermaid and media dependencies.")
+          fi
+          # Only the generated formula is updated; retain the PR as release history.
+          gh pr merge "$existing" --repo lancekrogers/homebrew-tap --squash --delete-branch
+  aur:
+    if: inputs.channel == 'all' || inputs.channel == 'aur'
+    runs-on: ubuntu-latest
+    environment: distribution
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash scripts/fetch-release.sh "$VERSION" tmp/release
+        env:
+          VERSION: ${{ inputs.version }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+      - name: Publish AUR recipe
+        env:
+          AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
+          AUR_KNOWN_HOSTS: ${{ secrets.AUR_KNOWN_HOSTS }}
+          AUR_EMAIL: ${{ secrets.AUR_EMAIL }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          test -n "$AUR_SSH_KEY" && test -n "$AUR_KNOWN_HOSTS" && test -n "$AUR_EMAIL"
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$AUR_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$AUR_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          export GIT_SSH_COMMAND='ssh -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes'
+          git clone ssh://aur@aur.archlinux.org/peep-tui-bin.git tmp/aur
+          cp tmp/release/PKGBUILD tmp/aur/PKGBUILD
+          cp tmp/release/peep.SRCINFO tmp/aur/.SRCINFO
+          cd tmp/aur
+          git config user.name lancekrogers
+          git config user.email "$AUR_EMAIL"
+          git add PKGBUILD .SRCINFO
+          if git diff --cached --quiet; then
+            echo "AUR already contains this release."
+            exit 0
+          fi
+          git commit -m "peep $VERSION"
+          git push origin HEAD:master
+      - if: always()
+        run: rm -f ~/.ssh/id_ed25519

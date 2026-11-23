@@ -1,0 +1,72 @@
+name: distribution checks
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_call:
+    inputs:
+      version:
+        type: string
+        required: true
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Build all release archives
+        env:
+          VERSION: ${{ inputs.version || '0.0.0' }}
+        run: |
+          for os in darwin linux; do
+            for arch in arm64 amd64; do
+              go run ./cmd/peep-package --os "$os" --arch "$arch" --version "$VERSION"
+            done
+          done
+          go run ./cmd/peep-release --version "$VERSION"
+          bash scripts/distribution.sh pack
+      - run: node --test scripts/npm-launcher.test.cjs scripts/npm-publish.test.cjs
+      - run: python3 scripts/publish-retry-smoke.py
+      - run: python3 scripts/release-workflow-smoke.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: peep-distribution
+          path: dist/
+          include-hidden-files: true
+          retention-days: 7
+  install:
+    needs: build
+    strategy:
+      matrix:
+        runner: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: actions/download-artifact@v4
+        with:
+          name: peep-distribution
+          path: dist
+      - run: node scripts/npm-install-smoke.cjs dist/distribution
+      - run: ruby -c dist/distribution/homebrew/peep.rb
+      - run: bash -n dist/distribution/aur/PKGBUILD
+  arch:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: peep-distribution
+          path: dist
+      - name: Build and install the Arch package
+        run: docker run --rm -v "$PWD/dist:/release:ro" -v "$PWD/scripts/aur-package-smoke.sh:/test.sh:ro" archlinux:base-devel bash /test.sh

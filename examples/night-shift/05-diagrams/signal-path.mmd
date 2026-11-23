@@ -1,0 +1,8 @@
+flowchart LR
+    A[Observatory] --> B[Receiver]
+    B --> C{Signal clear?}
+    C -->|Yes| D[Save recording]
+    C -->|No| E[Adjust antenna]
+    E --> B
+    D --> F[Add field notes]
+    F --> G[Archive]

@@ -1,0 +1,9 @@
+sequenceDiagram
+    participant Night as Night shift
+    participant Archive
+    participant Morning as Morning shift
+    Night->>Archive: Save images and recordings
+    Night->>Archive: Add field notes
+    Morning->>Archive: Open the night's collection
+    Archive-->>Morning: Media, diagrams, and context
+    Morning->>Night: Signal received

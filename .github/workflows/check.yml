@@ -1,0 +1,61 @@
+name: check
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: test -z "$(gofmt -l cmd internal)"
+      - run: go vet ./...
+      - run: go test -race ./...
+      - run: go build ./cmd/peep
+
+  package:
+    strategy:
+      matrix:
+        runner: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: go run ./cmd/peep-package
+      - run: python3 scripts/package-smoke.py
+      - run: go build -o bin/peep ./cmd/peep
+      - run: python3 scripts/install-smoke.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: peep-${{ matrix.runner }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+
+  playback:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: sudo apt-get update && sudo apt-get install -y ffmpeg mpv ripgrep
+      - run: go build -o bin/peep ./cmd/peep
+      - run: python3 scripts/video-playback-smoke.py
+      - run: python3 scripts/stdin-smoke.py
+      - run: bash scripts/fixtures.sh && python3 scripts/iterm-preview-smoke.py
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: playback-terminal-logs
+          path: tmp/acceptance/

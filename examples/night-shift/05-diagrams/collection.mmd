@@ -1,0 +1,19 @@
+classDiagram
+    class Collection {
+        +string title
+        +browse()
+    }
+    class Image {
+        +preview()
+    }
+    class Recording {
+        +play()
+        +seek(seconds)
+    }
+    class FieldNote {
+        +render()
+        +search(query)
+    }
+    Collection o-- Image
+    Collection o-- Recording
+    Collection o-- FieldNote

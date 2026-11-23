@@ -1,0 +1,8 @@
+{
+  "title": "Night Shift",
+  "station": "North Ridge",
+  "observer": "Mara",
+  "playlist": ["Night Shift", "The Last Light On", "A Signal Worth Keeping"],
+  "capture": {"format": "lossless", "channels": 2},
+  "notes": "Keep listening after the silence."
+}
