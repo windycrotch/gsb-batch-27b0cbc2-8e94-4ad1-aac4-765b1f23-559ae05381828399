@@ -156,8 +156,8 @@ func main() {
 			pause, err := time.ParseDuration(p)
 			if err == nil && pause > 0 {
 				msg := fmt.Sprintf("System paused %s! Restart to resume.", pause)
-				logger.Printf(msg)
-				telegramNotifyf(msg)
+				logger.Print(msg)
+				telegramNotifyf("%s", msg)
 				time.Sleep(pause)
 				logger.Print("System resumed!")
 				telegramNotifyf("System resumed!")
@@ -175,6 +175,10 @@ func main() {
 
 	<-stop
 	cancel()
+
+	// Interrupt any in-progress conversion (its source segment is kept)
+	// and leave queued segments in .tmp for the next start.
+	StopConverter()
 
 	logger.Println("waiting recordings to finish")
 	select {

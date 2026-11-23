@@ -406,7 +406,7 @@ func record(ctx context.Context, c *Camera, stillProcessing chan<- struct{}) {
 			logger.Printf("error running ffmpeg for %s - %s", c.Name, err)
 			led.BadCamera()
 		}
-		FilesToConvert <- filePath
+		EnqueueConversion(filePath)
 		finished <- struct{}{}
 	}()
 
