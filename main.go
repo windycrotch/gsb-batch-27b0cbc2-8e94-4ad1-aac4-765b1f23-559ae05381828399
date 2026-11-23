@@ -134,7 +134,13 @@ func main() {
 			// Detected EOF
 			// Closing
 			log.Info("Closing process detected EOF")
-			mg.Close()
+			// The final chunk and final chunklist must complete the same
+			// upload + retry flow as regular data. A failure here is a real
+			// data-loss signal: exit non-zero instead of reporting success.
+			if closeErr := mg.Close(); closeErr != nil {
+				log.Error("Error closing segmenter, final chunk/manifest not fully uploaded: ", closeErr)
+				os.Exit(1)
+			}
 
 			break
 		}
@@ -147,7 +153,13 @@ func main() {
 
 		// process buf
 		log.Debug("Sent to process: ", n, " bytes")
-		mg.AddData(buf[:n])
+		if addErr := mg.AddData(buf[:n]); addErr != nil {
+			// An upload failed permanently (retries exhausted or permanent
+			// origin error). Continuing would only publish manifests pointing
+			// at missing objects, so surface the failure and stop.
+			log.Error("Error processing input data, stream stopped to avoid referencing unavailable chunks: ", addErr)
+			os.Exit(1)
+		}
 	}
 
 	log.Info("Exit because detected EOF in the input reader")

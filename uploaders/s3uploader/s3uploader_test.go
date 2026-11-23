@@ -1,6 +1,7 @@
 package s3uploader
 
 import (
+	"os"
 	"strconv"
 	"testing"
 	"time"
@@ -11,8 +12,14 @@ func getDateTimeStr() string {
 	return strconv.Itoa(t.Year()) + strconv.Itoa(int(t.Month())) + strconv.Itoa(t.Day()) + strconv.Itoa(t.Hour()) + strconv.Itoa(t.Minute()) + strconv.Itoa(t.Second())
 }
 
-// Do not run this test, it uses real S3 and local default config
+// TestUploadLocalFile talks to a real S3 bucket using the machine's default
+// credentials. It cannot run in CI / sandboxed environments (no credentials)
+// and is skipped unless RUN_S3_INTEGRATION_TESTS=1 is set explicitly.
 func TestUploadLocalFile(t *testing.T) {
+	if os.Getenv("RUN_S3_INTEGRATION_TESTS") == "" {
+		t.Skip("Skipping real S3 integration test; set RUN_S3_INTEGRATION_TESTS=1 to run it")
+	}
+
 	testFilePath := "../../fixture/testSmall.ts"
 	headerName := "hName"
 	headerValue := "hValue"

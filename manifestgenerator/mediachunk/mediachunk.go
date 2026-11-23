@@ -12,8 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jordicenzano/go-ts-segmenter/uploaders/httpuploader"
-	"github.com/jordicenzano/go-ts-segmenter/uploaders/s3uploader"
+	"github.com/jordicenzano/go-ts-segmenter/uploaders"
 	"github.com/sirupsen/logrus"
 )
 
@@ -48,14 +47,15 @@ type Options struct {
 	FileExtension      string
 	BasePath           string
 	ChunkBaseFilename  string
-	HTTPUploader       *httpuploader.HTTPUploader
-	S3Uploader         *s3uploader.S3Uploader
+	Uploader           uploaders.Uploader
 }
 
 // Chunk Chunk class
 type Chunk struct {
 	// Used by HTTP chunked based
-	httpWriteChan chan<- []byte
+	httpWriteChan chan []byte
+	// Receives the final result of the chunked transfer (nil on success)
+	httpErrChan chan error
 
 	// Used by file chunk write
 	fileWriter     *bufio.Writer
@@ -79,7 +79,10 @@ type Chunk struct {
 
 // New Creates a chunk instance
 func New(index uint64, options Options) Chunk {
-	c := Chunk{nil, nil, nil, options, index, "", "", "", 0, time.Now().UnixNano()}
+	if options.Log == nil {
+		options.Log = logrus.New()
+	}
+	c := Chunk{nil, nil, nil, nil, options, index, "", "", "", 0, time.Now().UnixNano()}
 
 	c.filename = c.createFilename(options.BasePath, options.ChunkBaseFilename, index, options.FileNumberLength, options.FileExtension, "")
 	if options.GhostPrefix != "" {
@@ -137,12 +140,17 @@ func (c *Chunk) initializeChunkFile() error {
 }
 
 func (c *Chunk) initializeChunkHTTPChunkedTransfer() error {
-	c.httpWriteChan = c.options.HTTPUploader.UploadChunkedTransfer(c.filename, c.getChunkHeaders(-1))
+	chunkedUploader, ok := c.options.Uploader.(uploaders.ChunkedTransferUploader)
+	if !ok {
+		return fmt.Errorf("%w: configured uploader does not support chunked transfer", uploaders.ErrPermanentUploadError)
+	}
+
+	c.httpWriteChan, c.httpErrChan = chunkedUploader.UploadChunkedTransfer(c.filename, c.getChunkHeaders(-1))
 
 	return nil
 }
 
-//InitializeChunk Initializes chunk
+// InitializeChunk Initializes chunk
 func (c *Chunk) InitializeChunk() error {
 	ret := error(nil)
 
@@ -169,43 +177,83 @@ func (c *Chunk) closeChunkFile() {
 	}
 }
 
-func (c *Chunk) closeChunkTmpFileExternal(outputType OutputTypes, durationS float64) {
+// closeChunkTmpFileExternal flushes the local temp file, uploads it to the
+// external origin (with the uploader's own retry policy) and always removes
+// the temp file afterwards. A non-nil error means the object is NOT
+// available at the destination, so the caller must not reference it from a
+// manifest.
+func (c *Chunk) closeChunkTmpFileExternal(outputType OutputTypes, durationS float64) error {
 	if c.fileWriter != nil {
-		c.fileDescriptor.Sync()
-		c.fileDescriptor.Close()
-	}
-
-	if c.tmpFilename != "" {
-		h := c.getChunkHeaders(durationS)
-		if outputType == ChunkOutputModeS3 {
-			c.options.S3Uploader.UploadLocalFile(c.tmpFilename, c.filename, h)
-		} else {
-			c.options.HTTPUploader.UploadLocalFile(c.tmpFilename, c.filename, h)
+		if errFlush := c.fileWriter.Flush(); errFlush != nil {
+			c.fileDescriptor.Close()
+			c.removeTmpFile()
+			return errFlush
+		}
+		if errSync := c.fileDescriptor.Sync(); errSync != nil {
+			c.fileDescriptor.Close()
+			c.removeTmpFile()
+			return errSync
+		}
+		if errClose := c.fileDescriptor.Close(); errClose != nil {
+			c.removeTmpFile()
+			return errClose
 		}
 	}
 
-	// Delete temp file
+	var uploadErr error
+	if c.tmpFilename != "" && c.options.Uploader != nil {
+		h := c.getChunkHeaders(durationS)
+		uploadErr = c.options.Uploader.UploadLocalFile(c.tmpFilename, c.filename, h)
+	}
+
+	// The temp file is always removed: successful objects already live at
+	// the destination, and failed uploads must not leave half-written files
+	// behind when the process exits.
+	c.removeTmpFile()
+
+	return uploadErr
+}
+
+func (c *Chunk) removeTmpFile() {
+	if c.tmpFilename == "" {
+		return
+	}
 	exists, _ := fileExists(c.tmpFilename)
 	if exists {
-		os.Remove(c.tmpFilename)
+		if errRemove := os.Remove(c.tmpFilename); errRemove != nil {
+			c.options.Log.Error("Error removing temp file ", c.tmpFilename, ". Err: ", errRemove)
+		}
 	}
 }
 
-func (c *Chunk) closeChunkHTTPChunkedTransfer() {
+// closeChunkHTTPChunkedTransfer closes the write channel and waits for the
+// upload result. Chunked transfers cannot be retried, but a broken transfer
+// is returned as an explicit error instead of being logged and forgotten.
+func (c *Chunk) closeChunkHTTPChunkedTransfer() error {
 	if c.httpWriteChan != nil {
 		close(c.httpWriteChan)
 	}
+	if c.httpErrChan != nil {
+		return <-c.httpErrChan
+	}
+	return nil
 }
 
-//Close Closes chunk
-func (c *Chunk) Close(durationS float64) {
+// Close Closes chunk, returning a non-nil error when the chunk could not be
+// delivered to its destination. On success the object referenced by
+// GetFilename is available (local file written or remote upload confirmed).
+func (c *Chunk) Close(durationS float64) error {
 	c.options.Log.Debug("Closing chunk ", c.filename)
-	if c.options.OutputType == ChunkOutputModeFile {
+	switch c.options.OutputType {
+	case ChunkOutputModeFile:
 		c.closeChunkFile()
-	} else if c.options.OutputType == ChunkOutputModeHTTPChunkedTransfer {
-		c.closeChunkHTTPChunkedTransfer()
-	} else if c.options.OutputType == ChunkOutputModeHTTPRegular || c.options.OutputType == ChunkOutputModeS3 {
-		c.closeChunkTmpFileExternal(c.options.OutputType, durationS)
+		return nil
+	case ChunkOutputModeHTTPChunkedTransfer:
+		return c.closeChunkHTTPChunkedTransfer()
+	case ChunkOutputModeHTTPRegular, ChunkOutputModeS3:
+		return c.closeChunkTmpFileExternal(c.options.OutputType, durationS)
+	default:
+		return nil
 	}
 }
 
@@ -253,7 +301,7 @@ func (c *Chunk) addDataChunkHTTP(buf []byte) error {
 	return nil
 }
 
-//AddData Add data to chunk and flush it
+// AddData Add data to chunk and flush it
 func (c *Chunk) AddData(buf []byte) error {
 	ret := error(nil)
 
@@ -269,7 +317,7 @@ func (c *Chunk) AddData(buf []byte) error {
 	return ret
 }
 
-//IsEmpty Indicates if there are any bytes already saved in this chunk
+// IsEmpty Indicates if there are any bytes already saved in this chunk
 func (c *Chunk) IsEmpty() bool {
 	ret := true
 	if c.totalBytes > 0 {
@@ -279,12 +327,12 @@ func (c *Chunk) IsEmpty() bool {
 	return ret
 }
 
-//GetFilename Returns the filename
+// GetFilename Returns the filename
 func (c *Chunk) GetFilename() string {
 	return c.filename
 }
 
-//GetIndex Returns the index
+// GetIndex Returns the index
 func (c *Chunk) GetIndex() uint64 {
 	return c.index
 }

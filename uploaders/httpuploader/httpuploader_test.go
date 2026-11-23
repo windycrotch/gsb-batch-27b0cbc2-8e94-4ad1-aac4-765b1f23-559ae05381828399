@@ -214,7 +214,7 @@ func TestUploadChunkedData(t *testing.T) {
 
 	// Create channel
 	h := map[string]string{headerName: headerValue}
-	channel := up.UploadChunkedTransfer(UploadFilePath, h)
+	channel, errChan := up.UploadChunkedTransfer(UploadFilePath, h)
 	if channel == nil {
 		t.Error("Error creating channel")
 	}
@@ -226,4 +226,9 @@ func TestUploadChunkedData(t *testing.T) {
 
 	// Wait to process the data
 	wg.Wait()
+
+	// The chunked transfer result must be observable (nil on success)
+	if uploadErr := <-errChan; uploadErr != nil {
+		t.Error("Error on chunked transfer. Err: ", uploadErr)
+	}
 }
