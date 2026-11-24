@@ -21,7 +21,21 @@ import (
 	"fmt"
 	"github.com/onitake/restreamer/protocol"
 	"net/http"
+	"sync"
 	"time"
+)
+
+// sendResult describes the outcome of an attempt to queue a packet for a
+// connection.
+type sendResult int
+
+const (
+	// sendQueued means the packet was handed over to the client queue.
+	sendQueued sendResult = iota
+	// sendDropped means the client queue was full and the packet was dropped.
+	sendDropped
+	// sendClosed means the client connection has already been shut down.
+	sendClosed
 )
 
 // Connection is a single active client connection.
@@ -29,17 +43,68 @@ import (
 // This is meant to be called directly from a ServeHTTP handler.
 // No separate thread is created.
 type Connection struct {
-	// Queue is the per-connection packet queue
+	// Queue is the per-connection packet queue.
+	//
+	// Do not close or write to this channel directly: use closeQueue() to
+	// terminate the connection and trySend() to enqueue packets. Both
+	// methods synchronize on queueLock, which makes it safe for the stream
+	// loop and the connection handler to race on connection shutdown.
 	Queue chan protocol.MpegTsPacket
 	// ClientAddress is the remote client address
 	ClientAddress string
 	// the destination socket
 	writer http.ResponseWriter
-	// Closed is true if Serve was ended because of a closed channel.
-	// This is simply there to avoid a double close.
+	// Closed is true once the connection queue has been closed.
+	// It is only written by closeQueue(), under queueLock.
 	Closed bool
 	// context contains the cached context object for this connection
 	context context.Context
+	// queueLock protects Queue, Closed and queueClosed against concurrent
+	// access from the stream loop (send) and the connection handler or
+	// control interface (close).
+	queueLock sync.Mutex
+	// queueClosed is true after the queue has been closed.
+	queueClosed bool
+	// finishOnce makes sure the connection quota is returned and the
+	// statistics are settled no more than once.
+	finishOnce sync.Once
+	// startedAt records the time the connection was accepted.
+	startedAt time.Time
+}
+
+// closeQueue terminates the packet queue of this connection.
+//
+// It is safe to call this method more than once and from multiple goroutines:
+// only the first call has an effect. All other calls are silently ignored.
+// Because trySend() synchronizes on the same lock, a concurrent packet send
+// can never observe a closed channel.
+func (conn *Connection) closeQueue() {
+	conn.queueLock.Lock()
+	defer conn.queueLock.Unlock()
+	if conn.queueClosed {
+		return
+	}
+	conn.queueClosed = true
+	conn.Closed = true
+	close(conn.Queue)
+}
+
+// trySend attempts to enqueue a packet without blocking.
+//
+// It returns sendQueued if the packet was accepted, sendDropped if the queue
+// is full and sendClosed if the connection has been shut down.
+func (conn *Connection) trySend(packet protocol.MpegTsPacket) sendResult {
+	conn.queueLock.Lock()
+	defer conn.queueLock.Unlock()
+	if conn.queueClosed {
+		return sendClosed
+	}
+	select {
+	case conn.Queue <- packet:
+		return sendQueued
+	default:
+		return sendDropped
+	}
 }
 
 // NewConnection creates a new connection object.
@@ -129,7 +194,8 @@ func (conn *Connection) Serve(preamble []byte) {
 					"message", "Shutting down client connection",
 				)
 				running = false
-				conn.Closed = true
+				// Closed has already been set by closeQueue(), which is the
+				// only place that closes the queue.
 			}
 		case <-conn.context.Done():
 			// connection closed while we were waiting for more data

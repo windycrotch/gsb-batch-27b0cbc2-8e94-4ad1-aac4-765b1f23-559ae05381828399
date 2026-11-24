@@ -143,6 +143,12 @@ type Streamer struct {
 	name string
 	// lock is the outgoing connection pool lock
 	lock sync.Mutex
+	// streamLock serializes Stream invocations.
+	// An upstream reconnect may start a new Stream before the previous one
+	// has noticed that its input queue was closed; waiting here guarantees
+	// that only one stream loop consumes packets at a time and that the new
+	// input queue is never left unread.
+	streamLock sync.Mutex
 	// broker is a global connection broker
 	broker ConnectionBroker
 	// queueSize defines the maximum number of packets to queue per outgoing connection
@@ -151,6 +157,12 @@ type Streamer struct {
 	// incoming connections are allowed.
 	// If false, incoming connections are blocked.
 	running util.AtomicBool
+	// inhibited reflects the operator-controlled online/offline state.
+	// If true, no new connections are accepted and all existing connections
+	// are terminated. The state is kept on the streamer (instead of the
+	// stream loop) so that it survives upstream reconnects and can be set
+	// even while no stream is running.
+	inhibited util.AtomicBool
 	// stats is the statistics collector for this stream
 	stats metrics.Collector
 	// request is an unbuffered queue for requests to add or remove a connection
@@ -183,11 +195,18 @@ type ConnectionBroker interface {
 // broker handles policy enforcement
 // stats is a statistics collector object.
 func NewStreamer(name string, qsize uint, broker ConnectionBroker, auth auth.Authenticator) *Streamer {
+	if broker == nil {
+		// Be lenient about a missing broker: an unlimited access controller
+		// behaves like "allow everything", which is the least surprising
+		// default.
+		broker = NewAccessController(0)
+	}
 	streamer := &Streamer{
 		name:      name,
 		broker:    broker,
 		queueSize: int(qsize),
 		running:   util.AtomicFalse,
+		inhibited: util.AtomicFalse,
 		stats:     &metrics.DummyCollector{},
 		request:   make(chan *ConnectionRequest),
 		auth:      auth,
@@ -199,6 +218,9 @@ func NewStreamer(name string, qsize uint, broker ConnectionBroker, auth auth.Aut
 
 // SetCollector assigns a stats collector
 func (streamer *Streamer) SetCollector(stats metrics.Collector) {
+	if stats == nil {
+		stats = &metrics.DummyCollector{}
+	}
 	streamer.stats = stats
 }
 
@@ -211,16 +233,54 @@ func (streamer *Streamer) SetPreamble(preamble []byte) {
 	streamer.preamble = preamble
 }
 
-func (streamer *Streamer) SetInhibit(inhibit bool) {
-	if inhibit {
-		streamer.request <- &ConnectionRequest{
-			Command: StreamerCommandInhibit,
-		}
-	} else {
-		streamer.request <- &ConnectionRequest{
-			Command: StreamerCommandAllow,
-		}
+// notifyConnect forwards a connection count change to the event notifier,
+// if one has been configured.
+func (streamer *Streamer) notifyConnect(connected int) {
+	if streamer.events != nil {
+		streamer.events.NotifyConnect(connected)
 	}
+}
+
+// isInhibited returns the current operator-controlled online/offline state.
+func (streamer *Streamer) isInhibited() bool {
+	return util.LoadBool(&streamer.inhibited)
+}
+
+// SetInhibit switches the stream between the offline (inhibit=true) and
+// online (inhibit=false) state.
+//
+// While offline, new connections are refused and all existing downstream
+// connections are terminated. The state is persistent: it survives upstream
+// reconnects and is only reset by another call with inhibit=false.
+//
+// The method returns after the stream loop has processed the state change,
+// so callers can rely on new connections being refused immediately and on
+// the termination of existing connections having been initiated. The flag is
+// also set synchronously, so it takes effect even when no stream loop is
+// running.
+func (streamer *Streamer) SetInhibit(inhibit bool) {
+	// Update the state first so that any connection attempt that races with
+	// the command below is already refused.
+	util.StoreBool(&streamer.inhibited, inhibit)
+	// Without a running stream loop there is no connection pool to drain.
+	// The flag above is enough; this also avoids blocking on the request
+	// channel while the loop is being restarted after an upstream loss.
+	if !util.LoadBool(&streamer.running) {
+		return
+	}
+	command := StreamerCommandAllow
+	if inhibit {
+		command = StreamerCommandInhibit
+	}
+	waiter := &sync.WaitGroup{}
+	waiter.Add(1)
+	streamer.request <- &ConnectionRequest{
+		Command: command,
+		Waiter:  waiter,
+	}
+	// Wait until the request has been handled, so that the caller
+	// (the control API) can report completion.
+	waiter.Wait()
 }
 
 // eatCommands is started in the background to drain the command
@@ -263,6 +323,16 @@ func (streamer *Streamer) eatCommands() {
 //
 // go streamer.Stream(queue)
 func (streamer *Streamer) Stream(queue <-chan protocol.MpegTsPacket) error {
+	// Only one stream loop may consume packets at a time.
+	//
+	// An upstream reconnect creates a new input queue and starts a new stream
+	// loop while the previous one may still be draining its old queue. The
+	// lock makes the new invocation wait for the old one instead of failing
+	// with ErrAlreadyRunning (which would leave the new queue unread and all
+	// viewers without data).
+	streamer.streamLock.Lock()
+	defer streamer.streamLock.Unlock()
+
 	// interlock and check for availability first
 	if !util.CompareAndSwapBool(&streamer.running, false, true) {
 		return ErrAlreadyRunning
@@ -270,8 +340,6 @@ func (streamer *Streamer) Stream(queue <-chan protocol.MpegTsPacket) error {
 
 	// create the local outgoing connection pool
 	pool := make(map[*Connection]bool)
-	// prevent new connections if this is true
-	inhibit := false
 
 	// stop the eater process
 	streamer.request <- &ConnectionRequest{
@@ -283,22 +351,21 @@ func (streamer *Streamer) Stream(queue <-chan protocol.MpegTsPacket) error {
 		"message", "Starting streaming",
 	)
 
-	// loop until the input channel is closed
+	// Loop until the input channel is closed.
+	//
+	// The offline state is kept on the streamer and read on each connection
+	// attempt, so it survives upstream reconnects and is not reset when a new
+	// stream loop starts.
 	running := true
 	for running {
 		select {
 		case packet, ok := <-queue:
 			if ok {
 				// got a packet, distribute
-				//log.Printf("Got packet (length %d):\n%s\n", len(packet), hex.Dump(packet))
-				//log.Printf("Got packet (length %d)\n", len(packet))
-
 				for conn := range pool {
-					select {
-					case conn.Queue <- packet:
+					switch conn.trySend(packet) {
+					case sendQueued:
 						// packet distributed, done
-						//log.Printf("Queued packet (length %d):\n%s\n", len(packet), hex.Dump(packet))
-
 						// report the packet
 						streamer.stats.PacketSent()
 						if streamer.promCounter {
@@ -306,10 +373,17 @@ func (streamer *Streamer) Stream(queue <-chan protocol.MpegTsPacket) error {
 							metricBytesSent.With(prometheus.Labels{"stream": streamer.name}).Add(protocol.MpegTsPacketSize)
 						}
 
+					case sendClosed:
+						// The connection has already been terminated (offline
+						// switch or upstream loss). Remove it from the pool so
+						// we don't try to send to it again, and settle its
+						// accounting (idempotent) so the quota is available
+						// again immediately.
+						delete(pool, conn)
+						streamer.settleConnection(conn)
+
 					default:
 						// queue is full
-						//log.Print(ErrSlowRead)
-
 						// report the drop
 						streamer.stats.PacketDropped()
 						if streamer.promCounter {
@@ -331,19 +405,33 @@ func (streamer *Streamer) Stream(queue <-chan protocol.MpegTsPacket) error {
 					"event", eventStreamerClientRemove,
 					"message", fmt.Sprintf("Removing client %s from pool", request.Address),
 				)
-				if !request.Connection.Closed {
-					close(request.Connection.Queue)
-				}
+				// Terminate the connection queue (idempotent) and forget the
+				// connection. Removing an already removed connection is a
+				// no-op; this happens after an offline switch or a stream
+				// restart, where connections are removed in bulk.
+				request.Connection.closeQueue()
 				delete(pool, request.Connection)
+				// The connection has ended; settle its accounting exactly
+				// once, no matter how many removal paths race here.
+				streamer.settleConnection(request.Connection)
 			case StreamerCommandAdd:
-				// check if the connection can be accepted
-				if !inhibit && streamer.broker.Accept(request.Address, streamer) {
+				// check if the connection can be accepted.
+				// The offline flag is read from the streamer so the decision
+				// is consistent across stream restarts.
+				if !streamer.isInhibited() && streamer.broker.Accept(request.Address, streamer) {
 					logger.Logkv(
 						"event", eventStreamerClientAdd,
 						"remote", request.Address,
 						"message", fmt.Sprintf("Adding client %s to pool", request.Address),
 					)
+					// Account for the viewer in the same critical section
+					// that makes it visible, so the reported connection
+					// count never disagrees with the pool.
+					request.Connection.startedAt = time.Now()
 					pool[request.Connection] = true
+					streamer.stats.ConnectionAdded()
+					metricConnections.With(prometheus.Labels{"stream": streamer.name}).Inc()
+					streamer.notifyConnect(1)
 					request.Ok = true
 				} else {
 					logger.Logkv(
@@ -359,19 +447,26 @@ func (streamer *Streamer) Stream(queue <-chan protocol.MpegTsPacket) error {
 					"event", eventStreamerInhibit,
 					"message", fmt.Sprintf("Turning stream offline"),
 				)
-				inhibit = true
-				// close all downstream connections
+				// the persistent flag has already been set by SetInhibit;
+				// make sure it is set even if the command was submitted
+				// through the request channel directly.
+				util.StoreBool(&streamer.inhibited, true)
+				// Close all downstream connections in an orderly fashion and
+				// remove them from the pool. Closing the queue ends Serve
+				// (and thus the HTTP response) normally; the quota of each
+				// connection is returned exactly once here, so it is
+				// available again as soon as the stream is put back online.
 				for conn := range pool {
-					close(conn.Queue)
+					conn.closeQueue()
+					delete(pool, conn)
+					streamer.settleConnection(conn)
 				}
-				// TODO implement inhibit in the check api
 			case StreamerCommandAllow:
 				logger.Logkv(
 					"event", eventStreamerAllow,
 					"message", fmt.Sprintf("Turning stream online"),
 				)
-				inhibit = false
-				// TODO implement inhibit in the check api
+				util.StoreBool(&streamer.inhibited, false)
 			default:
 				logger.Logkv(
 					"event", eventStreamerError,
@@ -391,7 +486,9 @@ func (streamer *Streamer) Stream(queue <-chan protocol.MpegTsPacket) error {
 		// drain any leftovers
 	}
 	for conn := range pool {
-		close(conn.Queue)
+		conn.closeQueue()
+		delete(pool, conn)
+		streamer.settleConnection(conn)
 	}
 
 	// start the command eater again
@@ -439,23 +536,29 @@ func (streamer *Streamer) ServeHTTP(writer http.ResponseWriter, request *http.Re
 	}
 
 	if conn != nil {
-		// connection will be handled, report
-		streamer.stats.ConnectionAdded()
-		metricConnections.With(prometheus.Labels{"stream": streamer.name}).Inc()
-		// also notify the event queue
-		streamer.events.NotifyConnect(1)
-
 		logger.Logkv(
 			"event", eventStreamerStreaming,
 			"message", fmt.Sprintf("Streaming to %s", request.RemoteAddr),
 			"remote", request.RemoteAddr,
 		)
 
-		start := time.Now()
 		conn.Serve(streamer.preamble)
-		duration := time.Since(start)
+		duration := time.Since(conn.startedAt)
 
-		// done, remove the stale connection
+		// Terminate the queue idempotently. An offline switch or a stream
+		// restart may already have closed it; in that case this is a no-op.
+		conn.closeQueue()
+
+		// Settle the accounting before handing the removal to the stream
+		// loop. The stream loop normally also settles when it processes the
+		// remove command, but it may already have ended (upstream loss) - in
+		// which case the command is eaten by the idle command eater. Settling
+		// here guarantees that the quota is returned promptly, and
+		// settleConnection() being idempotent guarantees it is returned only
+		// once even if both paths run.
+		streamer.settleConnection(conn)
+
+		// Remove the connection from the active pool.
 		streamer.request <- &ConnectionRequest{
 			Command:    StreamerCommandRemove,
 			Address:    request.RemoteAddr,
@@ -471,9 +574,24 @@ func (streamer *Streamer) ServeHTTP(writer http.ResponseWriter, request *http.Re
 			"remote", request.RemoteAddr,
 			"duration", duration,
 		)
+	} else {
+		// Return a suitable error
+		// TODO This should be 503 or 504, but client support seems to be poor
+		// and the standards mandate nothing. Bummer.
+		ServeStreamError(writer, http.StatusNotFound)
+	}
+}
 
-		// and report
-		streamer.events.NotifyConnect(-1)
+// settleConnection settles the accounting for a connection that has ended.
+//
+// It reports the disconnect, updates the statistics and returns the quota to
+// the broker exactly once per accepted connection. Calling it again for the
+// same connection is a no-op, which makes it safe when an offline switch, an
+// upstream loss and a client disconnect race with each other.
+func (streamer *Streamer) settleConnection(conn *Connection) {
+	conn.finishOnce.Do(func() {
+		duration := time.Since(conn.startedAt)
+		streamer.notifyConnect(-1)
 		streamer.stats.ConnectionRemoved()
 		metricConnections.With(prometheus.Labels{"stream": streamer.name}).Dec()
 		streamer.stats.StreamDuration(duration)
@@ -481,10 +599,5 @@ func (streamer *Streamer) ServeHTTP(writer http.ResponseWriter, request *http.Re
 
 		// also notify the broker
 		streamer.broker.Release(streamer)
-	} else {
-		// Return a suitable error
-		// TODO This should be 503 or 504, but client support seems to be poor
-		// and the standards mandate nothing. Bummer.
-		ServeStreamError(writer, http.StatusNotFound)
-	}
+	})
 }

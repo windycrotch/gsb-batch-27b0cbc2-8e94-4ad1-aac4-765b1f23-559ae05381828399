@@ -242,6 +242,12 @@ func (stats *realStatistics) update(delta time.Duration, change map[string]*real
 	// loop over all streams
 	for name, stream := range stats.streams {
 		diff := change[name]
+		if diff == nil {
+			// A stream that was registered after the previous snapshot has
+			// no delta yet. Treat it as unchanged instead of dereferencing a
+			// nil collector.
+			diff = &realCollector{}
+		}
 
 		// update the stats
 		stream.Connections += diff.connections
@@ -292,7 +298,14 @@ func (stats *realStatistics) delta(previous map[string]*realCollector) map[strin
 	current := make(map[string]*realCollector)
 	for name, stream := range stats.internal {
 		update := stream.clone()
-		previous[name].invsub(update)
+		prev, ok := previous[name]
+		if !ok || prev == nil {
+			// The stream was registered after the previous snapshot.
+			// There is no baseline to subtract, so use a zero baseline.
+			prev = &realCollector{}
+			previous[name] = prev
+		}
+		prev.invsub(update)
 		current[name] = update
 	}
 	stats.lock.RUnlock()
@@ -369,11 +382,32 @@ func (stats *realStatistics) RemoveStream(name string) {
 	stats.lock.Unlock()
 }
 
+// liveConnections returns the number of currently active downstream
+// connections of a stream. The value is read from the live gauge maintained
+// by the streamer, so it never lags behind the periodic statistics update.
+func (stats *realStatistics) liveConnections(name string) int64 {
+	collector, ok := stats.internal[name]
+	if !ok || collector == nil {
+		return 0
+	}
+	connections := atomic.LoadInt64(&collector.connections)
+	if connections < 0 {
+		// Guard against accounting errors; the reported value must never be
+		// negative.
+		return 0
+	}
+	return connections
+}
+
 // GetStreamStatistics fetches the statistics for a stream.
 // The returned object is a copy does not need to be handled with care.
 func (stats *realStatistics) GetStreamStatistics(name string) *StreamStatistics {
 	stats.lock.RLock()
-	stream := *stats.streams[name]
+	stream := StreamStatistics{}
+	if stored, ok := stats.streams[name]; ok && stored != nil {
+		stream = *stored
+	}
+	stream.Connections = stats.liveConnections(name)
 	stats.lock.RUnlock()
 	return &stream
 }
@@ -384,7 +418,11 @@ func (stats *realStatistics) GetAllStreamStatistics() map[string]*StreamStatisti
 	stats.lock.RLock()
 	streams := make(map[string]*StreamStatistics, len(stats.streams))
 	for name, stream := range stats.streams {
-		scopy := *stream
+		scopy := StreamStatistics{}
+		if stream != nil {
+			scopy = *stream
+		}
+		scopy.Connections = stats.liveConnections(name)
 		streams[name] = &scopy
 	}
 	stats.lock.RUnlock()
@@ -396,6 +434,11 @@ func (stats *realStatistics) GetAllStreamStatistics() map[string]*StreamStatisti
 func (stats *realStatistics) GetGlobalStatistics() *StreamStatistics {
 	stats.lock.RLock()
 	global := *stats.global
+	var connections int64
+	for name := range stats.streams {
+		connections += stats.liveConnections(name)
+	}
+	global.Connections = connections
 	stats.lock.RUnlock()
 	return &global
 }

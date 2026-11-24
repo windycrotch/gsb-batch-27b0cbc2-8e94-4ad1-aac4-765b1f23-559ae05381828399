@@ -114,3 +114,61 @@ func TestRealStatistics(t *testing.T) {
 	testStatisticsLimits(t, NewStatistics(10, 20), 10, 20)
 	testStatisticsStateChange(t, NewStatistics(0, 0))
 }
+
+// TestStatisticsLiveConnections verifies that connection counts are reported
+// from the live state of the collector, not merely from the last periodic
+// aggregation. This is what the health and statistics APIs rely on to stay in
+// sync with the actually connected viewers.
+func TestStatisticsLiveConnections(t *testing.T) {
+	s := NewStatistics(0, 0).(*realStatistics)
+	collector := s.RegisterStream("live")
+
+	// no updater thread running: the live count must still be accurate
+	if got := s.GetGlobalStatistics().Connections; got != 0 {
+		t.Errorf("expected 0 connections before any connect, got %d", got)
+	}
+
+	collector.ConnectionAdded()
+	collector.ConnectionAdded()
+	if got := s.GetGlobalStatistics().Connections; got != 2 {
+		t.Errorf("expected 2 live connections, got %d", got)
+	}
+	if got := s.GetStreamStatistics("live").Connections; got != 2 {
+		t.Errorf("expected 2 live stream connections, got %d", got)
+	}
+
+	collector.ConnectionRemoved()
+	if got := s.GetGlobalStatistics().Connections; got != 1 {
+		t.Errorf("expected 1 live connection after a disconnect, got %d", got)
+	}
+
+	// a second stream adds to the global count
+	collector2 := s.RegisterStream("live2")
+	collector2.ConnectionAdded()
+	if got := s.GetGlobalStatistics().Connections; got != 2 {
+		t.Errorf("expected 2 live connections across streams, got %d", got)
+	}
+
+	// removing a stream removes its connections from the global count
+	s.RemoveStream("live2")
+	if got := s.GetGlobalStatistics().Connections; got != 1 {
+		t.Errorf("expected 1 connection after removing a stream, got %d", got)
+	}
+
+	// unknown streams must not panic
+	if got := s.GetStreamStatistics("doesnotexist").Connections; got != 0 {
+		t.Errorf("expected 0 connections for an unknown stream, got %d", got)
+	}
+}
+
+// TestStatisticsNegativeConnections verifies that a negative internal counter
+// (which should never happen, but could after accounting bugs) is clamped to
+// zero instead of being reported to the API.
+func TestStatisticsNegativeConnections(t *testing.T) {
+	s := NewStatistics(0, 0).(*realStatistics)
+	collector := s.RegisterStream("negative").(*realCollector)
+	collector.ConnectionRemoved()
+	if got := s.GetGlobalStatistics().Connections; got != 0 {
+		t.Errorf("expected negative connection count to be clamped to 0, got %d", got)
+	}
+}

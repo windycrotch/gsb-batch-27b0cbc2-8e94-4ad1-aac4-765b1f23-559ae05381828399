@@ -29,9 +29,10 @@ type AccessController struct {
 	// lock to protect the connection counter
 	lock sync.Mutex
 	// connections contains the number of active connections.
-	// must be accessed atomically.
+	// Must only be accessed while holding lock.
 	connections uint
 	// inhibit is a global connection inhibitor flag.
+	// Must only be accessed while holding lock.
 	inhibit bool
 }
 
@@ -53,10 +54,19 @@ func (control *AccessController) SetInhibit(inhibit bool) {
 	control.lock.Unlock()
 }
 
+// Connections returns the current number of active connections.
+func (control *AccessController) Connections() uint {
+	control.lock.Lock()
+	connections := control.connections
+	control.lock.Unlock()
+	return connections
+}
+
 // Accept accepts an incoming connection when the maximum number of open connections
 // has not been reached yet.
 func (control *AccessController) Accept(remoteaddr string, streamer *Streamer) bool {
 	accept := false
+	var connections uint
 	// protect concurrent access
 	control.lock.Lock()
 	// check if the limit is disabled or unreached, and no inhibit is set
@@ -65,23 +75,25 @@ func (control *AccessController) Accept(remoteaddr string, streamer *Streamer) b
 		control.connections++
 		accept = true
 	}
+	// take a consistent snapshot for logging while the lock is still held
+	connections = control.connections
 	control.lock.Unlock()
 	// print some info
 	if accept {
 		logger.Logkv(
 			"event", eventAclAccepted,
 			"remote", remoteaddr,
-			"connections", control.connections,
+			"connections", connections,
 			"max", control.maxconnections,
-			"message", fmt.Sprintf("Accepted connection from %s, active=%d, max=%d", remoteaddr, control.connections, control.maxconnections),
+			"message", fmt.Sprintf("Accepted connection from %s, active=%d, max=%d", remoteaddr, connections, control.maxconnections),
 		)
 	} else {
 		logger.Logkv(
 			"event", eventAclDenied,
 			"remote", remoteaddr,
-			"connections", control.connections,
+			"connections", connections,
 			"max", control.maxconnections,
-			"message", fmt.Sprintf("Denied connection from %s, active=%d, max=%d", remoteaddr, control.connections, control.maxconnections),
+			"message", fmt.Sprintf("Denied connection from %s, active=%d, max=%d", remoteaddr, connections, control.maxconnections),
 		)
 	}
 	// return the result
@@ -89,8 +101,13 @@ func (control *AccessController) Accept(remoteaddr string, streamer *Streamer) b
 }
 
 // Release decrements the open connections count.
+//
+// Each accepted connection must be released exactly once. Release is
+// idempotent with respect to the counter floor: it never drops below zero,
+// and it reports whether a connection was actually released.
 func (control *AccessController) Release(streamer *Streamer) {
 	remove := false
+	var connections uint
 	// protect concurrent access
 	control.lock.Lock()
 	if control.connections > 0 {
@@ -98,13 +115,15 @@ func (control *AccessController) Release(streamer *Streamer) {
 		control.connections--
 		remove = true
 	}
+	// take a consistent snapshot for logging while the lock is still held
+	connections = control.connections
 	control.lock.Unlock()
 	if remove {
 		logger.Logkv(
 			"event", eventAclRemoved,
-			"connections", control.connections,
+			"connections", connections,
 			"max", control.maxconnections,
-			"message", fmt.Sprintf("Removed connection, active=%d, max=%d", control.connections, control.maxconnections),
+			"message", fmt.Sprintf("Removed connection, active=%d, max=%d", connections, control.maxconnections),
 		)
 	} else {
 		logger.Logkv(
