@@ -145,15 +145,16 @@ func (m Model) viewSelect() tea.View {
 }
 
 func (m Model) viewCamera() tea.View {
-	if (m.videoSession == nil && !m.playbackMode) || len(m.frameBuffer) == 0 {
+	if m.session == nil || len(m.session.front) == 0 {
 		v := tea.NewView(errStyle.Render("Camera session is not initialized."))
 		v.AltScreen = true
 		return v
 	}
 
-	// Get the dimensions of the image
-	imgWidth := m.videoWidth
-	imgHeight := m.videoHeight
+	// Get the dimensions of the image from the active session so the render
+	// always matches the buffer it is reading.
+	imgWidth := m.session.width
+	imgHeight := m.session.height
 
 	// Allocate screen layout width
 	var reservedWidth int
@@ -210,7 +211,7 @@ func (m Model) viewCamera() tea.View {
 	}
 
 	// Pass the loaded frame into the raw RGB24 converter
-	asciiArt, err := ascii.ConvertRGB24ToASCII(m.frameBuffer, imgWidth, imgHeight, targetWidth, m.color, m.getPalette(), m.mirror, m.ratio)
+	asciiArt, err := ascii.ConvertRGB24ToASCII(m.session.front, imgWidth, imgHeight, targetWidth, m.color, m.getPalette(), m.mirror, m.ratio)
 	if err != nil {
 		asciiArt = errStyle.Render(fmt.Sprintf("Error converting image to ASCII: %v", err))
 	}
@@ -243,16 +244,16 @@ func (m Model) viewCamera() tea.View {
 
 	// Change recording/playback status
 	var statusStr string
-	if m.playbackMode {
+	if m.isPlayback() {
 		statusStr = badgeStyle.Render(" PLAYBACK ")
-	} else if m.recording {
+	} else if m.isRecording() {
 		statusStr = errStyle.Render(" RECORDING ")
 	} else {
 		statusStr = badgeStyle.Render(" LIVE ")
 	}
 
 	var recKeymap string
-	if !m.playbackMode {
+	if !m.isPlayback() {
 		recKeymap = mutedStyle.Render("[r]      Toggle Record\n")
 	}
 
@@ -261,7 +262,7 @@ func (m Model) viewCamera() tea.View {
 		titleStyle.Render("MONITOR HUD"),
 		"",
 		fmt.Sprintf("Status:     %s", statusStr),
-		fmt.Sprintf("Resolution: %dx%d", m.videoWidth, m.videoHeight),
+		fmt.Sprintf("Resolution: %dx%d", imgWidth, imgHeight),
 		fmt.Sprintf("Target FPS: %s", badgeStyle.Render(fmt.Sprintf(" %d ", m.fps))),
 		fmt.Sprintf("Color Mode: %s", badgeStyle.Render(colorMode)),
 		fmt.Sprintf("Palette:    %s", badgeStyle.Render(detailMode)),
@@ -280,7 +281,7 @@ func (m Model) viewCamera() tea.View {
 
 	// Combine the viewfinder monitor box and the HUD side-panel horizontally
 	var monitor string
-	if m.recording {
+	if m.isRecording() {
 		monitor = recordingStyle.Render(asciiArt)
 	} else {
 		monitor = monitorStyle.Render(asciiArt)

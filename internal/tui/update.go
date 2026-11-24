@@ -12,7 +12,9 @@ import (
 	"github.com/Megge06/TermiCam/internal/video"
 )
 
-type playbackTickMsg struct{}
+// playbackTickMsg paces playback. It carries the session id so a tick belonging
+// to a session that has since been closed is ignored instead of reading frames.
+type playbackTickMsg struct{ sessionID uint64 }
 
 // Define how the model updates
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -21,11 +23,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		isTyping := m.inputActive || (m.screen == screenSelect && m.deviceList.FilterState() == list.Filtering)
 
 		if keyMsg.String() == "ctrl+c" || (keyMsg.String() == "q" && !isTyping) {
-			if m.videoSession != nil {
-				_ = m.videoSession.Close()
-			}
-			m.stopRecording()
-			m.closePlayback()
+			m.shutdown()
 			return m, tea.Quit
 		}
 	}
@@ -34,14 +32,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	// In case of playing back a recording
 	case playbackTickMsg:
-		if m.playbackMode {
-			if err := m.readNextPlaybackFrame(); err != nil {
-				m.err = err
-				m.closePlayback()
-				return m, nil
-			}
-			return m, playbackTickCmd(m.fps)
+		if m.session == nil || m.session.id != msg.sessionID || m.session.isClosed() {
+			// Stale tick from a session that has already ended.
+			return m, nil
 		}
+		if !m.session.playback {
+			return m, nil
+		}
+		return m, m.startRead()
 
 	case tea.WindowSizeMsg:
 		m.termWidth = msg.Width
@@ -79,6 +77,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	return m, nil
+}
+
+// shutdown releases every resource owned by the model. It is safe to call
+// multiple times and from any screen.
+func (m *Model) shutdown() {
+	m.closeSession()
 }
 
 func (m Model) updateSettings(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -277,45 +281,20 @@ func (m Model) updateSelect(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			if idx >= 0 && idx < len(m.devices) {
 				device := m.devices[idx]
-
-				if device.ID != "" {
-					// Query native camera resolution
-					nativeW, nativeH, err := video.GetDeviceResolution(device)
-					if err != nil || nativeW == 0 || nativeH == 0 {
-						nativeW, nativeH = 640, 480 // Fallback
-					}
-
-					// Calculate aspect ratio
-					aspectRatio := float64(nativeW) / float64(nativeH)
-
-					// Cap maximum width to 640px to keep CPU load low
-					maxWidth := 640
-					if nativeW < maxWidth {
-						maxWidth = nativeW
-					}
-
-					// Scale height proportionally to maintain exact aspect ratio
-					m.videoWidth = maxWidth
-					m.videoHeight = int(float64(maxWidth) / aspectRatio)
-					captureFPS, err := video.GetDeviceFramerate(device, nativeW, nativeH, m.fps)
-					if err != nil || captureFPS <= 0 {
-						captureFPS = 30
-					}
-
-					session, err := video.NewSession(device, nativeW, nativeH, m.videoWidth, m.videoHeight, m.fps, captureFPS)
-					if err != nil {
-						m.err = err
-						return m, nil
-					}
-
-					m.videoSession = session
-					m.frameBuffer = make([]byte, m.videoWidth*m.videoHeight*3)
-					m.backBuffer = make([]byte, m.videoWidth*m.videoHeight*3)
-					m.screen = screenCamera
-
-					m.cursor = 0
-					return m, readFrameCmd(m.videoSession, m.backBuffer)
+				if device.ID == "" {
+					return m, nil
 				}
+
+				// Always rebuild the session: the new one is bound to this
+				// entry's frame size and the previous one is already closed.
+				if err := m.enterLiveSession(device); err != nil {
+					m.err = err
+					return m, nil
+				}
+
+				m.screen = screenCamera
+				m.cursor = 0
+				return m, m.startRead()
 			}
 		}
 	}
@@ -326,76 +305,110 @@ func (m Model) updateSelect(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m Model) updateCamera(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case frameMsg:
-		m.frameBuffer, m.backBuffer = m.backBuffer, m.frameBuffer
-		// Reads recorded frame if a recording is played
-		if m.recording && m.recordGzip != nil {
-			_, err := m.recordGzip.Write(m.frameBuffer)
-			if err != nil {
-				m.err = fmt.Errorf("failed to write recorded frame: %w", err)
-				m.stopRecording()
-			}
+		// Discard results from a session that is no longer the active one.
+		if m.session == nil || m.session.id != msg.sessionID || m.session.isClosed() {
+			return m, nil
 		}
+		m.session.reading = false
+
+		m.session.swapBuffers()
+
+		// Reads recorded frame if a recording is being written.
+		if err := m.session.writeRecordedFrame(); err != nil {
+			m.err = fmt.Errorf("failed to write recorded frame: %w", err)
+			_ = m.session.stopRecording()
+			return m, nil
+		}
+
+		if m.session.playback {
+			return m, playbackTickCmd(m.session.id, m.fps)
+		}
+
 		// Fetch the next frame into the back buffer
-		return m, readFrameCmd(m.videoSession, m.backBuffer)
+		return m, m.startRead()
 
 	case frameErrMsg:
-		m.err = msg.err
-		if m.videoSession != nil {
-			_ = m.videoSession.Close()
-			m.videoSession = nil
+		// A late error from a closed session must not tear down the new one.
+		if m.session == nil || m.session.id != msg.sessionID {
+			return m, nil
 		}
+
+		if msg.err != nil {
+			m.err = msg.err
+		}
+		m.closeSession()
 		return m, nil
 
 	case tea.KeyPressMsg:
 		switch msg.String() {
 		case "esc", "backspace":
-			if m.playbackMode {
-				m.closePlayback()
+			wasPlayback := m.isPlayback()
+			m.closeSession()
+			if wasPlayback {
 				return m, tea.Quit
 			}
-			if m.videoSession != nil {
-				_ = m.videoSession.Close()
-				m.videoSession = nil
-			}
-			m.stopRecording()
 			m.screen = screenSelect
 		case "h":
 			m.hideUI = !m.hideUI
 		case "r":
-			if !m.playbackMode {
-				if m.recording {
-					m.stopRecording()
-				} else {
-					filename := fmt.Sprintf("rec_%s.tcam", time.Now().Format("2006-01-02_15-04-05"))
-					if err := m.startRecording(filename); err != nil {
-						m.err = err
-					}
+			if m.session == nil || m.session.playback {
+				return m, nil
+			}
+			if m.session.isRecording() {
+				_ = m.session.stopRecording()
+			} else {
+				filename := recordingFilename()
+				if err := m.startRecording(filename); err != nil {
+					m.err = err
 				}
 			}
 		}
 	}
 	return m, nil
-
 }
 
-// Read a frame from the video session and update the buffers
-func readFrameCmd(s *video.Session, buf []byte) tea.Cmd {
+// startRead dispatches one asynchronous frame read, unless the active session
+// already has a read in flight. Keeping this guard on the Update goroutine
+// ensures two reads never target the same buffer concurrently.
+func (m Model) startRead() tea.Cmd {
+	s := m.session
+	if s == nil || s.isClosed() || s.reading {
+		return nil
+	}
+	s.reading = true
+
+	return readFrameCmd(s)
+}
+
+// readFrameCmd reads the next frame from s into s.back asynchronously. The
+// resulting message carries the session id so a result that arrives after the
+// session has been replaced is discarded instead of writing into the new
+// session's buffers.
+func readFrameCmd(s *cameraSession) tea.Cmd {
+	if s == nil {
+		return nil
+	}
+	id := s.id
+	// Capture the destination now: a swap after this read completes must not
+	// change the buffer this in-flight read is writing into.
+	buf := s.back
+
 	return func() tea.Msg {
-		err := s.ReadFrame(buf)
-		if err != nil {
-			return frameErrMsg{err}
+		if err := s.source.ReadFrame(buf); err != nil {
+			return frameErrMsg{sessionID: id, err: err}
 		}
-		return frameMsg{}
+
+		return frameMsg{sessionID: id}
 	}
 }
 
-// Paces playback to privded fps
-func playbackTickCmd(fps int) tea.Cmd {
+// Paces playback to provided fps
+func playbackTickCmd(sessionID uint64, fps int) tea.Cmd {
 	if fps <= 0 {
 		fps = 30
 	}
 	return tea.Tick(time.Second/time.Duration(fps), func(t time.Time) tea.Msg {
-		return playbackTickMsg{}
+		return playbackTickMsg{sessionID: sessionID}
 	})
 }
 

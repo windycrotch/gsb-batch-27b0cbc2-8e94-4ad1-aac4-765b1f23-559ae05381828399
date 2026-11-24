@@ -1,11 +1,10 @@
 package tui
 
 import (
-	"compress/gzip"
-	"encoding/binary"
+	"errors"
 	"fmt"
-	"io"
 	"os"
+	"time"
 
 	"charm.land/bubbles/v2/list"
 	"charm.land/bubbles/v2/textinput"
@@ -22,6 +21,19 @@ const (
 	screenCamera
 )
 
+// Injectable seams so the camera lifecycle can be exercised without a real
+// camera or a local FFmpeg install.
+var (
+	openLiveSource  = defaultOpenLiveSource
+	probeResolution = video.GetDeviceResolution
+	probeFramerate  = video.GetDeviceFramerate
+	cliArgs         = os.Args
+)
+
+func defaultOpenLiveSource(device video.Device, captureWidth, captureHeight, width, height, fps int, captureFPS float64) (video.FrameSource, error) {
+	return video.NewSession(device, captureWidth, captureHeight, width, height, fps, captureFPS)
+}
+
 type Model struct {
 	choices       []string
 	devices       []video.Device
@@ -33,11 +45,6 @@ type Model struct {
 	screen        screenState
 	termWidth     int
 	termHeight    int
-	videoSession  *video.Session
-	frameBuffer   []byte
-	backBuffer    []byte
-	videoWidth    int
-	videoHeight   int
 	color         bool
 	paletteMode   string
 	customPalette string
@@ -46,18 +53,33 @@ type Model struct {
 	inputActive   bool
 	deviceList    list.Model
 	mirror        bool
-	recording     bool
-	recordFile    *os.File
-	recordGzip    *gzip.Writer
-	playbackMode  bool
-	playbackFile  *os.File
-	playbackGzip  *gzip.Reader
 	ratio         float64
+
+	// session is the single owner of everything tied to one visit to the
+	// camera view. It is replaced on every entry and closed on every exit.
+	session    *cameraSession
+	sessionSeq uint64
+	// playbackRestore holds the user's own settings while playback overrides
+	// them from the recording header.
+	playbackRestore *userSettings
 }
 
-// Frame capture message types
-type frameMsg struct{}
-type frameErrMsg struct{ err error }
+// userSettings is the subset of settings a recording header can override.
+type userSettings struct {
+	fps         int
+	color       bool
+	paletteMode string
+	mirror      bool
+	ratio       float64
+}
+
+// Frame capture message types. Every frame result carries the id of the session
+// that produced it so late results from a closed session can be discarded.
+type frameMsg struct{ sessionID uint64 }
+type frameErrMsg struct {
+	sessionID uint64
+	err       error
+}
 
 type devicesLoadedMsg []video.Device
 type errMsg struct{ err error }
@@ -112,8 +134,14 @@ func (m *Model) updateListItems() {
 	m.deviceList.SetItems(items)
 }
 
-// Empty initial model, filled with data upon command completion
+// InitialModel returns the model for the process command line arguments.
 func InitialModel() Model {
+	return initialModel(cliArgs[1:])
+}
+
+// initialModel builds the model for the given arguments. The first argument,
+// when present, is a .tcam recording to play back.
+func initialModel(args []string) Model {
 	saved := LoadSettings()
 
 	ti := textinput.New()
@@ -141,18 +169,17 @@ func InitialModel() Model {
 		textInput:     ti,
 		inputActive:   false,
 		deviceList:    l,
-		recording:     false,
 		ratio:         saved.Ratio,
 	}
 
-	// Detect if file is being given as argument
-	if len(os.Args) > 1 {
-		filePath := os.Args[1]
-		if err := m.loadRecording(filePath); err == nil {
+	// Detect if a recording file is being given as argument
+	if len(args) > 0 && args[0] != "" {
+		filePath := args[0]
+		if err := m.enterPlaybackSession(filePath); err != nil {
+			m.err = fmt.Errorf("failed to load recording %q: %w", filePath, err)
+		} else {
 			m.screen = screenCamera
 			m.loading = false
-		} else {
-			m.err = fmt.Errorf("failed to load recording %q: %w", filePath, err)
 		}
 	}
 
@@ -160,8 +187,8 @@ func InitialModel() Model {
 }
 
 func (m Model) Init() tea.Cmd {
-	if m.playbackMode {
-		return playbackTickCmd(m.fps)
+	if m.session != nil && m.session.playback {
+		return playbackTickCmd(m.session.id, m.fps)
 	}
 	return getDevicesCmd
 }
@@ -189,187 +216,178 @@ func (m Model) getPalette() string {
 	}
 }
 
-// Put atop recorded file to identify metadata
-type fileHeader struct {
-	Magic    [4]byte
-	Width    int32
-	Height   int32
-	FPS      int32
-	Color    byte
-	Detailed byte
-	Mirror   byte
+// isPlayback reports whether the active session is replaying a recording.
+func (m Model) isPlayback() bool {
+	return m.session != nil && m.session.playback
 }
 
-func boolToByte(b bool) byte {
-	if b {
-		return 1
+// isRecording reports whether the active session is writing a recording.
+func (m Model) isRecording() bool {
+	return m.session.isRecording()
+}
+
+// snapshotSettings captures the user's own settings before playback overrides
+// them from a recording header.
+func (m Model) snapshotSettings() userSettings {
+	return userSettings{
+		fps:         m.fps,
+		color:       m.color,
+		paletteMode: m.paletteMode,
+		mirror:      m.mirror,
+		ratio:       m.ratio,
 	}
-	return 0
 }
 
-func byteToBool(b byte) bool {
-	return b != 0
+// restoreUserSettings undoes any playback overrides.
+func (m *Model) restoreUserSettings() {
+	if m.playbackRestore == nil {
+		return
+	}
+	m.fps = m.playbackRestore.fps
+	m.color = m.playbackRestore.color
+	m.paletteMode = m.playbackRestore.paletteMode
+	m.mirror = m.playbackRestore.mirror
+	m.ratio = m.playbackRestore.ratio
+	m.playbackRestore = nil
 }
 
-// Create writer, etc. to start recording
-func (m *Model) startRecording(path string) error {
-	// #nosec G304 -- Safe. Path is generated internally or supplied safely from command arguments
-	file, err := os.Create(path)
+func (m *Model) nextSessionID() uint64 {
+	m.sessionSeq++
+	return m.sessionSeq
+}
+
+// closeSession stops and releases the active session. It is idempotent and
+// safe to call when no session is active; closing stops the frame source (which
+// unblocks any in-flight read and reaps the FFmpeg child process), stops any
+// recording in progress and restores playback-overridden settings.
+func (m *Model) closeSession() {
+	if m.session == nil {
+		m.restoreUserSettings()
+		return
+	}
+
+	session := m.session
+	m.session = nil
+	session.close()
+
+	m.restoreUserSettings()
+}
+
+// enterLiveSession probes the device and starts a fresh capture session sized to
+// the frame dimensions of this entry. Any previous session is closed first so a
+// failed entry cannot leave a stale session behind.
+func (m *Model) enterLiveSession(device video.Device) error {
+	nativeW, nativeH, err := probeResolution(device)
+	if err != nil || nativeW <= 0 || nativeH <= 0 {
+		nativeW, nativeH = 640, 480 // Fallback
+	}
+
+	// Calculate aspect ratio
+	aspectRatio := float64(nativeW) / float64(nativeH)
+
+	// Cap maximum width to 640px to keep CPU load low
+	maxWidth := 640
+	if nativeW < maxWidth {
+		maxWidth = nativeW
+	}
+
+	// Scale height proportionally to maintain exact aspect ratio
+	width := maxWidth
+	height := int(float64(maxWidth) / aspectRatio)
+	if height <= 0 {
+		height = 1
+	}
+
+	captureFPS, err := probeFramerate(device, nativeW, nativeH, m.fps)
+	if err != nil || captureFPS <= 0 {
+		captureFPS = 30
+	}
+
+	// Tear the previous session down before creating the next one.
+	m.closeSession()
+
+	source, err := openLiveSource(device, nativeW, nativeH, width, height, m.fps, captureFPS)
 	if err != nil {
 		return err
 	}
-	m.recordFile = file
 
-	gw := gzip.NewWriter(file)
-	m.recordGzip = gw
+	m.session = newLiveCameraSession(m.nextSessionID(), source, width, height)
 
-	// Save metadata atop of the file
-	header := fileHeader{
-		Magic:    [4]byte{'T', 'C', 'A', 'M'},
-		Width:    int32(m.videoWidth),  // #nosec G115 -- Safe. Dimensions are small terminal resolutions
-		Height:   int32(m.videoHeight), // #nosec G115 -- Safe. Dimensions are small terminal resolutions
-		FPS:      int32(m.fps),         // #nosec G115 -- Safe. Target FPS is validated and low
-		Color:    boolToByte(m.color),
-		Detailed: boolToByte(m.paletteMode == "detailed"),
-		Mirror:   boolToByte(m.mirror),
-	}
-
-	if err := binary.Write(gw, binary.LittleEndian, header); err != nil {
-		_ = gw.Close()
-		_ = file.Close()
-		return err
-	}
-
-	m.recording = true
 	return nil
 }
 
-// Because the data is streamed stopping is simple
-func (m *Model) stopRecording() {
-	m.recording = false
-	if m.recordGzip != nil {
-		_ = m.recordGzip.Close()
-		m.recordGzip = nil
-	}
-	if m.recordFile != nil {
-		_ = m.recordFile.Close()
-		m.recordFile = nil
-	}
-}
-
-// Start playback with metadata information from given file
-func (m *Model) loadRecording(path string) error {
-	// #nosec G304 G703 -- Safe. Path is passed safely from CLI arguments
-	file, err := os.Open(path)
+// enterPlaybackSession opens a recording and starts a playback session whose
+// buffers, frame rate and palette are bound to the file header.
+func (m *Model) enterPlaybackSession(path string) error {
+	reader, err := openPlayback(path)
 	if err != nil {
 		return err
 	}
-	m.playbackFile = file
 
-	gr, err := gzip.NewReader(file)
-	if err != nil {
-		_ = file.Close()
-		return err
+	// Drop any previous session before overriding the settings.
+	m.closeSession()
+	restore := m.snapshotSettings()
+
+	session := newPlaybackCameraSession(m.nextSessionID(), reader)
+
+	// Read the first frame up front so entering the view never renders a blank
+	// buffer. The read is done on the new session only; a failure closes the
+	// file and decompressor via the reader.
+	if err := session.source.ReadFrame(session.back); err != nil {
+		_ = reader.Close()
+		return fmt.Errorf("failed to read initial frame: %w", err)
 	}
-	m.playbackGzip = gr
+	session.swapBuffers()
 
-	var header fileHeader
-	if err := binary.Read(gr, binary.LittleEndian, &header); err != nil {
-		_ = gr.Close()
-		_ = file.Close()
-		return err
-	}
+	m.session = session
+	m.playbackRestore = &restore
 
-	if string(header.Magic[:]) != "TCAM" {
-		_ = gr.Close()
-		_ = file.Close()
-		return fmt.Errorf("invalid recording file format")
-	}
-
-	// Change model information to fit playback
-	m.videoWidth = int(header.Width)
-	m.videoHeight = int(header.Height)
-	m.fps = int(header.FPS)
-	m.color = byteToBool(header.Color)
-	if byteToBool(header.Detailed) {
+	// Settings come from the file header while playback is active.
+	m.fps = int(session.header.FPS)
+	m.color = byteToBool(session.header.Color)
+	if byteToBool(session.header.Detailed) {
 		m.paletteMode = "detailed"
 	} else {
 		m.paletteMode = "default"
 	}
-	m.mirror = byteToBool(header.Mirror)
-	m.playbackMode = true
-
-	// Buffer holds exactly one frame
-	m.frameBuffer = make([]byte, m.videoWidth*m.videoHeight*3)
-
-	if err := m.readNextPlaybackFrame(); err != nil {
-		_ = gr.Close()
-		_ = file.Close()
-		return fmt.Errorf("failed to read initial frame: %w", err)
+	m.mirror = byteToBool(session.header.Mirror)
+	if session.header.hasRatio() {
+		m.ratio = session.header.Ratio
 	}
 
 	return nil
 }
 
-func (m *Model) readNextPlaybackFrame() error {
-	if m.playbackGzip == nil {
-		return io.EOF
-	}
-
-	_, err := io.ReadFull(m.playbackGzip, m.frameBuffer)
-	if err != nil {
-		// End of file is reached, rewind to beginning
-		if err == io.EOF || err == io.ErrUnexpectedEOF {
-			return m.rewindPlayback()
-		}
-		return err
-	}
-	return nil
+// recordingFilename is a seam so tests can direct recordings into a temp dir.
+var recordingFilename = func() string {
+	return fmt.Sprintf("rec_%s.tcam", time.Now().Format("2006-01-02_15-04-05"))
 }
 
-// Rewind to beginning of file by opening a new gzip reader
-func (m *Model) rewindPlayback() error {
-	if m.playbackFile == nil {
-		return io.EOF
+// startRecording opens a recording file bound to the active session.
+func (m *Model) startRecording(path string) error {
+	if m.session == nil {
+		return errors.New("no active camera session")
+	}
+	if m.session.playback {
+		return errors.New("recording is not available during playback")
 	}
 
-	_ = m.playbackGzip.Close()
-	_ = m.playbackFile.Close()
-
-	// #nosec G304, G703 -- Safe. Path was validated on initial load.
-	file, err := os.Open(m.playbackFile.Name())
-	if err != nil {
-		return err
-	}
-	m.playbackFile = file
-
-	gr, err := gzip.NewReader(file)
-	if err != nil {
-		_ = file.Close()
-		return err
-	}
-	m.playbackGzip = gr
-
-	var header fileHeader
-	if err := binary.Read(gr, binary.LittleEndian, &header); err != nil {
-		_ = gr.Close()
-		_ = file.Close()
-		return err
+	header := fileHeader{
+		Width:    int32(m.session.width),  // #nosec G115 -- Safe. Dimensions are small terminal resolutions
+		Height:   int32(m.session.height), // #nosec G115 -- Safe. Dimensions are small terminal resolutions
+		FPS:      int32(m.fps),            // #nosec G115 -- Safe. Target FPS is validated and low
+		Color:    boolToByte(m.color),
+		Detailed: boolToByte(m.paletteMode == "detailed"),
+		Mirror:   boolToByte(m.mirror),
+		Ratio:    m.ratio,
 	}
 
-	_, err = io.ReadFull(m.playbackGzip, m.frameBuffer)
-	return err
+	return m.session.startRecording(path, header)
 }
 
-// Simply stops placback by closing the reader and file stream
-func (m *Model) closePlayback() {
-	m.playbackMode = false
-	if m.playbackGzip != nil {
-		_ = m.playbackGzip.Close()
-		m.playbackGzip = nil
-	}
-	if m.playbackFile != nil {
-		_ = m.playbackFile.Close()
-		m.playbackFile = nil
+// stopRecording finishes the active recording, if any.
+func (m *Model) stopRecording() {
+	if m.session != nil {
+		_ = m.session.stopRecording()
 	}
 }
