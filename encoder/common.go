@@ -73,6 +73,10 @@ func ParseProgress(raw string) map[string]string {
 
 // StreamProgress reads updates from progressChan, accumulates key-value pairs into blocks,
 // and invokes handler whenever a progress block completes (at "progress=continue" or "progress=end").
+//
+// Progress callbacks run synchronously on the calling goroutine. Callers that need
+// isolation from a slow handler (for example to keep cancellation responsive)
+// should use runEncodingCommand instead.
 func StreamProgress(progressChan <-chan string, handler func(map[string]string)) {
 	if handler == nil {
 		for range progressChan {
@@ -80,42 +84,75 @@ func StreamProgress(progressChan <-chan string, handler func(map[string]string))
 		return
 	}
 
-	block := make(map[string]string)
-	emitted := false
+	acc := newProgressAccumulator()
 	for raw := range progressChan {
-		lines := strings.Split(raw, "\n")
-		for _, line := range lines {
-			line = strings.TrimSpace(line)
-			if line == "" {
-				continue
-			}
-			parts := strings.SplitN(line, "=", 2)
-			if len(parts) == 2 {
-				k := strings.TrimSpace(parts[0])
-				v := strings.TrimSpace(parts[1])
-				// Retain last known valid values if FFmpeg emits "N/A" (e.g. at progress=end)
-				if v == "N/A" && block[k] != "" && block[k] != "N/A" {
-					continue
-				}
-				block[k] = v
-
-				if k == "progress" {
-					if v == "continue" || v == "end" {
-						snapshot := make(map[string]string, len(block))
-						for key, val := range block {
-							snapshot[key] = val
-						}
-						handler(snapshot)
-						emitted = true
-					}
-				}
-			}
+		for _, snapshot := range acc.add(raw) {
+			handler(snapshot)
 		}
 	}
-
-	if !emitted && len(block) > 0 {
-		handler(block)
+	for _, snapshot := range acc.flush() {
+		handler(snapshot)
 	}
+}
+
+// progressAccumulator groups the key-value lines FFmpeg emits between
+// "progress=continue"/"progress=end" markers into complete snapshots.
+type progressAccumulator struct {
+	block   map[string]string
+	emitted bool
+}
+
+func newProgressAccumulator() *progressAccumulator {
+	return &progressAccumulator{block: make(map[string]string)}
+}
+
+// add parses one raw line (or multi-line chunk) and returns the snapshots that
+// became complete, preserving order.
+func (a *progressAccumulator) add(raw string) []map[string]string {
+	var snapshots []map[string]string
+	for _, line := range strings.Split(raw, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		k := strings.TrimSpace(parts[0])
+		v := strings.TrimSpace(parts[1])
+		// Retain last known valid values if FFmpeg emits "N/A" (e.g. at progress=end)
+		if v == "N/A" && a.block[k] != "" && a.block[k] != "N/A" {
+			continue
+		}
+		a.block[k] = v
+
+		if k == "progress" && (v == "continue" || v == "end") {
+			snapshots = append(snapshots, a.snapshot())
+			a.emitted = true
+		}
+	}
+	return snapshots
+}
+
+// flush returns the residual block when the stream ended without a progress
+// marker, so partial output is still reported once.
+func (a *progressAccumulator) flush() []map[string]string {
+	if a.emitted || len(a.block) == 0 {
+		return nil
+	}
+	a.emitted = true
+	snapshot := a.snapshot()
+	a.block = make(map[string]string)
+	return []map[string]string{snapshot}
+}
+
+func (a *progressAccumulator) snapshot() map[string]string {
+	snapshot := make(map[string]string, len(a.block))
+	for key, val := range a.block {
+		snapshot[key] = val
+	}
+	return snapshot
 }
 
 // ParseOutTimeSeconds converts FFmpeg progress timestamps (out_time_us, out_time_ms, or out_time) to seconds.

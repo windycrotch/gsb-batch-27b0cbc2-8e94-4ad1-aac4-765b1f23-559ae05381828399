@@ -147,6 +147,29 @@ func EncodeDashWithExecutor(ctx context.Context, job Job, exec executor.CommandE
 
 Encodes the media into DASH CMAF (`manifest.mpd`, `init-stream*.m4s`, `chunk-stream*.m4s`).
 
+### Cancellation and Failure Semantics
+
+`EncodeHls` and `EncodeDash` share the same terminal-state contract. A single
+call produces exactly one outcome:
+
+| Outcome | Return value | `ProgressHandler` | Temp normalized input & partial output |
+|---|---|---|---|
+| Success | `*Usage`, `nil` | Last event delivered with `Percentage == 100` | N/A (kept) |
+| Cancelled (`ctx` done) | `nil`, error wrapping `context.Canceled` / `context.DeadlineExceeded` | No callbacks start after cancellation | Removed |
+| FFmpeg failure | `nil`, error wrapping the executor error (`errors.As` to `*executor.CommandError` for command + stderr) | No callbacks start after failure | Removed |
+
+Files that already existed in `OutputDir` before the call are never deleted.
+
+`ProgressHandler` may be slow or block. Progress is parsed on a dedicated
+goroutine and delivered on another, so a slow callback never prevents
+cancellation from returning and never stalls the FFmpeg pipe. On success the
+callback pipeline is drained and joined before returning, so the final
+`progress=end` event is never dropped. Concurrent calls are fully isolated:
+each call owns its own progress pipeline.
+
+Use `errors.Is(err, context.Canceled)` to distinguish a cancelled job from an
+FFmpeg failure.
+
 ---
 
 ## Functional Options Reference

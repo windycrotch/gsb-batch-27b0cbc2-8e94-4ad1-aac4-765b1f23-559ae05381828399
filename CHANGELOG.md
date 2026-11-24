@@ -2,6 +2,21 @@
 
 All notable changes to this project are documented here.
 
+## [Unreleased]
+
+### Fixed
+
+- Cancelling an encode (CLI Ctrl+C or a library `context`) now returns promptly with an error wrapping `context.Canceled` / `context.DeadlineExceeded` instead of hanging or surfacing an opaque `signal: killed`. No progress callback starts after cancellation, and the temporary normalized input file is removed.
+- Cancellation and FFmpeg failure are now distinguishable with `errors.Is` / `errors.As`; failures keep the command name and FFmpeg `stderr` context.
+- A slow or blocking `ProgressHandler` can no longer deadlock an encode: progress is parsed and delivered on dedicated goroutines. The final `progress=end` event is still delivered on success, so the last reported percentage reaches `100`.
+- HLS and DASH encoding now share one execution/progress pipeline, so both formats have identical success, cancellation, and failure behavior. Concurrent jobs no longer share progress state.
+- `RealCommandExecutor` now returns `ctx.Err()` when a command is killed by context cancellation.
+- Cancelled or failed encodes no longer leave partial segments behind: files created in `OutputDir` during the run are removed, while files that already existed are preserved.
+
+### Documentation
+
+- Documented the terminal-state contract (success / cancelled / failed) for `EncodeHls` and `EncodeDash` in `docs/API.md`.
+
 ## [v1.8.0] - 2026-08-31
 
 ### Added

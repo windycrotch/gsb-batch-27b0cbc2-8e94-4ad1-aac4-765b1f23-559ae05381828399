@@ -44,10 +44,12 @@ func (r *RealCommandExecutor) ExecuteWithProgress(ctx context.Context, progress 
 	if progress != nil {
 		stdoutPipe, err := cmd.StdoutPipe()
 		if err != nil {
+			close(progress)
 			return nil, nil, err
 		}
 
 		if err := cmd.Start(); err != nil {
+			close(progress)
 			return nil, nil, err
 		}
 
@@ -66,6 +68,12 @@ func (r *RealCommandExecutor) ExecuteWithProgress(ctx context.Context, progress 
 
 		if err := cmd.Wait(); err != nil {
 			wg.Wait() // Ensure goroutine finishes even on error
+			// Context cancellation kills the process; report the context error
+			// so callers can recognize cancellation with errors.Is rather than
+			// seeing an opaque "signal: killed".
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, nil, ctxErr
+			}
 			if stderr.Len() > 0 {
 				return nil, nil, &CommandError{
 					Command: name,
@@ -79,6 +87,9 @@ func (r *RealCommandExecutor) ExecuteWithProgress(ctx context.Context, progress 
 		wg.Wait()
 	} else {
 		if err := cmd.Run(); err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, nil, ctxErr
+			}
 			if stderr.Len() > 0 {
 				return nil, nil, &CommandError{
 					Command: name,

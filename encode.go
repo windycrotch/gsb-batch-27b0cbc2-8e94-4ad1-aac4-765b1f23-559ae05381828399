@@ -339,18 +339,18 @@ func buildProgressCallback(handler ProgressHandler, duration float64) func(map[s
 		return nil
 	}
 	return func(m map[string]string) {
-		var percentage float64
-		if duration > 0 {
-			if m["progress"] == "end" {
+		// A cancelled encode must not surface a spurious 0% or a completed run
+		// a non-final percentage: the terminal event is always progress=end.
+		percentage := 0.0
+		if m["progress"] == "end" {
+			percentage = 100.0
+		} else if duration > 0 {
+			currentSec := encoder.ParseOutTimeSeconds(m)
+			percentage = (currentSec / duration) * 100.0
+			if percentage > 100.0 {
 				percentage = 100.0
-			} else {
-				currentSec := encoder.ParseOutTimeSeconds(m)
-				percentage = (currentSec / duration) * 100.0
-				if percentage > 100.0 {
-					percentage = 100.0
-				} else if percentage < 0.0 {
-					percentage = 0.0
-				}
+			} else if percentage < 0.0 {
+				percentage = 0.0
 			}
 		}
 		handler(ProgressInfo{
@@ -395,11 +395,16 @@ func EncodeHlsWithExecutor(ctx context.Context, job Job, exec executor.CommandEx
 		return nil, err
 	}
 
+	// Take stock of the output dir before anything is written so a cancelled or
+	// failed run can remove only the artefacts it created.
+	before := snapshotOutputDir(job.OutputDir)
+
 	var keyInfoFile string
 	if o.encryption != nil {
 		var keyErr error
 		keyInfoFile, keyErr = encryption.SetupKeyInfo(job.OutputDir, *o.encryption)
 		if keyErr != nil {
+			removeNewFiles(job.OutputDir, before)
 			return nil, fmt.Errorf("setup encryption keyinfo: %w", keyErr)
 		}
 	}
@@ -427,6 +432,8 @@ func EncodeHlsWithExecutor(ctx context.Context, job Job, exec executor.CommandEx
 		},
 	)
 	if err != nil {
+		// A cancelled or failed encode must not leave partial segments behind.
+		removeNewFiles(job.OutputDir, before)
 		return nil, err
 	}
 
@@ -484,6 +491,7 @@ func EncodeDashWithExecutor(ctx context.Context, job Job, exec executor.CommandE
 		return nil, err
 	}
 	// 2. Encode
+	before := snapshotOutputDir(job.OutputDir)
 	usage, err := encoder.EncodeDASHCMAFWithExecutor(
 		ctx,
 		effectiveInput,
@@ -504,6 +512,8 @@ func EncodeDashWithExecutor(ctx context.Context, job Job, exec executor.CommandE
 		},
 	)
 	if err != nil {
+		// A cancelled or failed encode must not leave partial segments behind.
+		removeNewFiles(job.OutputDir, before)
 		return nil, err
 	}
 
@@ -526,6 +536,38 @@ func EncodeDashWithExecutor(ctx context.Context, job Job, exec executor.CommandE
 	}
 
 	return usage, nil
+}
+
+// snapshotOutputDir records the files already present in dir (best effort), so
+// a cancelled or failed run can remove only the artefacts it created.
+func snapshotOutputDir(dir string) map[string]struct{} {
+	existing := make(map[string]struct{})
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return existing
+	}
+	for _, entry := range entries {
+		existing[entry.Name()] = struct{}{}
+	}
+	return existing
+}
+
+// removeNewFiles deletes files in dir that were not present in before,
+// including partially written segments. Pre-existing files are never touched.
+func removeNewFiles(dir string, before map[string]struct{}) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		if _, ok := before[entry.Name()]; ok {
+			continue
+		}
+		_ = os.Remove(filepath.Join(dir, entry.Name()))
+	}
 }
 
 func prepareInputForEncoding(

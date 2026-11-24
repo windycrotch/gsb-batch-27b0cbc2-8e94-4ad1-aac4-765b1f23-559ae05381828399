@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -314,6 +315,10 @@ func main() {
 
 	fmt.Println() // newline after progress bar
 	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			fmt.Fprintln(os.Stderr, "\n⏹ Encoding cancelled. Partial output has been removed.")
+			os.Exit(130)
+		}
 		fmt.Fprintf(os.Stderr, "\n❌ Encoding failed: %v\n", err)
 		os.Exit(1)
 	}

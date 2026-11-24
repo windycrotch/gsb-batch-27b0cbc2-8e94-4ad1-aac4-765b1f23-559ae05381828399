@@ -5,8 +5,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestNewMockExecutor(t *testing.T) {
@@ -295,14 +297,25 @@ func TestRealCommandExecutor_ExecuteWithProgress(t *testing.T) {
 	exec := &RealCommandExecutor{}
 	progress := make(chan string, 10)
 
-	// Use a command that prints multiple lines
-	out, usage, err := exec.ExecuteWithProgress(context.Background(), progress, "echo", "-e", "line1\nline2")
+	// Use a command that prints multiple lines. `echo -e` does not interpret
+	// escapes on Windows, so pick per-platform line emitters.
+	var cmd string
+	var args []string
+	if runtime.GOOS == "windows" {
+		cmd = "cmd"
+		args = []string{"/c", "echo line1& echo line2"}
+	} else {
+		cmd = "printf"
+		args = []string{"line1\nline2\n"}
+	}
+	out, usage, err := exec.ExecuteWithProgress(context.Background(), progress, cmd, args...)
 	if err != nil {
 		t.Fatalf("ExecuteWithProgress failed: %v", err)
 	}
 
-	if string(bytes.TrimSpace(out)) != "line1\nline2" {
-		t.Errorf("expected 'line1\\nline2', got '%s'", string(bytes.TrimSpace(out)))
+	gotOut := strings.ReplaceAll(string(bytes.TrimSpace(out)), "\r\n", "\n")
+	if gotOut != "line1\nline2" {
+		t.Errorf("expected 'line1\\nline2', got '%s'", gotOut)
 	}
 	if usage == nil {
 		t.Fatal("expected usage stats, got nil")
@@ -310,7 +323,7 @@ func TestRealCommandExecutor_ExecuteWithProgress(t *testing.T) {
 
 	var lines []string
 	for line := range progress {
-		lines = append(lines, line)
+		lines = append(lines, strings.TrimSuffix(line, "\r"))
 	}
 	totalOutput := strings.Join(lines, "\n") + "\n"
 	if totalOutput != "line1\nline2\n" { // The progress channel sends individual lines
@@ -374,4 +387,46 @@ func TestRealCommandExecutorStderrError(t *testing.T) {
 	} else {
 		t.Errorf("expected CommandError, got %T", err)
 	}
+}
+
+func TestRealCommandExecutor_ContextCancelledError(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	exec := &RealCommandExecutor{}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, _, err := exec.Execute(ctx, "sleep", "5")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+}
+
+func TestRealCommandExecutor_ContextCancelledWithProgress(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	exec := &RealCommandExecutor{}
+	progress := make(chan string)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for range progress {
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	_, _, err := exec.ExecuteWithProgress(ctx, progress, "sleep", "5")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected context.DeadlineExceeded, got %v", err)
+	}
+	<-done
 }

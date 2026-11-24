@@ -144,28 +144,14 @@ func EncodeDASHCMAFWithExecutor(
 
 	if progressHandler != nil {
 		args = append(args, "-progress", "pipe:1")
-		progressChan := make(chan string)
-		errChan := make(chan error, 1)
-		var usage *executor.Usage
-
-		go func() {
-			var err error
-			_, usage, err = exec.ExecuteWithProgress(ctx, progressChan, "ffmpeg", args...)
-			errChan <- err
-		}()
-
-		StreamProgress(progressChan, progressHandler)
-
-		if err := <-errChan; err != nil {
-			return nil, fmt.Errorf("ffmpeg DASH failed: %w", err)
-		}
-		return usage, nil
-	} else {
-		_, usage, err := exec.Execute(ctx, "ffmpeg", args...)
-		if err != nil {
-			return nil, fmt.Errorf("ffmpeg DASH failed: %w", err)
-		}
-		return usage, nil
 	}
 
+	usage, err := runEncodingCommand(ctx, exec, progressHandler, "ffmpeg", args)
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, fmt.Errorf("ffmpeg DASH cancelled: %w", ctxErr)
+		}
+		return nil, fmt.Errorf("ffmpeg DASH failed: %w", err)
+	}
+	return usage, nil
 }
