@@ -150,6 +150,17 @@ func (g *noiseGate) reset() {
 	g.holdLeft = 0
 }
 
+// resetLatch clears the open/closed latch and any pending hold window WITHOUT
+// touching the slewed gain. It is the config-transition migration: the latch was
+// decided under the old config's decision source and thresholds (and the two VAD
+// sources use different hold-window lengths), so it must be re-decided from
+// scratch under the new config — but the gain ramp continues from its current
+// position, so the transition stays click-free (no hard mute, no jump).
+func (g *noiseGate) resetLatch() {
+	g.open = false
+	g.holdLeft = 0
+}
+
 // thresholdFor maps a [0,1] sensitivity to the linear RMS open threshold.
 func thresholdFor(sensitivity float32) float32 {
 	if sensitivity < 0 {

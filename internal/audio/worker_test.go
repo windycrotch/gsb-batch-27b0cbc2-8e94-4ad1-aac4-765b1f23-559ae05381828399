@@ -19,13 +19,16 @@ import (
 func newWorkerFor(e *Engine) *micWorker {
 	proc, _ := apm.New(e.buildAPMConfig())
 	return &micWorker{
-		e:             e,
-		apm:           proc,
-		gate:          newGate(),
-		nsTierApplied: e.nsTier(),
-		agcApplied:    e.agc(),
-		aecApplied:    e.echoCancellation(),
-		stop:          make(chan struct{}),
+		e:               e,
+		apm:             proc,
+		gate:            newGate(),
+		nsTierApplied:   e.nsTier(),
+		agcApplied:      e.agc(),
+		aecApplied:      e.echoCancellation(),
+		advVADApplied:   e.advancedVAD(),
+		autoSensApplied: e.autoSensitivity(),
+		micModeApplied:  e.micMode(),
+		stop:            make(chan struct{}),
 	}
 }
 

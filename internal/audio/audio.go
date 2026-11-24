@@ -27,6 +27,7 @@ import (
 	"github.com/gen2brain/malgo"
 
 	"github.com/jodagreyhame/SoundBoard/internal/catalog"
+	"github.com/jodagreyhame/SoundBoard/internal/denoise"
 	"github.com/jodagreyhame/SoundBoard/internal/devices"
 )
 
@@ -309,6 +310,12 @@ type Engine struct {
 	inRing  *ringSPSC
 	outRing *ringSPSC
 	worker  *micWorker
+
+	// denFactory builds the worker's RNNoise denoiser (off the audio thread, in
+	// startWorker and on chain-config transitions). Nil means denoise.New. It is a
+	// test seam: production never sets it, but tests override it to drive the REAL
+	// startWorker/stopWorker lifecycle with a deterministic denoiser.
+	denFactory func(suppress bool) denoise.Denoiser
 
 	// tapRing carries the EXACT interleaved-stereo cable mix from duplexCallback
 	// (producer) to monitorCallback (consumer) when MonitorSource is "transmitted".
