@@ -4,6 +4,7 @@ import (
 	"errors"
 	"io"
 	"math"
+	"sync"
 
 	"github.com/quasilyte/xm/internal/xmdb"
 	"github.com/quasilyte/xm/xmfile"
@@ -14,6 +15,13 @@ import (
 // The Read() method produces 16-bit little endian PCM bytes; this is what ebiten/audio
 // package extects. Use Stream as an io.Reader argument for audio.NewPlayer().
 type Stream struct {
+	// mu guards every piece of the playback state, so a goroutine
+	// calling Read() never observes a half-updated module when another
+	// goroutine calls LoadModule()/Rewind()/etc.
+	// Note: event handlers are called with this mutex being held;
+	// they should never call any of the Stream methods.
+	mu sync.Mutex
+
 	module module
 
 	pattern           *pattern
@@ -139,16 +147,23 @@ func NewStream() *Stream {
 // Events are produced when the XM track is being played.
 // Therefore, calling Read() may produce multiple events.
 //
+// The handler is called with the stream internal mutex being held,
+// so it should never call any of the Stream methods (it would deadlock).
+//
 // Experimental: the events handling API may change significantly in the future.
 func (s *Stream) SetEventHandler(f func(e StreamEvent)) {
+	s.mu.Lock()
 	s.settings.eventHandler = f
+	s.mu.Unlock()
 }
 
 // SetVolume adjusts the global volume scaling for the stream.
 // The default value is 0.8; a value of 0 disables the sound.
 // The value is clamped in [0, 1].
 func (s *Stream) SetVolume(v float64) {
+	s.mu.Lock()
 	s.settings.volumeScaling = clamp(v, 0, 1)
+	s.mu.Unlock()
 }
 
 // SetLooping enables a simple looping from the beginning of the stream.
@@ -163,14 +178,33 @@ func (s *Stream) SetVolume(v float64) {
 // Note: prefer this option to the InfiniteLoop provided by Ebitengine audio.
 // This native way of looping is ~free while InfiniteLoop has some overhead.
 func (s *Stream) SetLooping(loop bool) {
+	s.mu.Lock()
 	s.settings.loop = loop
+	s.mu.Unlock()
 }
 
+// assignCompiledModule replaces the current module and resets
+// all the playback state to the beginning of that module.
+// The caller should hold s.mu.
 func (s *Stream) assignCompiledModule(m module) {
 	s.module = m
 
-	// Call a rewind() that won't trigger a Sync event.
 	s.rewind()
+	s.fireSyncEvent()
+}
+
+// fireSyncEvent reports an EventSync event that is consistent
+// with the current stream state (its time counter in particular).
+// The caller should hold s.mu.
+func (s *Stream) fireSyncEvent() {
+	if s.settings.eventHandler == nil {
+		return
+	}
+	s.settings.eventHandler(StreamEvent{
+		Kind:  EventSync,
+		Time:  s.t,
+		value: math.Float64bits(s.t),
+	})
 }
 
 // LoadModule assigns a new XM module to this stream.
@@ -185,13 +219,9 @@ func (s *Stream) LoadModule(m *xmfile.Module, config LoadModuleConfig) error {
 		return errors.New("unsupported sample rate (only 44100 is supported)")
 	}
 
-	if cap(s.channels) < m.NumChannels {
-		s.channels = make([]streamChannel, m.NumChannels)
-		s.activeChannels = make([]*streamChannel, m.NumChannels)
-	}
-	s.channels = s.channels[:m.NumChannels]
-	s.activeChannels = s.activeChannels[:0]
-
+	// Compile the module before touching the stream state.
+	// If the compilation fails, the stream keeps its previous
+	// (fully playable) module and none of its fields are mutated.
 	compiled, err := compileModule(m, moduleConfig{
 		sampleRate: config.SampleRate,
 		bpm:        config.BPM,
@@ -201,6 +231,16 @@ func (s *Stream) LoadModule(m *xmfile.Module, config LoadModuleConfig) error {
 	if err != nil {
 		return err
 	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if cap(s.channels) < m.NumChannels {
+		s.channels = make([]streamChannel, m.NumChannels)
+		s.activeChannels = make([]*streamChannel, m.NumChannels)
+	}
+	s.channels = s.channels[:m.NumChannels]
+	s.activeChannels = s.activeChannels[:0]
 
 	s.assignCompiledModule(compiled)
 
@@ -231,10 +271,14 @@ func (s *Stream) applyConfigDefaults(m *xmfile.Module, config *LoadModuleConfig)
 //  1. (0, SeekStart) for rewind
 //  2. (0, SeekCurrent) to get the byte pos inside the stream
 func (s *Stream) Seek(offset int64, whence int) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	switch whence {
 	case io.SeekStart:
 		if offset == 0 {
-			s.Rewind()
+			s.rewind()
+			s.fireSyncEvent()
 			return 0, nil
 		}
 
@@ -264,6 +308,9 @@ func (s *Stream) Seek(offset int64, whence int) (int64, error) {
 //
 // When stream has no bytes to produce, io.EOF error is returned.
 func (s *Stream) Read(b []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	written := 0
 	eof := false
 
@@ -282,7 +329,8 @@ func (s *Stream) Read(b []byte) (int, error) {
 
 	if eof {
 		if s.settings.loop {
-			s.Rewind()
+			s.rewind()
+			s.fireSyncEvent()
 			return written, nil
 		}
 		return written, io.EOF
@@ -293,28 +341,43 @@ func (s *Stream) Read(b []byte) (int, error) {
 // Rewind prepares the stream to play the module right from the start.
 // Doing rewind is relatively cheap.
 func (s *Stream) Rewind() {
-	if s.settings.eventHandler != nil {
-		s.settings.eventHandler(StreamEvent{
-			Kind:  EventSync,
-			Time:  s.t,
-			value: math.Float64bits(0),
-		})
-	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	s.rewind()
+	s.fireSyncEvent()
 }
 
+// rewind resets all the runtime playback state (both global and
+// per-channel) to the beginning of the currently assigned module.
+// The caller should hold s.mu.
 func (s *Stream) rewind() {
-	// Make all fields zero-initialized just to be safe.
-	// Copying the module object is redundant, but oh well (it's a shallow copy anyway).
-	*s = Stream{
-		module:         s.module,
-		channels:       s.channels,
-		activeChannels: s.activeChannels,
-		settings:       s.settings,
-	}
+	// Reset all the runtime fields, so the previous playback
+	// (or a previously loaded module) leaves no traces behind.
+	// Note: we can't just zero the entire Stream struct here,
+	// as it contains a mutex along with some fields that should
+	// be preserved (like the module and the settings).
 
-	// Now initialize the player to the "ready to start" state.
-	// This code is used as a final part of the constructor as well.
+	s.pattern = nil
+	s.patternIndex = -1
+	s.patternRowsRemain = 0
+	s.patternRowIndex = -1
+	s.rowTicksRemain = 0
+	s.tickIndex = -1
+
+	s.jumpKind = jumpNone
+	s.jumpPattern = 0
+	s.jumpRow = 0
+
+	s.globalVolume = 1.0
+	s.bpm = 0
+	s.samplesPerTick = 0
+	s.bytesPerTick = 0
+	s.bytePos = 0
+	s.t = 0
+	s.secondsPerRow = 0
+
+	s.activeChannels = s.activeChannels[:0]
 
 	for i := range s.channels {
 		ch := &s.channels[i]
@@ -322,20 +385,16 @@ func (s *Stream) rewind() {
 		ch.id = i
 	}
 
-	s.globalVolume = 1.0
-	s.patternIndex = -1
-	s.patternRowsRemain = 0
-	s.patternRowIndex = -1
-	s.rowTicksRemain = 0
-	s.tickIndex = -1
+	// Now initialize the player to the "ready to start" state.
+	// This code is used as a final part of the constructor as well.
 
 	s.ticksPerRow = s.module.ticksPerRow
 	s.setBPM(s.module.bpm)
 }
 
 func (s *Stream) setTempo(tempo int) {
-	s.module.ticksPerRow = tempo
-	s.secondsPerRow = calcSecondsPerRow(s.module.ticksPerRow, s.bpm)
+	s.ticksPerRow = tempo
+	s.secondsPerRow = calcSecondsPerRow(s.ticksPerRow, s.bpm)
 }
 
 func (s *Stream) setBPM(bpm float64) {
@@ -347,6 +406,9 @@ func (s *Stream) setBPM(bpm float64) {
 // GetInfo returns stream-related info.
 // See StreamInfo for more details.
 func (s *Stream) GetInfo() StreamInfo {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	return StreamInfo{
 		BytesPerTick: uint(s.bytesPerTick),
 		MemoryUsage:  moduleSize(&s.module),

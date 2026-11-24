@@ -68,8 +68,10 @@ func (s *Synthesizer) SetInstruments(is *SynthesizerInstruments) error {
 		return errors.New("mismatching channel count")
 	}
 
+	s.stream.mu.Lock()
 	s.stream.activeChannels = s.stream.activeChannels[:0]
 	s.stream.assignCompiledModule(is.instOnly)
+	s.stream.mu.Unlock()
 
 	return nil
 }
@@ -81,6 +83,9 @@ func (s *Synthesizer) SetInstruments(is *SynthesizerInstruments) error {
 // the module re-compilation.
 // The instruments are only compatible if the number of channels is matching.
 func (s *Synthesizer) GetInstruments() *SynthesizerInstruments {
+	s.stream.mu.Lock()
+	defer s.stream.mu.Unlock()
+
 	return &SynthesizerInstruments{
 		instOnly:    s.stream.module,
 		numChannels: len(s.stream.channels),
@@ -100,14 +105,22 @@ func (s *Synthesizer) GetInstruments() *SynthesizerInstruments {
 func (s *Synthesizer) LoadInstruments(m *xmfile.Module, config LoadModuleConfig) error {
 	s.stream.applyConfigDefaults(m, &config)
 
-	s.stream.activeChannels = s.stream.activeChannels[:0]
+	if config.SampleRate != 44100 {
+		return errors.New("unsupported sample rate (only 44100 is supported)")
+	}
 
+	// Compile the instruments before touching the stream state.
+	// If the compilation fails, the previously loaded instruments
+	// (if any) remain usable.
 	instOnly, err := s.compileModuleInstruments(m, config)
 	if err != nil {
 		return err
 	}
 
+	s.stream.mu.Lock()
+	s.stream.activeChannels = s.stream.activeChannels[:0]
 	s.stream.assignCompiledModule(instOnly)
+	s.stream.mu.Unlock()
 
 	return nil
 }
@@ -150,11 +163,20 @@ func (s *Synthesizer) compileModuleInstruments(m *xmfile.Module, config LoadModu
 	return compiled, nil
 }
 
+// prepareToPlay resets the note/effect compiler tables and puts
+// the stream back to the beginning of the (single-row) synth pattern.
+// Every audition starts from a clean slate: the previous note's
+// envelopes, slides, vibrato and other per-channel effect states
+// are all reset, so consecutive PlayNote calls never contaminate
+// each other.
+// The caller should hold s.stream.mu.
 func (s *Synthesizer) prepareToPlay(duration float64) {
 	s.noteCompiler.reset(&s.stream.module)
 
 	s.stream.module.effectTab = s.stream.module.effectTab[:0]
 	s.stream.module.noteTab = s.stream.module.noteTab[:0]
+
+	s.stream.rewind()
 
 	if duration == 0 {
 		s.stream.setTempo(240)
@@ -166,6 +188,9 @@ func (s *Synthesizer) prepareToPlay(duration float64) {
 // PlayNote plays one or more notes up to the specified duration.
 // Using 0 for the duration will play it for several seconds.
 func (s *Synthesizer) PlayNote(duration float64, notes ...xmfile.PatternNote) error {
+	s.stream.mu.Lock()
+	defer s.stream.mu.Unlock()
+
 	s.prepareToPlay(duration)
 
 	chansUsed := 0
