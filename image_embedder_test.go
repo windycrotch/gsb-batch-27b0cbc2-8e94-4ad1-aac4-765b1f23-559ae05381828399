@@ -5,6 +5,7 @@ import (
 	"image"
 	"image/color"
 	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -116,7 +117,7 @@ func TestEncode_InvalidFileCreation(t *testing.T) {
 	coverImage := createTestImage()
 	data := []byte("test data")
 	bitDepth := uint8(3)
-	outputFilename := "/invalid/path/test_output.png" // Invalid path
+	outputFilename := filepath.Join(t.TempDir(), "does-not-exist", "test_output.png") // Directory does not exist
 
 	// Execute
 	handler := &EmbedHandler{3}

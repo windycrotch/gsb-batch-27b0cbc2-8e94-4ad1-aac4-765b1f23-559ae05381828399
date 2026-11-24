@@ -380,9 +380,10 @@ func EmbedFile(coverImagePath, dataFilePath, outputFilePath, password string, bi
 	df = append([]byte(ext), df...)
 
 	var (
-		wg       sync.WaitGroup
-		erchan   = make(chan error)
-		channels []u.RgbChannel
+		wg         sync.WaitGroup
+		channels   []u.RgbChannel
+		extractErr error
+		cryptErr   error
 	)
 
 	wg.Add(2)
@@ -390,34 +391,44 @@ func EmbedFile(coverImagePath, dataFilePath, outputFilePath, password string, bi
 	go func() {
 		defer wg.Done()
 		channels = u.ExtractRGBChannelsFromImageWithConCurrency(cf, runtime.NumCPU())
-		if (len(df)*8)+32 > len(channels)*3*(int(bitDepth)+1) {
-			erchan <- fmt.Errorf("error: Data too large to embed into the image")
-			return
+		if channels == nil {
+			extractErr = ErrFailedToExtractRGB
 		}
 	}()
 
 	go func() {
 		defer wg.Done()
-		df, err = c.CompressZSTD(df)
+		compressed, err := c.CompressZSTD(df)
 		if err != nil {
-			erchan <- err
+			cryptErr = err
 			return
 		}
 
-		df, err = u.Encrypt(password, df)
+		encrypted, err := u.Encrypt(password, compressed)
 		if err != nil {
-			erchan <- err
+			cryptErr = err
 			return
 		}
+
+		df = encrypted
 	}()
 
-	select {
-	case <-erchan:
-		return err
-	default:
+	wg.Wait()
+
+	// Any failure in either goroutine must abort the embed.
+	if extractErr != nil {
+		return extractErr
+	}
+	if cryptErr != nil {
+		return cryptErr
 	}
 
-	wg.Wait()
+	// Capacity check against the final compressed+encrypted payload.
+	// This runs before any pixel is modified and before the output
+	// file is created, so a rejection leaves the target path untouched.
+	if (len(df)*8)+32 > len(channels)*3*(int(bitDepth)+1) {
+		return ErrDataTooLarge
+	}
 
 	channels, err = u.EmbedIntoRGBchannelsWithDepth(channels, df, bitDepth)
 	if err != nil {
@@ -426,10 +437,16 @@ func EmbedFile(coverImagePath, dataFilePath, outputFilePath, password string, bi
 
 	newImage, err := u.SaveImage(channels, cf.Bounds().Max.Y, cf.Bounds().Max.X)
 	if err != nil {
-		return nil
+		return err
 	}
 
-	return SaveImage(outputFilePath, newImage)
+	if err := SaveImage(outputFilePath, newImage); err != nil {
+		// Don't leave a half-written output file behind.
+		os.Remove(outputFilePath)
+		return err
+	}
+
+	return nil
 }
 
 // ExtractFile extracts embedded data from an image using a default bit depth of 1 (the last two bits in a byte).
