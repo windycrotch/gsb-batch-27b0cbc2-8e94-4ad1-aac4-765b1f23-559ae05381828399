@@ -83,15 +83,21 @@ func (c *SourceReaderCallback) GetInterface() *IMFSourceReaderCallback {
 //
 // For more information, see https://learn.microsoft.com/en-us/windows/win32/api/mfreadwrite/nf-mfreadwrite-imfsourcereadercallback-onreadsample
 func (c *SourceReaderCallback) SetOnReadSample(fn func(this *CaptureAsync, dwStreamIndex uint32, dwStreamFlags uint32, llTimestamp int64, pSample *mf.IMFSample)) {
+	c.this.mu.Lock()
 	c.OnReadSampleFunc = fn
+	c.this.mu.Unlock()
 }
 
 func (c *SourceReaderCallback) SetOnFlush(fn func(this *CaptureAsync, dwStreamIndex uint32)) {
+	c.this.mu.Lock()
 	c.OnFlushFunc = fn
+	c.this.mu.Unlock()
 }
 
 func (c *SourceReaderCallback) SetOnEvent(fn func(this *CaptureAsync, dwStreamIndex uint32, pEvent *mf.IMFMediaEvent)) {
+	c.this.mu.Lock()
 	c.OnEventFunc = fn
+	c.this.mu.Unlock()
 }
 
 // IUnknown 方法实现
@@ -144,47 +150,45 @@ func (c *SourceReaderCallback) release(this uintptr) uintptr {
 
 // IMFSourceReaderCallback 方法实现
 func (c *SourceReaderCallback) onReadSample(this uintptr, hrStatus uint32, dwStreamIndex uint32, dwStreamFlags uint32, llTimestamp int64, pSample uintptr) uintptr {
-	HResult := consts.HResultError{Code: consts.HRESULT(hrStatus)}
-	if HResult.Code != consts.S_OK {
-		//panic(HResult.Code)
-		c.this.Device.SetError(HResult)
-		return uintptr(hrStatus)
+	var sample *mf.IMFSample
+	if pSample != 0 {
+		sample = (*mf.IMFSample)(unsafe.Pointer(pSample))
 	}
-
-	if pSample == 0 {
-		err := c.this.GetNextFrame()
-		if err != nil {
-			c.this.Device.SetError(err)
-			//panic(err)
-			return consts.S_OK
-		}
-		return uintptr(hrStatus)
-	}
-
-	if c.OnReadSampleFunc != nil {
-		sample := (*mf.IMFSample)(unsafe.Pointer(pSample))
-		if sample.S == nil {
-			return consts.S_OK
-		}
-
-		c.OnReadSampleFunc(c.this, dwStreamIndex, dwStreamFlags, llTimestamp, sample)
-	}
-
-	return consts.S_OK
+	// All policy (closed gating, bounded empty-sample retry, once-only error
+	// reporting, frame delivery) lives in CaptureAsync.handleReadSample so it
+	// can be tested without COM.
+	return c.this.handleReadSample(hrStatus, dwStreamIndex, dwStreamFlags, llTimestamp, sample)
 }
 
 func (c *SourceReaderCallback) onFlush(this uintptr, dwStreamIndex uint32) uintptr {
-	if c.OnFlushFunc != nil {
-		c.OnFlushFunc(c.this, dwStreamIndex)
+	// Never run user code once closing has started.
+	if !c.this.Device.beginCallback() {
+		return consts.S_OK
+	}
+	defer c.this.Device.endCallback()
+	c.this.mu.Lock()
+	fn := c.OnFlushFunc
+	c.this.mu.Unlock()
+	if fn != nil {
+		fn(c.this, dwStreamIndex)
 	}
 	return consts.S_OK
 }
 
 func (c *SourceReaderCallback) onEvent(this uintptr, dwStreamIndex uint32, pEvent uintptr) uintptr {
+	// Gate the whole callback, including the event Release, on the close
+	// lifecycle so a late event cannot outlive the reader.
+	if !c.this.Device.beginCallback() {
+		return consts.S_OK
+	}
+	defer c.this.Device.endCallback()
 
-	if c.OnEventFunc != nil && pEvent != 0 {
+	c.this.mu.Lock()
+	fn := c.OnEventFunc
+	c.this.mu.Unlock()
+	if fn != nil && pEvent != 0 {
 		event := (*mf.IMFMediaEvent)(unsafe.Pointer(pEvent))
-		c.OnEventFunc(c.this, dwStreamIndex, event)
+		fn(c.this, dwStreamIndex, event)
 		_ = event.Release()
 	}
 	return consts.S_OK

@@ -13,6 +13,8 @@ var ErrorAsyncNeedCallBack = errors.New("async operation requires a callback han
 var ErrorFormatNotMatched = errors.New("media type format does not match the expected format")
 var ErrorParameterInvalid = errors.New("invalid parameter provided")
 var ErrorInternalError = errors.New("internal error occurred")
+var ErrorCaptureAlreadyStarted = errors.New("capture session already started, close the device before starting another")
+var ErrorAsyncRetryExhausted = errors.New("async sample re-request retries exhausted, restart capture to resume")
 
 func CheckError(err error) error {
 	if err == nil {

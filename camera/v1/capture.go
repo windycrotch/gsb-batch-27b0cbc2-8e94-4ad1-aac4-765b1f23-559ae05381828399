@@ -1,11 +1,19 @@
 package camera
 
 import (
+	"runtime"
+	"sync"
+
 	"github.com/Kirizu-Official/windows-camera-go/utils"
 	"github.com/Kirizu-Official/windows-camera-go/windows/consts"
-	"github.com/Kirizu-Official/windows-camera-go/windows/guid"
 	"github.com/Kirizu-Official/windows-camera-go/windows/mf"
 )
+
+// maxEmptySampleRetries bounds how many times the asynchronous path re-issues
+// a read request after receiving an empty sample (e.g. a stream tick). Beyond
+// this the session reports one error and stops re-requesting until the user
+// starts a fresh capture.
+const maxEmptySampleRetries = 5
 
 type CaptureConfig struct {
 	enableAsync bool
@@ -16,6 +24,19 @@ type CaptureAsync struct {
 	Device   *Device
 	Config   *CaptureConfig
 	callback *SourceReaderCallback
+
+	// mu guards the fields below.
+	mu sync.Mutex
+	// emptySampleCount counts consecutive empty samples since the last real
+	// sample (or the start of the session).
+	emptySampleCount int
+	// stopped is set once the empty-sample retry budget is exhausted. While
+	// stopped no further read request is issued automatically; it is cleared
+	// only by starting a new capture session.
+	stopped bool
+	// reportOnce makes sure a failed session surfaces at most one error to the
+	// device error callback.
+	reportOnce sync.Once
 }
 type CaptureSync struct {
 	Device *Device
@@ -36,8 +57,7 @@ func (d *Device) StartCaptureAsync(mediaType *CaptureFormats) (*CaptureAsync, er
 		MediaType:   mediaType,
 	}
 	a.Config = config
-	err := d.startCapture(config)
-	if err != nil {
+	if err := d.startCapture(config); err != nil {
 		return nil, err
 	}
 
@@ -51,8 +71,7 @@ func (d *Device) StartCapture(mediaType *CaptureFormats) (*CaptureSync, error) {
 		enableAsync: false,
 		MediaType:   mediaType,
 	}
-	err := d.startCapture(config)
-	if err != nil {
+	if err := d.startCapture(config); err != nil {
 		return nil, err
 	}
 	return &CaptureSync{
@@ -62,46 +81,44 @@ func (d *Device) StartCapture(mediaType *CaptureFormats) (*CaptureSync, error) {
 }
 
 func (d *Device) startCapture(config *CaptureConfig) error {
-	if d.pDeviceSource == nil {
+	d.mu.Lock()
+	if d.closed {
+		d.mu.Unlock()
 		return utils.ErrorDeviceNotOpen
 	}
-	if d.pDevPresent == nil {
+	if d.reader != nil || d.config != nil {
+		d.mu.Unlock()
+		return utils.ErrorCaptureAlreadyStarted
+	}
+	provider := d.readerProvider
+	d.mu.Unlock()
+	if provider == nil {
 		return utils.ErrorDeviceNotOpen
 	}
-	if d.pDeviceSource == nil {
-		return utils.ErrorDeviceNotOpen
-	}
-	if config.enableAsync && config.callBack == 0 {
-		return utils.ErrorAsyncNeedCallBack
-	}
-	d.config = config
-	var err error
-	d.pMediaType, err = d.getSelectedMediaType(config.MediaType)
-	if err != nil {
-		return err
-	}
-	var sourceReaderAttributes *mf.IMFAttributes
-	err = mfPlat.MFCreateAttributes(&sourceReaderAttributes, 2)
+
+	reader, mediaType, err := provider.createSourceReader(config)
 	if err != nil {
 		return err
 	}
 
-	if config.enableAsync {
-		err = sourceReaderAttributes.SetUnknown(guid.MF_SOURCE_READER_ASYNC_CALLBACK, config.callBack)
-		if err != nil {
-			return err
+	d.mu.Lock()
+	// Re-check under the lock: a concurrent CloseDevice may have run while the
+	// reader was being created. If so, release what we just built and fail.
+	if d.closed {
+		d.mu.Unlock()
+		_ = reader.Release()
+		if mediaType != nil {
+			_ = mediaType.Release()
 		}
+		return utils.ErrorDeviceNotOpen
 	}
-
-	err = mfReadWrite.MFCreateSourceReaderFromMediaSource(d.pDeviceSource, sourceReaderAttributes, &d.pSourceReader)
-	if err != nil {
-		return err
+	d.reader = reader
+	if concrete, ok := reader.(*mf.IMFSourceReader); ok {
+		d.pSourceReader = concrete
 	}
-	//sourceReaderAttributes.Release()
-	err = d.pSourceReader.SetCurrentMediaType(0xFFFFFFFC, d.pMediaType)
-	if err != nil {
-		return err
-	}
+	d.pMediaType = mediaType
+	d.config = config
+	d.mu.Unlock()
 	return nil
 }
 
@@ -147,41 +164,171 @@ func (s *SampleData) Release() error {
 
 }
 
+// GetFrame synchronously reads one real frame. A stream tick means "no new
+// sample yet", so it is never surfaced as an error or an empty SampleData: the
+// call keeps waiting until an actual sample arrives, a real read error occurs,
+// or the device is closed (ErrorDeviceNotOpen).
 func (d *CaptureSync) GetFrame() (*SampleData, error) {
 	var pdwActualStreamIndex, pdwStreamFlags uint32
 	var pllTimestamp int64
 	var ppSample *mf.IMFSample
-RetryGetSample:
-	err := d.Device.pSourceReader.ReadSample(consts.MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0, &pdwActualStreamIndex, &pdwStreamFlags, &pllTimestamp, &ppSample)
-	if err != nil {
-		return nil, err
-	}
-	if consts.MF_SOURCE_READER_FLAG(pdwStreamFlags) == consts.MF_SOURCE_READERF_STREAMTICK {
-		goto RetryGetSample
-	}
-	if ppSample == nil {
+
+	for {
+		if d.Device.isClosed() {
+			return nil, utils.ErrorDeviceNotOpen
+		}
+
+		d.Device.mu.Lock()
+		reader := d.Device.reader
+		d.Device.mu.Unlock()
+		if reader == nil {
+			return nil, utils.ErrorDeviceNotOpen
+		}
+
+		err := reader.ReadSample(consts.MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0, &pdwActualStreamIndex, &pdwStreamFlags, &pllTimestamp, &ppSample)
+		if err != nil {
+			if d.Device.isClosed() {
+				return nil, utils.ErrorDeviceNotOpen
+			}
+			return nil, err
+		}
+
+		// The device may have been closed while the read was blocked. Never
+		// surface a frame from a closing/closed session.
+		if d.Device.isClosed() {
+			if ppSample != nil {
+				_ = ppSample.Release()
+			}
+			return nil, utils.ErrorDeviceNotOpen
+		}
+
+		flags := consts.MF_SOURCE_READER_FLAG(pdwStreamFlags)
+		if flags&consts.MF_SOURCE_READERF_STREAMTICK != 0 || ppSample == nil {
+			// Stream tick (or an empty read with no error): keep waiting for a
+			// real sample rather than handing back an empty/error result.
+			if ppSample != nil {
+				_ = ppSample.Release()
+				ppSample = nil
+			}
+			runtime.Gosched()
+			continue
+		}
+
 		return &SampleData{
 			PdwActualStreamIndex: pdwActualStreamIndex,
-			PdwStreamFlags:       consts.MF_SOURCE_READER_FLAG(pdwStreamFlags),
-			PllTimestamp:         pllTimestamp,
-			PpSample:             nil,
-		}, utils.ErrorInternalError
-	} else {
-		return &SampleData{
-			PdwActualStreamIndex: pdwActualStreamIndex,
-			PdwStreamFlags:       consts.MF_SOURCE_READER_FLAG(pdwStreamFlags),
+			PdwStreamFlags:       flags,
 			PllTimestamp:         pllTimestamp,
 			PpSample:             ppSample,
 		}, nil
 	}
-
 }
+
+// GetNextFrame issues an asynchronous read request. It fails once the device
+// has been closed or the session has stopped itself after exhausting its
+// empty-sample retry budget.
 func (d *CaptureAsync) GetNextFrame() error {
-	err := d.Device.pSourceReader.ReadSample(consts.MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0, nil, nil, nil, nil)
-	if err != nil {
-		return err
+	d.mu.Lock()
+	stopped := d.stopped
+	d.mu.Unlock()
+	if stopped {
+		return utils.ErrorAsyncRetryExhausted
 	}
-	return nil
+	if d.Device.isClosed() {
+		return utils.ErrorDeviceNotOpen
+	}
+
+	d.Device.mu.Lock()
+	reader := d.Device.reader
+	d.Device.mu.Unlock()
+	if reader == nil {
+		return utils.ErrorDeviceNotOpen
+	}
+
+	return reader.ReadSample(consts.MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0, nil, nil, nil, nil)
+}
+
+// handleReadSample contains the callback's frame-delivery policy and is kept
+// free of syscall machinery so it can be unit tested directly. It is invoked
+// once per OnReadSample callback.
+//
+// Delivery guarantees:
+//   - After CloseDevice has started, no user callback ever receives a frame.
+//   - An empty sample re-issues a read request only up to
+//     maxEmptySampleRetries; afterwards the device error callback is notified
+//     exactly once and the session stops re-requesting until capture restarts.
+//   - A real sample resets the consecutive empty-sample counter.
+func (a *CaptureAsync) handleReadSample(hrStatus uint32, dwStreamIndex uint32, dwStreamFlags uint32, llTimestamp int64, pSample *mf.IMFSample) uintptr {
+	// Gate the whole callback: once closing begins this returns false and we
+	// leave without touching any device-owned object.
+	if !a.Device.beginCallback() {
+		return consts.S_OK
+	}
+	defer a.Device.endCallback()
+
+	if consts.HRESULT(hrStatus) != consts.S_OK {
+		a.reportError(consts.HResultError{Code: consts.HRESULT(hrStatus)})
+		return uintptr(hrStatus)
+	}
+
+	if pSample == nil {
+		return a.onEmptySample()
+	}
+	if pSample.S == nil {
+		return consts.S_OK
+	}
+
+	// A real sample arrived: the empty-sample streak is over.
+	a.mu.Lock()
+	a.emptySampleCount = 0
+	fn := a.callback.OnReadSampleFunc
+	a.mu.Unlock()
+
+	if fn != nil {
+		fn(a, dwStreamIndex, dwStreamFlags, llTimestamp, pSample)
+	}
+	return consts.S_OK
+}
+
+// onEmptySample handles a callback carrying no sample (stream tick). It
+// re-requests the next frame while the retry budget allows it; once the budget
+// is exhausted it reports a single error and stops.
+func (a *CaptureAsync) onEmptySample() uintptr {
+	a.mu.Lock()
+	if a.stopped {
+		// Already gave up for this session; stay quiet until a restart.
+		a.mu.Unlock()
+		return consts.S_OK
+	}
+	a.emptySampleCount++
+	exhausted := a.emptySampleCount > maxEmptySampleRetries
+	if exhausted {
+		a.stopped = true
+	}
+	a.mu.Unlock()
+
+	if exhausted {
+		a.reportError(utils.ErrorAsyncRetryExhausted)
+		return consts.S_OK
+	}
+
+	if err := a.GetNextFrame(); err != nil {
+		a.reportError(err)
+	}
+	return consts.S_OK
+}
+
+// reportError forwards an error to the device error callback at most once per
+// capture session, and never while the device is closing.
+func (a *CaptureAsync) reportError(err error) {
+	if a.Device.isClosed() {
+		return
+	}
+	a.reportOnce.Do(func() {
+		if a.Device.isClosed() {
+			return
+		}
+		a.Device.SetError(err)
+	})
 }
 
 type CaptureBuffer struct {

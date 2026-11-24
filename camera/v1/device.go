@@ -1,21 +1,62 @@
 package camera
 
 import (
+	"sync"
+
 	"github.com/Kirizu-Official/windows-camera-go/utils"
 	"github.com/Kirizu-Official/windows-camera-go/windows/consts"
 	"github.com/Kirizu-Official/windows-camera-go/windows/mf"
 )
 
+// sourceReader is the subset of *mf.IMFSourceReader that the capture session
+// actually needs. Keeping it an interface lets the capture logic be driven with
+// an in-process fake in tests, without a real camera or any COM calls.
+type sourceReader interface {
+	SetCurrentMediaType(dwStreamIndex uint32, pType *mf.IMFMediaType) error
+	ReadSample(dwStreamIndex uint32, dwControlFlags uint32, pdwActualStreamIndex *uint32, pdwStreamFlags *uint32, pllTimestamp *int64, ppSample **mf.IMFSample) error
+	Release() error
+}
+
+// sourceReaderProvider decouples capture startup from the concrete Media
+// Foundation factory, again so tests can substitute an in-process provider.
+type sourceReaderProvider interface {
+	createSourceReader(config *CaptureConfig) (sourceReader, *mf.IMFMediaType, error)
+}
+
 type Device struct {
-	Name          string
-	SymbolLink    string
+	Name       string
+	SymbolLink string
+
+	// mu protects every mutable field below, including the closed flag, the
+	// reader pointers and the error callback.
+	mu sync.Mutex
+
 	pDeviceActive *mf.IMFActivate
 	pDeviceSource *mf.IMFMediaSource
 	pDevPresent   *mf.IMFPresentationDescriptor
 	pSourceReader *mf.IMFSourceReader
 	pMediaType    *mf.IMFMediaType
+
+	// reader is the interface used by both capture paths and by CloseDevice.
+	// In production it is the same object as pSourceReader; in tests it can be
+	// a fake.
+	reader sourceReader
+	// readerProvider builds the source reader at capture startup.
+	readerProvider sourceReaderProvider
+
 	config        *CaptureConfig
 	errorCallBack func(err error)
+
+	// closed is set first during shutdown, before any resource is released, so
+	// that late callbacks and frame requests fail fast instead of touching
+	// released objects.
+	closed bool
+	// closeOnce makes sure concurrent or repeated CloseDevice calls converge on
+	// a single actual release.
+	closeOnce sync.Once
+	// callbackWG tracks callbacks currently executing. CloseDevice waits for
+	// all of them to leave before releasing anything they might touch.
+	callbackWG sync.WaitGroup
 }
 
 func OpenDevice(symbolLink string) (*Device, error) {
@@ -64,17 +105,51 @@ func (d *Device) init() error {
 		return err
 	}
 
+	d.readerProvider = &comSourceReaderProvider{device: d}
 	return nil
 }
 
-func (d *Device) internalErrorSet(err error) {
-	if d.errorCallBack != nil {
-		d.errorCallBack(err)
+// beginCallback marks one callback as in flight. It returns false once the
+// device has started closing, in which case the caller must return immediately
+// without touching any device resource.
+func (d *Device) beginCallback() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.closed {
+		return false
 	}
+	d.callbackWG.Add(1)
+	return true
+}
+
+func (d *Device) endCallback() {
+	d.callbackWG.Done()
+}
+
+// isClosed reports whether the device has started (or finished) closing.
+func (d *Device) isClosed() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.closed
+}
+
+// SetErrorCallBack registers the handler invoked for asynchronous capture
+// errors. It is safe to call concurrently with error delivery.
+func (d *Device) SetErrorCallBack(fn func(err error)) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.errorCallBack = fn
 }
 
 func (d *Device) GetControl() (*mf.IAMCameraControl, *mf.IAMVideoProcAmp, error) {
-	return d.pSourceReader.GetServiceForStream()
+	d.mu.Lock()
+	reader := d.pSourceReader
+	closed := d.closed
+	d.mu.Unlock()
+	if closed || reader == nil {
+		return nil, nil, utils.ErrorDeviceNotOpen
+	}
+	return reader.GetServiceForStream()
 }
 
 type ConfigParameterStatus struct {
@@ -424,22 +499,62 @@ func (d *Device) getConfig() (*ConfigParameter, error) {
 
 }
 
+// CloseDevice ends the capture session and releases every underlying COM
+// resource. It is idempotent and safe to call concurrently: only the first
+// call performs the release, every subsequent call returns immediately.
+//
+// The ordering is deliberate:
+//  1. Flip the closed flag while holding the lock so no new callback or frame
+//     request can start (they fail with ErrorDeviceNotOpen instead).
+//  2. Wait for callbacks already in flight to finish, so none of them can
+//     dereference an object released below.
+//  3. Release source reader -> media type -> presentation descriptor -> media
+//     source -> activate object, each exactly once.
 func (d *Device) CloseDevice() {
-	if d.pSourceReader != nil {
-		d.pSourceReader.Release()
-	}
-	if d.pMediaType != nil {
-		d.pMediaType.Release()
-	}
+	d.closeOnce.Do(func() {
+		d.mu.Lock()
+		d.closed = true
+		reader := d.reader
+		pSourceReader := d.pSourceReader
+		pMediaType := d.pMediaType
+		pDevPresent := d.pDevPresent
+		pDeviceSource := d.pDeviceSource
+		pDeviceActive := d.pDeviceActive
+		d.mu.Unlock()
 
-	if d.pDevPresent != nil {
-		d.pDevPresent.Release()
-	}
-	if d.pDeviceSource != nil {
-		d.pDeviceSource.Release()
-	}
-	if d.pDeviceActive != nil {
-		d.pDeviceActive.Release()
-	}
+		// Wait outside the lock: in-flight callbacks do not hold d.mu while
+		// doing their work, so they can always reach endCallback().
+		d.callbackWG.Wait()
 
+		// Prefer the interface handle (present in both production and test
+		// builds); fall back to the concrete pointer only if the interface was
+		// never assigned. Each pointer is released once and then dropped.
+		if reader != nil {
+			_ = reader.Release()
+		} else if pSourceReader != nil {
+			_ = pSourceReader.Release()
+		}
+		if pMediaType != nil {
+			_ = pMediaType.Release()
+		}
+		if pDevPresent != nil {
+			_ = pDevPresent.Release()
+		}
+		if pDeviceSource != nil {
+			_ = pDeviceSource.Release()
+		}
+		if pDeviceActive != nil {
+			_ = pDeviceActive.Release()
+		}
+
+		d.mu.Lock()
+		d.reader = nil
+		d.pSourceReader = nil
+		d.pMediaType = nil
+		d.pDevPresent = nil
+		d.pDeviceSource = nil
+		d.pDeviceActive = nil
+		d.config = nil
+		d.mu.Unlock()
+	})
 }
