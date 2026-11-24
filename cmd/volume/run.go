@@ -56,16 +56,15 @@ func run(args []string, out io.Writer) error {
 }
 
 func printStatus(out io.Writer) error {
-	vol, err := volume.GetVolume()
+	// A single GetStatus call returns volume and muted as one consistent
+	// snapshot; reading them separately could interleave with another
+	// process changing the state.
+	state, err := volume.GetStatus()
 	if err != nil {
 		return err
 	}
-	muted, err := volume.GetMuted()
-	if err != nil {
-		return err
-	}
-	fmt.Fprintf(out, "volume: %d\n", vol)
-	fmt.Fprintf(out, "muted: %t\n", muted)
+	fmt.Fprintf(out, "volume: %d\n", state.Volume)
+	fmt.Fprintf(out, "muted: %t\n", state.Muted)
 	return nil
 }
 

@@ -1,11 +1,15 @@
 #!/bin/bash
 
-volume=/tmp/pactl-volume
+# The state directory can be overridden through PACTL_FAKE_STATE so that
+# separate test processes do not share (and clobber) the same files. The
+# default preserves the original /tmp-based behavior.
+state_dir="${PACTL_FAKE_STATE:-/tmp}"
+volume="$state_dir/pactl-volume"
 if ! [[ -f "$volume" ]]; then
   echo "30" >"$volume"
 fi
 
-mute=/tmp/pactl-mute
+mute="$state_dir/pactl-mute"
 if ! [[ -f "$mute" ]]; then
   echo "no" >"$mute"
 fi

@@ -1,32 +1,40 @@
 package volume
 
 import (
-	"errors"
 	"math"
 
 	"github.com/go-ole/go-ole"
 	"github.com/moutend/go-wca/pkg/wca"
 )
 
-// GetVolume returns the current volume (0 to 100).
-func GetVolume() (int, error) {
-	vol, err := invoke(func(aev *wca.IAudioEndpointVolume) (interface{}, error) {
-		var level float32
-		err := aev.GetMasterVolumeLevelScalar(&level)
-		vol := int(math.Floor(float64(level*100.0 + 0.5)))
-		return vol, err
-	})
-	if vol == nil {
-		return 0, err
-	}
-	return vol.(int), err
+// newDefaultBackend returns the Windows audio backend backed by the Core
+// Audio APIs through COM.
+func newDefaultBackend() audioBackend {
+	return &windowsBackend{}
 }
 
-// SetVolume sets the sound volume to the specified value.
-func SetVolume(volume int) error {
-	if volume < 0 || 100 < volume {
-		return errors.New("out of valid volume range")
+type windowsBackend struct{}
+
+func (b *windowsBackend) Status() (State, error) {
+	ret, err := invoke(func(aev *wca.IAudioEndpointVolume) (interface{}, error) {
+		var level float32
+		if err := aev.GetMasterVolumeLevelScalar(&level); err != nil {
+			return nil, err
+		}
+		volume := int(math.Floor(float64(level*100.0 + 0.5)))
+		var muted bool
+		if err := aev.GetMute(&muted); err != nil {
+			return nil, err
+		}
+		return State{Volume: volume, Muted: muted}, nil
+	})
+	if err != nil {
+		return State{}, err
 	}
+	return ret.(State), nil
+}
+
+func (b *windowsBackend) SetVolume(volume int) error {
 	_, err := invoke(func(aev *wca.IAudioEndpointVolume) (interface{}, error) {
 		err := aev.SetMasterVolumeLevelScalar(float32(volume)/100, nil)
 		return nil, err
@@ -34,47 +42,9 @@ func SetVolume(volume int) error {
 	return err
 }
 
-// IncreaseVolume increases (or decreases) the audio volume by the specified value.
-func IncreaseVolume(diff int) error {
+func (b *windowsBackend) SetMuted(muted bool) error {
 	_, err := invoke(func(aev *wca.IAudioEndpointVolume) (interface{}, error) {
-		var level float32
-		err := aev.GetMasterVolumeLevelScalar(&level)
-		if err != nil {
-			return nil, err
-		}
-		vol := math.Min(math.Max(math.Floor(float64(level*100.0+0.5))+float64(diff), 0.0), 100.0)
-		err = aev.SetMasterVolumeLevelScalar(float32(vol)/100, nil)
-		return nil, err
-	})
-	return err
-}
-
-// GetMuted returns the current muted status.
-func GetMuted() (bool, error) {
-	muted, err := invoke(func(aev *wca.IAudioEndpointVolume) (interface{}, error) {
-		var muted bool
-		err := aev.GetMute(&muted)
-		return muted, err
-	})
-	if muted == nil {
-		return false, err
-	}
-	return muted.(bool), err
-}
-
-// Mute mutes the audio.
-func Mute() error {
-	_, err := invoke(func(aev *wca.IAudioEndpointVolume) (interface{}, error) {
-		err := aev.SetMute(true, nil)
-		return nil, err
-	})
-	return err
-}
-
-// Unmute unmutes the audio.
-func Unmute() error {
-	_, err := invoke(func(aev *wca.IAudioEndpointVolume) (interface{}, error) {
-		err := aev.SetMute(false, nil)
+		err := aev.SetMute(muted, nil)
 		return nil, err
 	})
 	return err

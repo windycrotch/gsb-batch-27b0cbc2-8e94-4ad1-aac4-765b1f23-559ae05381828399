@@ -9,23 +9,76 @@ import (
 	"strings"
 )
 
-var useAmixer bool
-
-func init() {
-	if _, err := execCmd([]string{"pactl", "info"}); err != nil {
-		useAmixer = true
-	}
-}
-
 func cmdEnv() []string {
 	return []string{"LANG=C", "LC_ALL=C"}
 }
 
-func getVolumeCmd() []string {
-	if useAmixer {
-		return []string{"amixer", "get", "Master"}
+// newDefaultBackend returns the Linux audio backend. PulseAudio (pactl) is
+// preferred; amixer is used as a fallback when pactl is unavailable. The
+// availability is re-probed after every failure so that a transient outage
+// never degrades the package to the wrong backend permanently.
+func newDefaultBackend() audioBackend {
+	pactl := &pactlBackend{}
+	amixer := &amixerBackend{}
+	return &failoverBackend{
+		preferred: pactl,
+		fallback:  amixer,
+		probe: func() error {
+			_, err := execCmd([]string{"pactl", "info"})
+			return err
+		},
 	}
-	return []string{"pactl", "list", "sinks"}
+}
+
+// pactlBackend controls the audio through PulseAudio's pactl command.
+type pactlBackend struct{}
+
+func (b *pactlBackend) Status() (State, error) {
+	sinkName, sinkNameErr := getPulseAudioDefaultSink()
+	out, err := execCmd([]string{"pactl", "list", "sinks"})
+	if err != nil {
+		return State{}, err
+	}
+	return parseState(string(out), false, sinkName, sinkNameErr)
+}
+
+func (b *pactlBackend) SetVolume(volume int) error {
+	_, err := execCmd([]string{"pactl", "--", "set-sink-volume", "@DEFAULT_SINK@", strconv.Itoa(volume) + "%"})
+	return err
+}
+
+func (b *pactlBackend) SetMuted(muted bool) error {
+	flag := "0"
+	if muted {
+		flag = "1"
+	}
+	_, err := execCmd([]string{"pactl", "--", "set-sink-mute", "@DEFAULT_SINK@", flag})
+	return err
+}
+
+// amixerBackend controls the audio through the ALSA amixer command.
+type amixerBackend struct{}
+
+func (b *amixerBackend) Status() (State, error) {
+	out, err := execCmd([]string{"amixer", "get", "Master"})
+	if err != nil {
+		return State{}, err
+	}
+	return parseState(string(out), true, "", nil)
+}
+
+func (b *amixerBackend) SetVolume(volume int) error {
+	_, err := execCmd([]string{"amixer", "set", "Master", strconv.Itoa(volume) + "%"})
+	return err
+}
+
+func (b *amixerBackend) SetMuted(muted bool) error {
+	action := "unmute"
+	if muted {
+		action = "mute"
+	}
+	_, err := execCmd([]string{"amixer", "-D", "pulse", "set", "Master", action})
+	return err
 }
 
 func getPulseAudioDefaultSink() (string, error) {
@@ -48,90 +101,61 @@ func getPulseAudioDefaultSink() (string, error) {
 
 var volumePattern = regexp.MustCompile(`\d+%`)
 
-func parseVolume(out string) (int, error) {
-	sinkName, sinkNameErr := getPulseAudioDefaultSink()
-	isDefaultSink := sinkNameErr != nil
+// parseState extracts the volume and the muted flag from a single command
+// output, so both values describe the same point in time. sinkName locates
+// the default PulseAudio sink; when sinkNameErr is non-nil the sink could
+// not be identified, in which case the first sink in the output is used as
+// a fallback rather than silently parsing the wrong sink. The isAmixer
+// flag selects the ALSA output layout.
+func parseState(out string, isAmixer bool, sinkName string, sinkNameErr error) (State, error) {
+	// When the default sink name is known, only the block following its
+	// "Name:" line is parsed. When it could not be determined, fall back to
+	// the first sink block in the output.
+	fallback := sinkNameErr != nil
+	inDefaultBlock := fallback
+	var state State
+	volumeFound, mutedFound := false, false
 
-	lines := strings.Split(out, "\n")
-
-	for _, line := range lines {
+	for _, line := range strings.Split(out, "\n") {
 		s := strings.TrimLeft(line, " \t")
 
-		if !useAmixer && !isDefaultSink && strings.Contains(s, "Name: "+sinkName) {
-			isDefaultSink = true
+		if !isAmixer && strings.HasPrefix(s, "Name: ") {
+			inDefaultBlock = fallback || strings.Contains(s, "Name: "+sinkName)
 		}
 
-		if useAmixer && strings.Contains(s, "Playback") && strings.Contains(s, "%") ||
-			!useAmixer && isDefaultSink && strings.HasPrefix(s, "Volume:") {
+		amixerLine := isAmixer && strings.Contains(s, "Playback") && strings.Contains(s, "%")
+		pactlVolumeLine := !isAmixer && inDefaultBlock && strings.HasPrefix(s, "Volume:")
+		if !volumeFound && (amixerLine || pactlVolumeLine) {
 			volumeStr := volumePattern.FindString(s)
-			return strconv.Atoi(volumeStr[:len(volumeStr)-1])
-		}
-	}
-	return 0, errors.New("no volume found")
-}
-
-func setVolumeCmd(volume int) []string {
-	if useAmixer {
-		return []string{"amixer", "set", "Master", strconv.Itoa(volume) + "%"}
-	}
-	return []string{"pactl", "set-sink-volume", "@DEFAULT_SINK@", strconv.Itoa(volume) + "%"}
-}
-
-func increaseVolumeCmd(diff int) []string {
-	var sign string
-	if diff >= 0 {
-		sign = "+"
-	} else if useAmixer {
-		diff = -diff
-		sign = "-"
-	}
-	if useAmixer {
-		return []string{"amixer", "set", "Master", strconv.Itoa(diff) + "%" + sign}
-	}
-	return []string{"pactl", "--", "set-sink-volume", "@DEFAULT_SINK@", sign + strconv.Itoa(diff) + "%"}
-}
-
-func getMutedCmd() []string {
-	if useAmixer {
-		return []string{"amixer", "get", "Master"}
-	}
-	return []string{"pactl", "list", "sinks"}
-}
-
-func parseMuted(out string) (bool, error) {
-	sinkName, sinkNameErr := getPulseAudioDefaultSink()
-	isDefaultSink := sinkNameErr != nil
-
-	lines := strings.Split(out, "\n")
-	for _, line := range lines {
-		s := strings.TrimLeft(line, " \t")
-
-		if !useAmixer && !isDefaultSink && strings.Contains(s, "Name: "+sinkName) {
-			isDefaultSink = true
+			if volumeStr == "" {
+				return State{}, errors.New("no volume found")
+			}
+			volume, err := strconv.Atoi(volumeStr[:len(volumeStr)-1])
+			if err != nil {
+				return State{}, err
+			}
+			state.Volume = volume
+			volumeFound = true
 		}
 
-		if useAmixer && strings.Contains(s, "Playback") && strings.Contains(s, "%") ||
-			!useAmixer && isDefaultSink && strings.HasPrefix(s, "Mute: ") {
-			if strings.Contains(s, "[off]") || strings.Contains(s, "yes") {
-				return true, nil
-			} else if strings.Contains(s, "[on]") || strings.Contains(s, "no") {
-				return false, nil
+		pactlMuteLine := !isAmixer && inDefaultBlock && strings.HasPrefix(s, "Mute: ")
+		if !mutedFound && (amixerLine || pactlMuteLine) {
+			switch {
+			case strings.Contains(s, "[off]") || strings.Contains(s, "yes"):
+				state.Muted = true
+				mutedFound = true
+			case strings.Contains(s, "[on]") || strings.Contains(s, "no"):
+				state.Muted = false
+				mutedFound = true
 			}
 		}
 	}
-	return false, errors.New("no muted information found")
-}
 
-func muteCmd() []string {
-	if useAmixer {
-		return []string{"amixer", "-D", "pulse", "set", "Master", "mute"}
+	if !volumeFound {
+		return State{}, errors.New("no volume found")
 	}
-	return []string{"pactl", "set-sink-mute", "@DEFAULT_SINK@", "1"}
-}
-
-func unmuteCmd() []string {
-	if useAmixer {
-		return []string{"amixer", "-D", "pulse", "set", "Master", "unmute"}
+	if !mutedFound {
+		return State{}, errors.New("no muted information found")
 	}
-	return []string{"pactl", "set-sink-mute", "@DEFAULT_SINK@", "0"}
+	return state, nil
 }

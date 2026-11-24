@@ -12,25 +12,52 @@ import (
 	"github.com/itchyny/volume-go"
 )
 
+// audioAvailable reports whether the machine exposes a usable, writable
+// audio endpoint. Some virtualized endpoints accept reads yet reject
+// writes, so the probe performs a write-and-restore as well.
+// Hardware-dependent tests skip when it is unavailable.
+var audioAvailable bool
+
 func TestMain(m *testing.M) {
+	useIsolatedFakePactl()
+	audioAvailable = probeAudioControl()
+	if !audioAvailable {
+		fmt.Fprintln(os.Stderr, "no writable audio device available, skipping hardware tests")
+	}
+	code := m.Run()
+	os.Exit(code)
+}
+
+// probeAudioControl checks that volume and muted state can be read and
+// changed, restoring the observed state afterwards.
+func probeAudioControl() bool {
 	origVolume, err := volume.GetVolume()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "get volume failed: %+v\n", err)
-		os.Exit(1)
+		return false
 	}
 	origMuted, err := volume.GetMuted()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "get muted failed: %+v\n", err)
-		os.Exit(1)
+		return false
 	}
-	code := m.Run()
-	_ = volume.SetVolume(origVolume)
+	if err := volume.SetVolume(origVolume); err != nil {
+		return false
+	}
+	if err := volume.Unmute(); err != nil {
+		return false
+	}
 	if origMuted {
-		_ = volume.Mute()
-	} else {
-		_ = volume.Unmute()
+		if err := volume.Mute(); err != nil {
+			return false
+		}
 	}
-	os.Exit(code)
+	return true
+}
+
+func skipIfNoAudio(t *testing.T) {
+	t.Helper()
+	if !audioAvailable {
+		t.Skip("no audio device available; skipping hardware-dependent test")
+	}
 }
 
 func TestRunVersion(t *testing.T) {
@@ -56,6 +83,7 @@ func TestRunHelp(t *testing.T) {
 }
 
 func TestRunStatus(t *testing.T) {
+	skipIfNoAudio(t)
 	_ = volume.SetVolume(17)
 	_ = volume.Unmute()
 	out := new(bytes.Buffer)
@@ -78,6 +106,7 @@ func TestRunStatus(t *testing.T) {
 }
 
 func TestRunGetSet(t *testing.T) {
+	skipIfNoAudio(t)
 	out := new(bytes.Buffer)
 	if err := run([]string{"set", "13"}, out); err != nil {
 		t.Errorf("set volume failed: %+v", err)
@@ -92,6 +121,7 @@ func TestRunGetSet(t *testing.T) {
 }
 
 func TestRunUp(t *testing.T) {
+	skipIfNoAudio(t)
 	_ = volume.SetVolume(17)
 	{
 		if err := run([]string{"up"}, nil); err != nil {
@@ -124,6 +154,7 @@ func TestRunUp(t *testing.T) {
 }
 
 func TestRunDown(t *testing.T) {
+	skipIfNoAudio(t)
 	_ = volume.SetVolume(17)
 	{
 		if err := run([]string{"down"}, nil); err != nil {
@@ -156,6 +187,7 @@ func TestRunDown(t *testing.T) {
 }
 
 func TestRunMute(t *testing.T) {
+	skipIfNoAudio(t)
 	_ = volume.Unmute()
 	if err := run([]string{"mute"}, nil); err != nil {
 		t.Errorf("mute failed: %+v", err)
@@ -168,6 +200,7 @@ func TestRunMute(t *testing.T) {
 }
 
 func TestRunUnmute(t *testing.T) {
+	skipIfNoAudio(t)
 	_ = volume.Mute()
 	if err := run([]string{"unmute"}, nil); err != nil {
 		t.Errorf("unmute failed: %+v", err)

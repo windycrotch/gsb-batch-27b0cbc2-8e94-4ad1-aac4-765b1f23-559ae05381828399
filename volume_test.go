@@ -7,28 +7,32 @@ import (
 	"testing"
 )
 
+// audioAvailable reports whether the machine exposes a usable, writable
+// audio endpoint. Hardware-dependent tests skip when it is unavailable (for
+// example a CI sandbox without an audio device or with a read-only virtual
+// endpoint); the concurrency and failure-handling guarantees are covered by
+// the fake-backend tests which run everywhere.
+var audioAvailable bool
+
 func TestMain(m *testing.M) {
-	origVolume, err := GetVolume()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "get volume failed: %+v\n", err)
-		os.Exit(1)
-	}
-	origMuted, err := GetMuted()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "get muted failed: %+v\n", err)
-		os.Exit(1)
+	useIsolatedFakePactl()
+	audioAvailable = checkAudioControl()
+	if !audioAvailable {
+		fmt.Fprintln(os.Stderr, "no writable audio device available, skipping hardware tests")
 	}
 	code := m.Run()
-	_ = SetVolume(origVolume)
-	if origMuted {
-		_ = Mute()
-	} else {
-		_ = Unmute()
-	}
 	os.Exit(code)
 }
 
+func skipIfNoAudio(t *testing.T) {
+	t.Helper()
+	if !audioAvailable {
+		t.Skip("no audio device available; skipping hardware-dependent test")
+	}
+}
+
 func TestGetVolume(t *testing.T) {
+	skipIfNoAudio(t)
 	_, err := GetVolume()
 	if err != nil {
 		t.Errorf("get volume failed: %+v", err)
@@ -36,6 +40,7 @@ func TestGetVolume(t *testing.T) {
 }
 
 func TestSetVolume(t *testing.T) {
+	skipIfNoAudio(t)
 	for _, vol := range []int{0, 37, 54, 20, 10} {
 		err := SetVolume(vol)
 		if err != nil {
@@ -56,6 +61,7 @@ func TestSetVolume(t *testing.T) {
 }
 
 func TestIncreaseVolume(t *testing.T) {
+	skipIfNoAudio(t)
 	vol := 17
 	diff := 3
 	err := SetVolume(vol)
@@ -106,6 +112,7 @@ func TestIncreaseVolume(t *testing.T) {
 }
 
 func TestMute(t *testing.T) {
+	skipIfNoAudio(t)
 	err := Mute()
 	if err != nil {
 		t.Errorf("mute failed: %+v", err)
@@ -120,6 +127,7 @@ func TestMute(t *testing.T) {
 }
 
 func TestUnmute(t *testing.T) {
+	skipIfNoAudio(t)
 	err := Unmute()
 	if err != nil {
 		t.Errorf("unmute failed: %+v", err)
