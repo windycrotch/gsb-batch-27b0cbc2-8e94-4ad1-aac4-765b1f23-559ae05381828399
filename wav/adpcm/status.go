@@ -60,9 +60,15 @@ func saveSample(samples []byte, idx int, sample int) int {
 // -------------------------------------------------------------------------------------
 
 func loadStatus(b []byte) *status {
+	index := int(b[2])
+	if index < 0 {
+		index = 0
+	} else if index > 88 {
+		index = 88
+	}
 	return &status{
 		sample: int(int16(b[0]) | (int16(b[1]) << 8)),
-		index:  int(b[2]),
+		index:  index,
 	}
 }
 

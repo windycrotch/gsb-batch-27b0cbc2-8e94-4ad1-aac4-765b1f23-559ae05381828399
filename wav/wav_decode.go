@@ -67,6 +67,7 @@ func decodeEx(r *bufiox.Reader, cfg *Config) (audio.Decoded, error) {
 
 type stream struct {
 	src            *bufiox.Reader
+	mu             sync.Mutex
 	headerSize     int64
 	dataSize       int64
 	remaining      int64
@@ -76,6 +77,8 @@ type stream struct {
 }
 
 func (s *stream) Read(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.remaining < int64(len(p)) {
 		if s.remaining <= 0 {
 			return 0, io.EOF
@@ -88,10 +91,16 @@ func (s *stream) Read(p []byte) (int, error) {
 }
 
 func (s *stream) Seek(offset int64, whence int) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	switch whence {
 	case io.SeekStart:
 		offset = offset + s.headerSize
 	case io.SeekCurrent:
+		// The underlying buffered reader may have read ahead, so the
+		// current offset must be computed from the logical position.
+		offset = s.headerSize + (s.dataSize - s.remaining) + offset
+		whence = io.SeekStart
 	case io.SeekEnd:
 		offset = s.headerSize + s.dataSize + offset
 		whence = io.SeekStart
@@ -152,8 +161,8 @@ func decode(src *bufiox.Reader) (audio.Decoded, error) {
 		return nil, errNotWAVE
 	}
 
-	// Read chunks
-	cfg := Config{HeaderSize: int64(len(b))}
+	// Read chunks. Only the 12 bytes of the RIFF header were consumed above.
+	cfg := Config{HeaderSize: 12}
 chunks:
 	for {
 		if _, err := src.ReadFull(b[:8]); err != nil {

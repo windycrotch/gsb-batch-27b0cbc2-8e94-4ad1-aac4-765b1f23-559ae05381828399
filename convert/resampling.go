@@ -1,8 +1,10 @@
 package convert
 
 import (
+	"errors"
 	"io"
 	"math"
+	"sync"
 
 	"github.com/qiniu/audio"
 )
@@ -57,15 +59,25 @@ func sinc01(x float64) float64 {
 // Resampling class.
 type Resampling struct {
 	source       io.ReadSeeker
+	mu           sync.Mutex
 	size         int64
 	from         int
 	to           int
 	pos          int64
-	srcBlock     int64
+	srcBlock     int64 // source is physically positioned at the end of this block
 	srcBufL      map[int64][]float64
 	srcBufR      map[int64][]float64
 	lruSrcBlocks []int64
 }
+
+const (
+	// srcBlockInitial means the source is at offset 0 (end of block -1).
+	srcBlockInitial = -1
+	// srcBlockUnknown means the physical source position is unknown, so the
+	// next block load must re-seek. srcBlockUnknown+1 never matches a real
+	// block index.
+	srcBlockUnknown = -2
+)
 
 // NewResampling func.
 func NewResampling(source io.ReadSeeker, size int64, from, to int) *Resampling {
@@ -74,7 +86,7 @@ func NewResampling(source io.ReadSeeker, size int64, from, to int) *Resampling {
 		size:     size,
 		from:     from,
 		to:       to,
-		srcBlock: -1,
+		srcBlock: srcBlockInitial,
 		srcBufL:  map[int64][]float64{},
 		srcBufR:  map[int64][]float64{},
 	}
@@ -100,6 +112,7 @@ func (r *Resampling) src(i int64) (float64, float64, error) {
 	if _, ok := r.srcBufL[nextPos]; !ok {
 		if r.srcBlock+1 != nextPos {
 			if _, err := r.source.Seek(nextPos*resamplingBufferSize*4, io.SeekStart); err != nil {
+				r.srcBlock = srcBlockUnknown
 				return 0, 0, err
 			}
 		}
@@ -112,6 +125,9 @@ func (r *Resampling) src(i int64) (float64, float64, error) {
 				if err == io.EOF {
 					break
 				}
+				// The physical source position is unknown now; force a
+				// re-seek on the next access so no stale state remains.
+				r.srcBlock = srcBlockUnknown
 				return 0, 0, err
 			}
 		}
@@ -134,10 +150,12 @@ func (r *Resampling) src(i int64) (float64, float64, error) {
 		}
 		r.lruSrcBlocks = append(r.lruSrcBlocks, r.srcBlock)
 	} else {
-		r.srcBlock = nextPos
+		// Cache hit: only refresh the LRU. Do NOT touch r.srcBlock here -
+		// it tracks the physical source position, which this path doesn't
+		// change.
 		idx := -1
 		for i, p := range r.lruSrcBlocks {
-			if p == r.srcBlock {
+			if p == nextPos {
 				idx = i
 				break
 			}
@@ -146,10 +164,10 @@ func (r *Resampling) src(i int64) (float64, float64, error) {
 			panic("not reach")
 		}
 		r.lruSrcBlocks = append(r.lruSrcBlocks[:idx], r.lruSrcBlocks[idx+1:]...)
-		r.lruSrcBlocks = append(r.lruSrcBlocks, r.srcBlock)
+		r.lruSrcBlocks = append(r.lruSrcBlocks, nextPos)
 	}
 	ii := i % resamplingBufferSize
-	return r.srcBufL[r.srcBlock][ii], r.srcBufR[r.srcBlock][ii], nil
+	return r.srcBufL[nextPos][ii], r.srcBufR[nextPos][ii], nil
 }
 
 func (r *Resampling) at(t int64) (float64, float64, error) {
@@ -195,7 +213,10 @@ func (r *Resampling) at(t int64) (float64, float64, error) {
 }
 
 func (r *Resampling) Read(b []uint8) (int, error) {
-	if r.pos == r.Length() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.pos >= r.Length() {
 		return 0, io.EOF
 	}
 	n := len(b) / 4 * 4
@@ -220,13 +241,18 @@ func (r *Resampling) Read(b []uint8) (int, error) {
 
 // Seek func.
 func (r *Resampling) Seek(offset int64, whence int) (int64, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
 	switch whence {
 	case io.SeekStart:
 		r.pos = offset
 	case io.SeekCurrent:
 		r.pos += offset
 	case io.SeekEnd:
-		r.pos += r.Length() + offset
+		r.pos = r.Length() + offset
+	default:
+		return 0, errors.New("convert: invalid whence")
 	}
 	if r.pos < 0 {
 		r.pos = 0
@@ -234,13 +260,15 @@ func (r *Resampling) Seek(offset int64, whence int) (int64, error) {
 	if r.Length() <= r.pos {
 		r.pos = r.Length()
 	}
+	// Positions are always whole stereo16 frames.
+	r.pos = r.pos / 4 * 4
 	return r.pos, nil
 }
 
 // -------------------------------------------------------------------------------------
 
 type resampleDecoded struct {
-	Resampling
+	*Resampling
 	d audio.Decoded
 }
 
@@ -268,7 +296,7 @@ func Resample(d audio.Decoded, sampleRate int) audio.Decoded {
 		return d
 	}
 	s := NewResampling(d, d.Length(), sampleRateFrom, sampleRate)
-	return &resampleDecoded{*s, d}
+	return &resampleDecoded{s, d}
 }
 
 // -------------------------------------------------------------------------------------

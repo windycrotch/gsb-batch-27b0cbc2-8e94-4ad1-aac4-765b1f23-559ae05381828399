@@ -3,6 +3,7 @@ package adpcm
 import (
 	"errors"
 	"fmt"
+	"sync"
 
 	"github.com/qiniu/audio"
 	"github.com/qiniu/audio/wav"
@@ -17,6 +18,7 @@ var (
 
 type decoded struct {
 	src *bufiox.Reader
+	mu  sync.Mutex
 
 	samples   []byte
 	remaining int
@@ -27,8 +29,11 @@ type decoded struct {
 	blockAlign int
 }
 
-func newDecoded(src *bufiox.Reader, cfg *wav.Config) *decoded {
+func newDecoded(src *bufiox.Reader, cfg *wav.Config) (*decoded, error) {
 	samplesPerBlock := cfg.SamplesPerBlock()
+	if samplesPerBlock <= 0 || cfg.BlockAlign < cfg.Channels*4 || cfg.BlockAlign > 1<<20 {
+		return nil, fmt.Errorf("adpcm wav: invalid block align %d", cfg.BlockAlign)
+	}
 	return &decoded{
 		src:        bufiox.NewReaderSize(src, cfg.BlockAlign),
 		sampleRate: cfg.SampleRate,
@@ -36,7 +41,7 @@ func newDecoded(src *bufiox.Reader, cfg *wav.Config) *decoded {
 		blockAlign: cfg.BlockAlign,
 		samples:    make([]byte, samplesPerBlock<<1),
 		length:     cfg.DataSize / int64(cfg.BlockAlign) * int64(samplesPerBlock<<1),
-	}
+	}, nil
 }
 
 func (p *decoded) nextBlock() error {
@@ -46,17 +51,19 @@ func (p *decoded) nextBlock() error {
 	}
 	loadBlock(p.channelNum, block, p.samples)
 	p.src.Discard(p.blockAlign)
-	p.remaining = p.blockAlign
+	p.remaining = len(p.samples)
 	return nil
 }
 
 func (p *decoded) Read(b []byte) (n int, err error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	if p.remaining <= 0 {
 		if err = p.nextBlock(); err != nil {
 			return
 		}
 	}
-	n = copy(b, p.samples[p.blockAlign-p.remaining:])
+	n = copy(b, p.samples[len(p.samples)-p.remaining:])
 	p.remaining -= n
 	return
 }
@@ -93,8 +100,7 @@ func decode(src *bufiox.Reader, cfg *wav.Config) (dec audio.Decoded, err error) 
 	if cfg.BitsPerSample != 4 {
 		return nil, fmt.Errorf("adpcm wav: bits per sample must be 4 but was %d", cfg.BitsPerSample)
 	}
-	d := newDecoded(src, cfg)
-	return d, nil
+	return newDecoded(src, cfg)
 }
 
 const (

@@ -2,6 +2,7 @@ package mp3
 
 import (
 	"io"
+	"sync"
 
 	"github.com/qiniu/audio"
 	"github.com/qiniu/x/bufiox"
@@ -13,6 +14,22 @@ import (
 
 type decoded struct {
 	mp3.Decoder
+	mu sync.Mutex
+}
+
+// Read reads from the decoded stream. It is serialized with Seek so
+// concurrent goroutines cannot observe each other's positions.
+func (p *decoded) Read(b []byte) (int, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.Decoder.Read(b)
+}
+
+// Seek sets the position of the decoded stream.
+func (p *decoded) Seek(offset int64, whence int) (int64, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.Decoder.Seek(offset, whence)
 }
 
 // Channels returns the number of channels. One channel is mono playback.

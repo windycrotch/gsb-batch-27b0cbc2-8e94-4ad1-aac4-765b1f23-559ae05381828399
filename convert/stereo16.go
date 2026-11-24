@@ -1,17 +1,20 @@
 package convert
 
 import (
+	"errors"
 	"io"
+	"sync"
 
 	"github.com/qiniu/audio"
-	"github.com/qiniu/x/bufiox"
 )
 
 // -------------------------------------------------------------------------------------
 
 // Stereo16 class.
 type Stereo16 struct {
-	source *bufiox.Reader
+	source io.ReadSeeker
+	mu     sync.Mutex
+	pos    int64 // current position in source bytes
 	mono   bool
 	eight  bool
 }
@@ -19,13 +22,28 @@ type Stereo16 struct {
 // NewStereo16 func.
 func NewStereo16(source io.ReadSeeker, isMono, eightBitsPerSample bool) *Stereo16 {
 	return &Stereo16{
-		source: bufiox.NewReader(source),
+		source: source,
 		mono:   isMono,
 		eight:  eightBitsPerSample,
 	}
 }
 
+// frameSize returns the number of source bytes per sample frame.
+func (s *Stereo16) frameSize() int {
+	frame := 4
+	if s.mono {
+		frame >>= 1
+	}
+	if s.eight {
+		frame >>= 1
+	}
+	return frame
+}
+
 func (s *Stereo16) Read(b []uint8) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	l := len(b)
 	if s.mono {
 		l >>= 1
@@ -33,8 +51,15 @@ func (s *Stereo16) Read(b []uint8) (int, error) {
 	if s.eight {
 		l >>= 1
 	}
+	// Align to whole source frames, so the stream never drifts off frame
+	// boundaries and no partial frame is ever expanded.
+	l = l / s.frameSize() * s.frameSize()
+	if l == 0 {
+		return 0, nil
+	}
 	buf := b[len(b)-l:]
-	n, err := s.source.ReadFull(buf) // ReadFull: forbidden to read odd bytes (when !mono or !eight).
+	n, err := io.ReadFull(s.source, buf)
+	s.pos += int64(n)
 	if err != nil {
 		if err == io.ErrUnexpectedEOF {
 			err = io.EOF
@@ -42,6 +67,8 @@ func (s *Stereo16) Read(b []uint8) (int, error) {
 			return 0, err
 		}
 	}
+	// Drop a partial trailing frame, if any.
+	n = n / s.frameSize() * s.frameSize()
 	switch {
 	case s.mono && s.eight:
 		for i := 0; i < n; i++ {
@@ -79,19 +106,56 @@ func (s *Stereo16) Read(b []uint8) (int, error) {
 
 // Seek func.
 func (s *Stereo16) Seek(offset int64, whence int) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	if s.mono {
 		offset >>= 1
 	}
 	if s.eight {
 		offset >>= 1
 	}
-	return s.source.Seek(offset, whence)
+	var abs int64
+	switch whence {
+	case io.SeekStart:
+		abs = offset
+	case io.SeekCurrent:
+		// Computed from our own logical position: the source may be a
+		// buffered stream whose physical position has read ahead.
+		abs = s.pos + offset
+	case io.SeekEnd:
+		pos, err := s.source.Seek(offset, io.SeekEnd)
+		if err != nil {
+			return 0, err
+		}
+		s.pos = pos
+		return s.logicalPos(), nil
+	default:
+		return 0, errors.New("convert: invalid whence")
+	}
+	pos, err := s.source.Seek(abs, io.SeekStart)
+	if err != nil {
+		return 0, err
+	}
+	s.pos = pos
+	return s.logicalPos(), nil
+}
+
+func (s *Stereo16) logicalPos() int64 {
+	pos := s.pos
+	if s.eight {
+		pos <<= 1
+	}
+	if s.mono {
+		pos <<= 1
+	}
+	return pos
 }
 
 // -------------------------------------------------------------------------------------
 
 type stereo16Decoded struct {
-	Stereo16
+	*Stereo16
 	d audio.Decoded
 }
 
@@ -101,7 +165,7 @@ func ToStereo16(d audio.Decoded) audio.Decoded {
 	eight := (d.BytesPerSample() == 1)
 	if mono || eight {
 		s := NewStereo16(d, mono, eight)
-		return &stereo16Decoded{*s, d}
+		return &stereo16Decoded{s, d}
 	}
 	return d
 }
