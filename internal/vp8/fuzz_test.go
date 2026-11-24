@@ -40,14 +40,14 @@ type discardSink struct {
 	sum    uint64
 }
 
-func (s *discardSink) Buffer(y, n int) []byte {
+func (s *discardSink) Buffer(y, n int) ([]byte, error) {
 	if y != s.next || n <= 0 || y+n > s.height {
 		panic("sink protocol violation")
 	}
 	if cap(s.buf) < n*s.stride {
 		s.buf = make([]byte, n*s.stride)
 	}
-	return s.buf[:n*s.stride]
+	return s.buf[:n*s.stride], nil
 }
 func (s *discardSink) Stride() int { return s.stride }
 func (s *discardSink) Commit(y, n int) error {

@@ -188,11 +188,11 @@ type rowSink struct {
 	fail  error
 }
 
-func (s *rowSink) Buffer(y, n int) []byte {
+func (s *rowSink) Buffer(y, n int) ([]byte, error) {
 	if y != s.next {
 		panic("rows out of order")
 	}
-	return s.img.Pix[y*s.img.Stride : (y+n)*s.img.Stride]
+	return s.img.Pix[y*s.img.Stride : (y+n)*s.img.Stride], nil
 }
 func (s *rowSink) Stride() int { return s.img.Stride }
 func (s *rowSink) Commit(y, n int) error {

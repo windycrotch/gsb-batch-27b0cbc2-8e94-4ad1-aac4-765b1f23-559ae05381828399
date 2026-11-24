@@ -149,9 +149,9 @@ func newTraceSink(w, h int) *traceSink {
 	return &traceSink{img: image.NewNRGBA(image.Rect(0, 0, w, h)), need: h, gids: map[uint64]bool{}}
 }
 
-func (s *traceSink) Buffer(y, n int) []byte {
+func (s *traceSink) Buffer(y, n int) ([]byte, error) {
 	s.log = append(s.log, fmt.Sprintf("B%d+%d", y, n))
-	return s.img.Pix[y*s.img.Stride : (y+n)*s.img.Stride]
+	return s.img.Pix[y*s.img.Stride : (y+n)*s.img.Stride], nil
 }
 func (s *traceSink) Stride() int { return s.img.Stride }
 func (s *traceSink) Commit(y, n int) error {

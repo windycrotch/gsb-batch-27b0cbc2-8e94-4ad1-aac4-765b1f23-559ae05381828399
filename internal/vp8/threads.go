@@ -24,10 +24,12 @@ package vp8
 // Algorithm adapted from libwebp (BSD-3-Clause): src/dec/frame_dec.c (mt_method 2 worker split).
 
 import (
+	"errors"
 	"runtime"
 	"sync"
 	"sync/atomic"
 
+	"github.com/kolesa-team/go-webp/v2/internal/pipeline"
 	"github.com/kolesa-team/go-webp/v2/internal/status"
 	"github.com/kolesa-team/go-webp/v2/internal/workers"
 )
@@ -127,6 +129,11 @@ type mtState struct {
 	jobs chan mtJob
 	free chan struct{}
 	stop atomic.Bool // set when a stage stops early: the others stop too
+	// sinkStop is set together with stop when the sink itself asked for a
+	// clean stop (pipeline.ErrStop from Buffer or Commit). The parser runs
+	// ahead of the sink and may have parsed into a truncated region first,
+	// so its speculative error must not turn a clean stop into a failure.
+	sinkStop atomic.Bool
 	// The parser waits for a free batch, the reconstruction helper for a
 	// batch or a free row cache.
 	parserParked, reconParked parked
@@ -299,12 +306,18 @@ parse:
 	// emit helper, so its error (or panic) comes first; either comes from
 	// an earlier row than perr.
 	if err := t.Wait(); err != nil {
-		return err
+		return d.afterSinkError(err)
 	}
 	if e != nil {
 		if err := e.task.Wait(); err != nil {
-			return err
+			return d.afterSinkError(err)
 		}
+	}
+	if m.sinkStop.Load() {
+		// The sink stopped cleanly: any perr came from the parser reading
+		// ahead into a region the sink never asked for and must not turn
+		// the clean stop into a failure. The committed rows are final.
+		return nil
 	}
 	if perr != nil && d.rowsOut < d.sink.NeedRows() {
 		// decodeFrame would have stopped before parsing the broken row
@@ -320,6 +333,7 @@ func (m *mtState) init(mbW, k int) {
 	m.jobs = make(chan mtJob, mtSlots)
 	m.free = make(chan struct{}, mtSlots)
 	m.stop.Store(false)
+	m.sinkStop.Store(false)
 	if n := mtSlots * k * mbW; cap(m.blocks) < n {
 		m.blocks = make([]mbBlock, n)
 	} else {
@@ -462,6 +476,13 @@ func (d *decoder) reconBatches() error {
 				}
 				d.reconRow(j.y+i, j.blocks[i*d.mbW:][:d.mbW])
 				if err := d.finishRow(j.y + i); err != nil {
+					if errors.Is(err, pipeline.ErrStop) {
+						// Clean stop after the committed rows (Buffer or
+						// Commit): record it and tell the parser (and the
+						// emitter, if any starts later) to stop.
+						m.stop.Store(true)
+						return d.afterSinkError(err)
+					}
 					return err
 				}
 			}
@@ -541,6 +562,12 @@ func (d *decoder) emitBatches(e *mtEmitter) error {
 			}
 			yo, uvo := 16*i*d.cacheYStride, 8*i*d.cacheUVStride
 			if err := d.emitRow(j.y+i, c.y[yo:], c.u[uvo:], c.v[uvo:]); err != nil {
+				if errors.Is(err, pipeline.ErrStop) {
+					// Clean stop (Buffer or Commit): record it; the deferred
+					// stop flag ends the parser and the reconstruction
+					// helper. No error reaches the caller.
+					return d.afterSinkError(err)
+				}
 				return err
 			}
 		}

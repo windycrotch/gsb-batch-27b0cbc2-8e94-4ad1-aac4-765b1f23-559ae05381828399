@@ -35,12 +35,12 @@ type discardSink struct {
 	buf []byte
 }
 
-func (s *discardSink) Buffer(y, n int) []byte {
+func (s *discardSink) Buffer(y, n int) ([]byte, error) {
 	need := n * 4 * s.w
 	if cap(s.buf) < need {
 		s.buf = make([]byte, need)
 	}
-	return s.buf[:need]
+	return s.buf[:need], nil
 }
 func (s *discardSink) Stride() int           { return 4 * s.w }
 func (s *discardSink) Commit(y, n int) error { return nil }

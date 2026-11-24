@@ -460,7 +460,10 @@ func (d *decoder) emitRows(argb []uint32, y0, row int) error {
 		}
 		return nil
 	}
-	b := d.sink.Buffer(y0, n)
+	b, err := d.sink.Buffer(y0, n)
+	if err != nil {
+		return err
+	}
 	stride := d.sink.Stride()
 	if stride < 4*fw || len(b) < (n-1)*stride+4*fw {
 		return status.InvalidParam("vp8l: sink buffer too small")

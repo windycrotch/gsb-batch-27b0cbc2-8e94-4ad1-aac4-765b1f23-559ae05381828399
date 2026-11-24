@@ -66,7 +66,10 @@ func feed(t testing.TB, s Sink, src *image.NRGBA, batch int, r *rand.Rand, all b
 			n = 1 + r.Intn(20)
 		}
 		n = min(n, h-y)
-		buf := s.Buffer(y, n)
+		buf, err := s.Buffer(y, n)
+		if err != nil {
+			t.Fatalf("Buffer(%d, %d): %v", y, n, err)
+		}
 		stride := s.Stride()
 		if len(buf) < (n-1)*stride+w4 {
 			t.Fatalf("Buffer(%d, %d): len = %d, want >= %d", y, n, len(buf), (n-1)*stride+w4)
@@ -132,7 +135,10 @@ func TestNoTransformIsDirect(t *testing.T) {
 	if !ok {
 		t.Fatalf("NewSink(5x3) = %T, want *lazyDirect", s)
 	}
-	buf := d.Buffer(0, 3)
+	buf, err := d.Buffer(0, 3)
+	if err != nil {
+		t.Fatalf("Buffer(0, 3): %v", err)
+	}
 	if &d.img.Pix[0] != &buf[0] {
 		t.Errorf("Buffer(0, 3) = %p, want the output image %p (rows are written in place)", &buf[0], &d.img.Pix[0])
 	}
@@ -235,7 +241,10 @@ func TestFlipInPlace(t *testing.T) {
 		t.Fatalf("NewSink(7x9, flip): %v", err)
 	}
 	// The decoder writes straight into the output image.
-	buf := s.Buffer(0, 9)
+	buf, berr := s.Buffer(0, 9)
+	if berr != nil {
+		t.Fatalf("Buffer(0, 9): %v", berr)
+	}
 	if want, got := &img().Pix[0], &buf[0]; !reflect.DeepEqual(want, got) {
 		t.Errorf("Buffer(0, 9) = %p, want the output image %p", got, want)
 	}
@@ -359,7 +368,10 @@ func BenchmarkSink(b *testing.B) {
 				}
 				for y := 0; y < s.NeedRows(); y += 16 {
 					n := min(16, h-y)
-					buf := s.Buffer(y, n)
+					buf, berr := s.Buffer(y, n)
+					if berr != nil {
+						b.Fatal(berr)
+					}
 					copy(buf, src.Pix[y*src.Stride:(y+n)*src.Stride])
 					_ = s.Commit(y, n)
 				}

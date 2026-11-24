@@ -442,7 +442,10 @@ func (d *decoder) processIdx8(base, row int) error {
 func (d *decoder) emitIdx8(idx []byte, y0, row int) error {
 	n := row - y0
 	fw := d.width
-	b := d.sink.Buffer(y0, n)
+	b, err := d.sink.Buffer(y0, n)
+	if err != nil {
+		return err
+	}
 	stride := d.sink.Stride()
 	if stride < 4*fw || len(b) < (n-1)*stride+4*fw {
 		return status.InvalidParam("vp8l: sink buffer too small")

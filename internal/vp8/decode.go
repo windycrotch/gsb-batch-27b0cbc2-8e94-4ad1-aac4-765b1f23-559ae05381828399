@@ -32,6 +32,7 @@ package vp8
 // dec/tree_dec.c, dec/frame_dec.c and dec/io_dec.c.
 
 import (
+	"errors"
 	"image"
 	"sync"
 
@@ -239,9 +240,9 @@ func DecodeYUV(data []byte, opts *Options, crop *image.Rectangle, sink YUVSink) 
 // recognizes it and hands it the Y'CbCr rows.
 type yuvAdapter struct{ YUVSink }
 
-func (yuvAdapter) Buffer(y, n int) []byte { return nil }
-func (yuvAdapter) Stride() int            { return 0 }
-func (yuvAdapter) Commit(y, n int) error  { return nil }
+func (yuvAdapter) Buffer(y, n int) ([]byte, error) { return nil, nil }
+func (yuvAdapter) Stride() int                     { return 0 }
+func (yuvAdapter) Commit(y, n int) error           { return nil }
 
 func decode(data, alpha []byte, opts *Options, crop *image.Rectangle, sink pipeline.Sink) error {
 	if sink == nil {
@@ -370,10 +371,27 @@ func (d *decoder) decodeFrame() error {
 			return err
 		}
 		if err := d.finishRow(mbY); err != nil {
-			return err
+			return d.afterSinkError(err)
 		}
 	}
 	return nil
+}
+
+// afterSinkError maps the sink's ErrStop request to a clean return: a stop
+// signal (from Buffer or Commit, directly or wrapped) is not a decode
+// failure (unlike a truncated stream, which returns a
+// status.NotEnoughData error), and no rows are written after it. With
+// UseThreads it also records the clean stop on the pipeline state, so a
+// parser that read ahead into a truncated region cannot override it with a
+// speculative error. Every other error is returned as is.
+func (d *decoder) afterSinkError(err error) error {
+	if errors.Is(err, pipeline.ErrStop) {
+		if d.mt != nil {
+			d.mt.sinkStop.Store(true)
+		}
+		return nil
+	}
+	return err
 }
 
 // finishRow emits the rows of the row cache that are final after decoding
@@ -575,7 +593,11 @@ func (d *decoder) emitSampled(ys, us, vs []byte, yStart, yEnd int) error {
 	if err := d.loadAlpha(yStart, yEnd); err != nil {
 		return err
 	}
-	dst := d.sink.Buffer(yStart, n)
+	dst, err := d.sink.Buffer(yStart, n)
+	if err != nil {
+		// The sink rejected the batch: nothing was written, no Commit.
+		return err
+	}
 	ds := d.sink.Stride()
 	w := d.outW
 	for j := 0; j < n; j++ {
@@ -608,7 +630,11 @@ func (d *decoder) emitFancy(ys, us, vs []byte, yStart, yEnd int, isLast bool) er
 	if err := d.loadAlpha(outStart, yEnd); err != nil {
 		return err
 	}
-	dst := d.sink.Buffer(outStart, n)
+	dst, err := d.sink.Buffer(outStart, n)
+	if err != nil {
+		// The sink rejected the batch: nothing was written, no Commit.
+		return err
+	}
 	ds := d.sink.Stride()
 	row := func(y int) []byte { return dst[(y-outStart)*ds:] }
 

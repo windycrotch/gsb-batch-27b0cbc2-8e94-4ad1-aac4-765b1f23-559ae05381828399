@@ -39,11 +39,11 @@ type countSink struct {
 	rows   int
 }
 
-func (s *countSink) Buffer(y, n int) []byte {
+func (s *countSink) Buffer(y, n int) ([]byte, error) {
 	if need := n * s.stride; cap(s.buf) < need {
 		s.buf = make([]byte, need)
 	}
-	return s.buf[:n*s.stride]
+	return s.buf[:n*s.stride], nil
 }
 func (s *countSink) Stride() int           { return s.stride }
 func (s *countSink) Commit(y, n int) error { s.rows += n; return nil }

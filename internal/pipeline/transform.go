@@ -197,11 +197,11 @@ func (d *lazyDirect) image() *image.NRGBA {
 }
 
 // Buffer implements Sink.
-func (d *lazyDirect) Buffer(y, n int) []byte {
+func (d *lazyDirect) Buffer(y, n int) ([]byte, error) {
 	img := d.image()
 	s := img.Stride
 	end := min((y+n)*s, len(img.Pix))
-	return img.Pix[y*s : end]
+	return img.Pix[y*s : end], nil
 }
 
 // Stride implements Sink.
@@ -312,15 +312,15 @@ type cropSink struct {
 func (s *cropSink) image() *image.NRGBA { return s.out() }
 
 // Buffer implements Sink.
-func (s *cropSink) Buffer(y, n int) []byte {
+func (s *cropSink) Buffer(y, n int) ([]byte, error) {
 	if s.fullWidth && y >= s.top && y+n <= s.bottom {
 		// Rows land at their final place (flip is applied at the end).
 		s.direct = true
 		off := (y - s.top) * s.srcStride
-		return s.out().Pix[off : off+n*s.srcStride]
+		return s.out().Pix[off : off+n*s.srcStride], nil
 	}
 	s.direct = false
-	return s.scratchRows(n)
+	return s.scratchRows(n), nil
 }
 
 // Commit implements Sink.
@@ -393,7 +393,7 @@ func (s *scaleSink) releaseWork() {
 func (s *scaleSink) image() *image.NRGBA { return s.out() }
 
 // Buffer implements Sink.
-func (s *scaleSink) Buffer(y, n int) []byte { return s.scratchRows(n) }
+func (s *scaleSink) Buffer(y, n int) ([]byte, error) { return s.scratchRows(n), nil }
 
 // Commit implements Sink.
 func (s *scaleSink) Commit(y, n int) error {

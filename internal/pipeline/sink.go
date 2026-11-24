@@ -31,7 +31,21 @@
 // returned buffer is a slice of the final image's Pix, so no copy happens.
 package pipeline
 
-import "image"
+import (
+	"errors"
+	"image"
+)
+
+// ErrStop is the recognizable signal with which a Sink asks the decoder to
+// stop early. Return it (or an error wrapping it, see errors.Is) from
+// Commit once the rows delivered so far are all the caller needs, or from
+// Buffer to refuse the next batch before any of its pixels are written. A
+// decoder that receives it stops at once and returns nil: it is not a
+// failure, so it must not be confused with a corrupt stream, whose errors
+// carry a status code such as Vp8StatusNotEnoughData. Rows committed before
+// the signal stay final and are byte-identical to the prefix of a full
+// decode; rows that were never committed are never written.
+var ErrStop = errors.New("pipeline: stop decoding")
 
 // Sink receives decoded rows.
 type Sink interface {
@@ -39,10 +53,17 @@ type Sink interface {
 	// rows starting at source row y. Row r (0 <= r < n) starts at offset
 	// r*Stride(). The slice is valid until the matching Commit call.
 	// y must equal the y+n of the previous Commit (rows arrive in order).
-	Buffer(y, n int) []byte
+	// A non-nil error rejects the batch before any of its pixels are
+	// written: the decoder then stops without calling Commit for it.
+	// ErrStop asks for a clean early stop (the decoder returns nil); any
+	// other error aborts the decode with that error.
+	Buffer(y, n int) ([]byte, error)
 	// Stride returns the row stride, in bytes, of slices returned by Buffer.
 	Stride() int
 	// Commit marks rows [y, y+n) previously obtained from Buffer as final.
+	// Returning ErrStop (or an error wrapping it) ends the decode cleanly
+	// after these rows: the decoder returns nil and never writes another
+	// row. Any other error aborts the decode with that error.
 	Commit(y, n int) error
 	// NeedRows reports how many source rows (from the top) the sink still
 	// needs in total; decoders MAY stop after producing that many rows
@@ -60,13 +81,13 @@ type Direct struct {
 func NewDirect(img *image.NRGBA) *Direct { return &Direct{Img: img} }
 
 // Buffer implements Sink.
-func (d *Direct) Buffer(y, n int) []byte {
+func (d *Direct) Buffer(y, n int) ([]byte, error) {
 	s := d.Img.Stride
 	end := (y + n) * s
 	if end > len(d.Img.Pix) {
 		end = len(d.Img.Pix)
 	}
-	return d.Img.Pix[y*s : end]
+	return d.Img.Pix[y*s : end], nil
 }
 
 // Stride implements Sink.

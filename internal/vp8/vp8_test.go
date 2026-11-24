@@ -217,12 +217,12 @@ type recordingSink struct {
 	pending [2]int
 }
 
-func (s *recordingSink) Buffer(y, n int) []byte {
+func (s *recordingSink) Buffer(y, n int) ([]byte, error) {
 	if y != s.next || n <= 0 || y+n > s.img.Rect.Dy() {
 		s.t.Fatalf("Buffer(%d, %d), want start %d", y, n, s.next)
 	}
 	s.pending = [2]int{y, n}
-	return s.img.Pix[y*s.img.Stride : (y+n)*s.img.Stride]
+	return s.img.Pix[y*s.img.Stride : (y+n)*s.img.Stride], nil
 }
 func (s *recordingSink) Stride() int { return s.img.Stride }
 func (s *recordingSink) Commit(y, n int) error {
