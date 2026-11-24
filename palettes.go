@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"image"
 	"image/color"
-	"os"
 )
 
 const (
@@ -53,27 +52,11 @@ func GetPaletteColour(index byte, palette byte) (uint8, uint8, uint8) {
 	return r, g, b
 }
 
-func checkColor(imData image.Image) {
+func checkColor(imData image.Image) error {
 	// Make sure it is 32-bit RGBA color, each R,G,B, A component requires 8-bits
 	if imData.ColorModel() != color.RGBAModel {
-		fmt.Println("Not RGBA")
-		fmt.Println("Color model:", imData.ColorModel())
-
-		switch imData.ColorModel() {
-		case color.RGBAModel: // 32-bit RGBA color, each R,G,B, A component requires 8-bits
-			fmt.Println("RGBA")
-		case color.GrayModel: // 8-bit grayscale
-			fmt.Println("Gray")
-		case color.NRGBAModel: // 32-bit non-alpha-premultiplied RGB color, each R,G,B component requires 8-bits
-			fmt.Println("NRGBA")
-		case imData.ColorModel(): // 32-bit non-alpha-premultiplied YCbCr color, each Y,Cb,Cr component requires 8-bits
-			fmt.Println("NYCbCrA")
-		case color.YCbCrModel: // 24-bit YCbCr color, each Y,Cb,Cr component requires 8-bits
-			fmt.Println("YCbCr")
-		default:
-			fmt.Println("Unknown")
-		}
-
-		os.Exit(1)
+		return fmt.Errorf("image is not RGBA (color model: %v)", imData.ColorModel())
 	}
+
+	return nil
 }

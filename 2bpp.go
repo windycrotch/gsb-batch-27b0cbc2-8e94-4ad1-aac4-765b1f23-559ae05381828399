@@ -5,21 +5,19 @@ import (
 	"image"
 	"image/color"
 	"math"
-	"os"
 )
 
 // Takes a 8x8 PNG RGBA images and converts it to 2BPP
 // and returns the original byte array (what the GB rom would contain, and you could see with a hex editor)
-// And also it saves the image as dest.2bpp
-func pngTo2BPP(imData image.Image) []byte {
+func pngTo2BPP(imData image.Image) ([]byte, error) {
 	// Make sure it is 8x8
-	if imData.Bounds().Max.X != 8 || imData.Bounds().Max.Y != 8 {
-		fmt.Println("Not 8x8")
-		fmt.Println("It is: ", imData.Bounds().Max.X, imData.Bounds().Max.Y)
-		os.Exit(1)
+	if imData.Bounds().Dx() != 8 || imData.Bounds().Dy() != 8 {
+		return nil, fmt.Errorf("tile is not 8x8, it is %dx%d", imData.Bounds().Dx(), imData.Bounds().Dy())
 	}
 
-	checkColor(imData)
+	if err := checkColor(imData); err != nil {
+		return nil, err
+	}
 
 	// print image pixel color r,g,b,a into uint32
 	var binCode []byte
@@ -35,8 +33,7 @@ func pngTo2BPP(imData image.Image) []byte {
 			// type assertion must be checked
 			col, ok := pixelColor.(color.RGBA)
 			if !ok {
-				fmt.Println("Not RGBA")
-				os.Exit(1)
+				return nil, fmt.Errorf("pixel (%d,%d) is not RGBA", x, y)
 			}
 
 			r := col.R
@@ -57,6 +54,8 @@ func pngTo2BPP(imData image.Image) []byte {
 				case 255: // white, r = 0
 					highBit = 0
 					lowBit = 0
+				default:
+					return nil, fmt.Errorf("unknown colour (r=%d g=%d b=%d) at pixel (%d,%d): not in palette", r, g, b, x, y)
 				}
 			} else {
 				// Find the closest palette colour
@@ -73,7 +72,7 @@ func pngTo2BPP(imData image.Image) []byte {
 					highBit = 0
 					lowBit = 0
 				} else {
-					panic("Unknown colour")
+					return nil, fmt.Errorf("unknown colour (r=%d g=%d b=%d) at pixel (%d,%d): not in palette", r, g, b, x, y)
 				}
 			}
 
@@ -84,5 +83,5 @@ func pngTo2BPP(imData image.Image) []byte {
 		binCode = append(binCode, binLow, binHigh)
 	}
 
-	return binCode
+	return binCode, nil
 }

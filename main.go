@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"runtime/debug"
@@ -34,47 +35,70 @@ func (args) Version() string {
 	return "Version (git commit):" + Commit
 }
 
+// run executes one extraction batch. It validates every input and decodes and
+// encodes every tile in memory before anything is written to disk, then
+// publishes the whole batch atomically. Any error is returned before a partial
+// result set can be left behind.
+func run(userInput args) error {
+	path := userInput.Rom
+	if path == "" {
+		return errors.New("no ROM specified")
+	}
+
+	romBytes, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("failed to read ROM: %w", err)
+	}
+
+	// Load and validate the screenshot before doing any work.
+	img, err := readImageFromFilePath(userInput.Screenshot)
+	if err != nil {
+		return err
+	}
+
+	if img.Bounds().Dx() != gbScreenXRes || img.Bounds().Dy() != gbScreenYRes {
+		return fmt.Errorf("screenshot is not %dx%d, it is %dx%d",
+			gbScreenXRes, gbScreenYRes, img.Bounds().Dx(), img.Bounds().Dy())
+	}
+
+	// Collect every matching address (loop from 0 to 7 column offsets).
+	var allAddresses []string
+	for i := 0; i < 8; i++ {
+		locations, err := getTiles(img, romBytes, i)
+		if err != nil {
+			return err
+		}
+		allAddresses = append(allAddresses, locations...)
+	}
+
+	uniqueAddresses := removeDuplicateString(allAddresses)
+
+	// Decode and encode every tile in memory first. If any address is bad,
+	// this fails here — before a single output file is created.
+	outputs, err := prepareOutputs(uniqueAddresses, userInput.Output, romBytes)
+	if err != nil {
+		return err
+	}
+
+	// Publish the whole batch atomically.
+	if err := writeBatch(outputs, userInput.Output); err != nil {
+		return err
+	}
+
+	for i, address := range uniqueAddresses {
+		fmt.Printf("Tile found at %s written to '%s'\n", address, outputs[i].filename)
+	}
+
+	return nil
+}
+
 func main() {
 	var userInput args
 
 	arg.MustParse(&userInput)
 
-	outputFilename := userInput.Output
-	screenshot := userInput.Screenshot
-
-	path := userInput.Rom
-	if path == "" {
-		fmt.Println("No ROM specified!")
+	if err := run(userInput); err != nil {
+		fmt.Fprintln(os.Stderr, "Error:", err)
 		os.Exit(1)
-	}
-
-	romBytes, errReadFile := os.ReadFile(path)
-	if errReadFile != nil {
-		fmt.Println(errReadFile)
-		os.Exit(1)
-	}
-
-	// loop from 0 to 7
-	var locations [][]string
-	for i := 0; i < 8; i++ {
-		locations = append(locations, getTiles(screenshot, romBytes, i))
-	}
-
-	// Create a slice of all the addresses
-	var allAddresses []string
-	for _, location := range locations {
-		allAddresses = append(allAddresses, location...)
-	}
-
-	uniqueAddresses := removeDuplicateString(allAddresses)
-
-	for i, address := range uniqueAddresses {
-		// for every address, get the tile and save it to disk
-		//tile := romBytes[convertHexToInt32(address) : convertHexToInt32(address)+16]
-		//fmt.Printf("Address: %s, Tile: %v\n", address, hex.EncodeToString(tile))
-		if err := processTile(i, address, outputFilename, romBytes, rangeLength, width, bitDepth); err != nil {
-			fmt.Println(err)
-			os.Exit(1)
-		}
 	}
 }

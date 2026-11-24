@@ -3,38 +3,35 @@ package main
 import (
 	"fmt"
 	"image"
-	"log"
+	_ "image/png"
 	"os"
 )
 
-func readImageFromFilePath(path string) image.Image {
+func readImageFromFilePath(path string) (image.Image, error) {
 	// Load GB ROM
 	infile, err := os.Open(path)
 	if err != nil {
-		// replace this with real error handling
-		log.Fatal(err)
+		return nil, fmt.Errorf("failed to open screenshot %q: %w", path, err)
 	}
 
 	defer func(infile *os.File) {
-		err := infile.Close()
-		if err != nil {
+		if err := infile.Close(); err != nil {
 			fmt.Println(err)
-			os.Exit(1)
 		}
 	}(infile)
 
 	// Decode the image
 	imData, imType, err := image.Decode(infile)
 	if err != nil {
-		fmt.Println(err)
+		return nil, fmt.Errorf("failed to decode screenshot %q: %w", path, err)
 	}
 
 	// Make sure it's a PNG
 	if imType != "png" {
-		fmt.Println("Not a PNG")
+		return nil, fmt.Errorf("screenshot %q is not a PNG (it is %q)", path, imType)
 	}
 
-	return imData
+	return imData, nil
 }
 
 func saveUniqueTiles(tiles []image.Image, tilesPerRow int, numRows int, filename string) ([]image.Image, error) {

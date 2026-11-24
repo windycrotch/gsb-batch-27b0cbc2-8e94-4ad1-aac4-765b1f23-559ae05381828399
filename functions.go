@@ -4,8 +4,6 @@ import (
 	"fmt"
 	"image"
 	"image/color"
-	"image/png"
-	"os"
 	"strconv"
 	"strings"
 )
@@ -43,40 +41,22 @@ func convert2BPPToPNG(height int, tile []byte, img *image.RGBA, xPos int, yPos i
 	}
 }
 
-// convertHexToInt32 converts a hex string to an int32
-func convertHexToInt32(v string) int32 {
+// convertHexToInt32 converts a hex string (e.g. 0x3f) to an int32
+func convertHexToInt32(v string) (int32, error) {
 	startOffsetString := v
 	// Remove the 0x prefix and keep only the actual number (as a string)
 	if !strings.Contains(startOffsetString, "0x") {
-		fmt.Println("Invalid start offset specified! Please specify a HEX value (e.g. 0x3f)")
-		os.Exit(1)
+		return 0, fmt.Errorf("invalid start offset %q: please specify a HEX value (e.g. 0x3f)", v)
 	}
 	// Remove the 0x prefix (it's not needed anymore)
 	startOffsetString = strings.ReplaceAll(startOffsetString, "0x", "")
 	// and convert the strings (which represent a hex value) to a decimal int32
-	a, _ := strconv.ParseInt(startOffsetString, 16, 32)
-
-	return int32(a)
-}
-
-func saveToDisk(outputFilename string, img image.Image) error {
-	f, err := os.Create(outputFilename)
+	a, err := strconv.ParseInt(startOffsetString, 16, 32)
 	if err != nil {
-		return fmt.Errorf("failed to create file: %w", err)
+		return 0, fmt.Errorf("invalid start offset %q: %w", v, err)
 	}
 
-	defer func(f *os.File) {
-		if err := f.Close(); err != nil {
-			return
-		}
-	}(f)
-
-	err = png.Encode(f, img)
-	if err != nil {
-		return fmt.Errorf("failed to encode image: %w", err)
-	}
-
-	return nil
+	return int32(a), nil
 }
 
 // Remove duplicates [][]byte
@@ -96,13 +76,17 @@ func removeDuplicateByte(byteSlice [][]byte) [][]byte {
 	return list
 }
 
-func getHexCodes(tiles []image.Image) [][]byte {
+func getHexCodes(tiles []image.Image) ([][]byte, error) {
 	origCodeTiles := make([][]byte, 0)
-	for _, tile := range tiles {
-		origCodeTiles = append(origCodeTiles, pngTo2BPP(tile))
+	for i, tile := range tiles {
+		code, err := pngTo2BPP(tile)
+		if err != nil {
+			return nil, fmt.Errorf("tile %d: %w", i, err)
+		}
+		origCodeTiles = append(origCodeTiles, code)
 	}
 
-	return origCodeTiles
+	return origCodeTiles, nil
 }
 
 func compare(tile []byte, code []byte) bool {

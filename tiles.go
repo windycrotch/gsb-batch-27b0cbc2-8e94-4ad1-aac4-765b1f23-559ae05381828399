@@ -1,81 +1,51 @@
 package main
 
 import (
-	"errors"
+	"bytes"
 	"fmt"
 	"image"
 	"image/color"
+	"image/png"
 	"math"
-	"os"
-	"strings"
 )
 
-func getTiles(screenshot string, romBytes []byte, numColumns int) []string {
-	// 1. Load a screenshot from the disk
-	img := readImageFromFilePath(screenshot)
-
-	// Step 2: Create a new image with the same dimensions as the original image but without the numColumns first columns
-	newImg := image.NewRGBA(image.Rect(0, 0, img.Bounds().Max.X-numColumns, img.Bounds().Max.Y))
-
-	// Step 3: Copy the pixels from the original image to the new image
-	for y := 0; y < img.Bounds().Max.Y; y++ {
-		for x := numColumns; x < img.Bounds().Max.X; x++ {
-			newImg.Set(x-numColumns, y, img.At(x, y))
-		}
-	}
-
-	// Print the dimensions of the new image
-	// fmt.Println("New image dimensions:", newImg.Bounds().Max.X, newImg.Bounds().Max.Y)
-
+func getTiles(img image.Image, romBytes []byte, numColumns int) ([]string, error) {
 	// Step 4: Split the image into sub-images
-	tiles := split7x8(img) // Split the image into sub-images of 7x8 pixels (tiles) and store them in a slice
+	var tiles []image.Image
+	var err error
+
 	if numColumns == 0 {
-		tiles = split8x8(img) // Split the image into sub-images of 8x8 pixels (tiles) and store them in a slice
-	} else if numColumns >= 1 && numColumns <= 7 {
-		tiles = split7x8(img) // Split the image into sub-images of 7x8 pixels (tiles) and store them in a slice
+		tiles, err = split8x8(img) // Split the image into sub-images of 8x8 pixels (tiles) and store them in a slice
+	} else {
+		tiles, err = split7x8(img) // Split the image into sub-images of 7x8 pixels (tiles) and store them in a slice
 	}
 
-	// Step 5: Checks if the number of tiles is correct
-	// err := validateTileDimensions(len(tiles), gbScreenXRes, gbScreenYRes)
-	// if err != nil {
-	// 	fmt.Println(err)
-	// 	os.Exit(1)
-	// }
+	if err != nil {
+		return nil, err
+	}
 
 	// Step 6: From the all the tiles, remove the duplicates
 	uniqueTiles, err := saveUniqueTiles(tiles, gbScreenXRes, tilesPerCol, fmt.Sprintf("%d", numColumns+1))
 	if err != nil {
-		fmt.Println("Error:", err)
-		os.Exit(1)
+		return nil, err
 	}
 
 	// Step 7:  These tiles are in RGBA format, so we need to convert them to 2BPP
 	// 			before we can compare them to the original gameboy tileset
-	origCodeTiles := getHexCodes(uniqueTiles)
+	origCodeTiles, err := getHexCodes(uniqueTiles)
+	if err != nil {
+		return nil, err
+	}
 	uniqCodeTiles := removeDuplicateByte(origCodeTiles)
 
 	// Step 8: Search for each tile in the screenshot and return the addresses from the ROM
-	return findTileAddresses(uniqCodeTiles, romBytes)
+	return findTileAddresses(uniqCodeTiles, romBytes), nil
 }
 
-// processTile Processes receives the addresses of tiles and converts them to PNG
-func processTile(i int, v string, outputFilename string, romBytes []byte, rangeLength int, width int, bitDepth int) error {
-	withoutPng := strings.ReplaceAll(outputFilename, ".png", "")
-	newOutputFilename := fmt.Sprintf("%s_%d.png", withoutPng, i)
-
-	rangeStartOffset := convertHexToInt32(v)
-
-	if rangeStartOffset < 0 {
-		return errors.New("invalid start offset specified")
-	}
-
-	rangeLengthInt32 := int32(rangeLength) // Convert rangeLength to int32
-
-	tile := romBytes[rangeStartOffset : rangeStartOffset+rangeLengthInt32] // Use rangeLengthInt32
-
+// renderTile renders a 2BPP tile as an image (white background)
+func renderTile(tile []byte) image.Image {
 	// Calculate the height of the img in bytes
 	height := 8 * int(math.Ceil(float64(len(tile))/float64(8*8*bitDepth)))
-	hexValue := fmt.Sprintf("% X", tile)
 	img := image.NewRGBA(image.Rect(0, 0, width, height))
 
 	for x := 0; x < width; x++ {
@@ -84,29 +54,53 @@ func processTile(i int, v string, outputFilename string, romBytes []byte, rangeL
 		}
 	}
 
-	xPos, yPos := 0, 0
-
 	// Modify the img
-	convert2BPPToPNG(height, tile, img, xPos, yPos)
+	convert2BPPToPNG(height, tile, img, 0, 0)
 
-	if err := saveToDisk(newOutputFilename, img); err != nil {
-		return err
-	}
-
-	fmt.Printf("'%s' (Found at location %s) converted to '%s'\n", hexValue, v, newOutputFilename)
-
-	return nil
+	return img
 }
 
-func split8x8(src image.Image) []image.Image {
-	// Check if image resolution is 160x144
-	if src.Bounds().Max.X != 160 || src.Bounds().Max.Y != 144 {
-		fmt.Println("Not 160x144")
-		fmt.Println("It is: ", src.Bounds().Max.X, src.Bounds().Max.Y)
-		os.Exit(1)
+// encodeTileAtAddress decodes the tile stored at the given hex address in the
+// ROM and returns it as an encoded PNG. Nothing is written to disk. Any
+// failure (bad address, out-of-bounds range, short tile) is reported with the
+// offending address so the caller can abort the whole batch.
+func encodeTileAtAddress(address string, romBytes []byte) ([]byte, error) {
+	rangeStartOffset, err := convertHexToInt32(address)
+	if err != nil {
+		return nil, fmt.Errorf("address %s: %w", address, err)
 	}
 
-	checkColor(src)
+	if rangeStartOffset < 0 {
+		return nil, fmt.Errorf("address %s: negative start offset %d", address, rangeStartOffset)
+	}
+
+	if int64(rangeStartOffset)+int64(rangeLength) > int64(len(romBytes)) {
+		return nil, fmt.Errorf("address %s: tile range [%d, %d) is out of bounds for a ROM of %d bytes",
+			address, rangeStartOffset, int64(rangeStartOffset)+int64(rangeLength), len(romBytes))
+	}
+
+	tile := romBytes[rangeStartOffset : rangeStartOffset+rangeLength]
+
+	img := renderTile(tile)
+
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		return nil, fmt.Errorf("address %s: failed to encode PNG: %w", address, err)
+	}
+
+	return buf.Bytes(), nil
+}
+
+func split8x8(src image.Image) ([]image.Image, error) {
+	// Check if image resolution is 160x144
+	if src.Bounds().Dx() != gbScreenXRes || src.Bounds().Dy() != gbScreenYRes {
+		return nil, fmt.Errorf("screenshot is not %dx%d, it is %dx%d",
+			gbScreenXRes, gbScreenYRes, src.Bounds().Dx(), src.Bounds().Dy())
+	}
+
+	if err := checkColor(src); err != nil {
+		return nil, err
+	}
 
 	// Iterate over the image pixels and split it into 8x8 sub-images
 	var tiles []image.Image
@@ -125,18 +119,13 @@ func split8x8(src image.Image) []image.Image {
 		}
 	}
 
-	return tiles
+	return tiles, nil
 }
 
-func split7x8(src image.Image) []image.Image {
-	// // Check if image resolution is 159x144
-	// if src.Bounds().Max.X != 159 && src.Bounds().Max.X != 158 || src.Bounds().Max.Y != 144 {
-	// 	fmt.Println("Not 159x144 or not 158x144")
-	// 	fmt.Println("Error: It is: ", src.Bounds().Max.X, src.Bounds().Max.Y)
-	// 	os.Exit(1)
-	// }
-
-	checkColor(src)
+func split7x8(src image.Image) ([]image.Image, error) {
+	if err := checkColor(src); err != nil {
+		return nil, err
+	}
 
 	// Iterate over the image pixels and split it into 7x8 sub-images
 	var tiles []image.Image
@@ -156,7 +145,7 @@ func split7x8(src image.Image) []image.Image {
 		}
 	}
 
-	return tiles
+	return tiles, nil
 }
 
 // Function to find the addresses of tiles in the ROM
