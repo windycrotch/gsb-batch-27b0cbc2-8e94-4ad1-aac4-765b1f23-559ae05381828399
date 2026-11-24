@@ -71,7 +71,7 @@ func makeTestServer() *server {
 		"", 0, false,
 	}
 	repo := repository.NewRepository(test.DB(), test.PubSub())
-	return newServer(&config, nil, repo)
+	return newServer(&config, nil, auth{}, repo)
 }
 
 func TestMain(m *testing.M) {

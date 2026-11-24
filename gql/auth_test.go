@@ -17,10 +17,10 @@ func TestServer_SignAndVerifyJWT(t *testing.T) {
 		Email: "test@test.com",
 	}
 
-	tokenStr, err := server.signJWT(user)
+	tokenStr, err := server.auth.signJWT(user)
 	assert.NoError(t, err)
 
-	token, err := server.validateJWT(tokenStr)
+	token, err := server.auth.validateJWT(tokenStr)
 	assert.NoError(t, err)
 
 	claims, ok := token.Claims.(*jwt.StandardClaims)
@@ -31,6 +31,6 @@ func TestServer_SignAndVerifyJWT(t *testing.T) {
 
 func TestServer_ValidateInvalidJWT(t *testing.T) {
 	server := makeTestServer()
-	_, err := server.validateJWT("lol this wont work")
+	_, err := server.auth.validateJWT("lol this wont work")
 	assert.Error(t, err)
 }

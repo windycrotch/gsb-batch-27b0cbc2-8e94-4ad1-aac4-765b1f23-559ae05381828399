@@ -10,7 +10,7 @@ import (
 )
 
 type Resolver struct {
-	repo   *repository.Repository
+	repo *repository.Repository
 	auth auth
 }
 
@@ -41,25 +41,16 @@ func (m mutationResolver) CreateMatchmakingRequest(ctx context.Context, input mo
 		return nil, errors.New("invalid user")
 	}
 
-	var rv models.CreateMatchmakingRequestPayload
-	err := m.repo.WithTx(func(r *repository.Repository) error {
-		req, err := r.CreateMatchmakingRequest(identity.User, input.Delta)
-		rv.Request = req
-
-		if err != nil {
-			log.Println("unable to create mm request", err)
-			return err
-		}
-
-		return nil
-	})
-
+	// Enqueue is idempotent: if this player already has an unfinished request
+	// queued, the existing request (with its original rank_delta) is returned
+	// instead of inserting a duplicate row.
+	req, err := m.repo.CreateMatchmakingRequest(identity.User, input.Delta)
 	if err != nil {
-		log.Println("unable to commit mm txn", err)
+		log.Println("unable to create mm request", err)
 		return nil, err
 	}
 
-	return &rv, nil
+	return &models.CreateMatchmakingRequestPayload{Request: req}, nil
 }
 
 type queryResolver struct{ *Resolver }

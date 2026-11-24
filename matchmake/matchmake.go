@@ -12,8 +12,20 @@ import (
 	"time"
 )
 
+// pool is the storage abstraction used by the matchmaker. Production code
+// backs it with DbPool; tests use an in-memory implementation.
 type pool interface {
+	// requests returns every matchmaking request currently queued.
 	requests() ([]models.MatchmakingRequest, error)
+	// enqueue creates a request for the given user. If the user already has
+	// an unfinished (still queued) request, that request is returned
+	// unchanged instead of inserting a new row, and its rank_delta is
+	// preserved.
+	enqueue(user models.User, delta int) (*models.MatchmakingRequest, error)
+	// match pairs two requests atomically: it creates the negotiation game,
+	// deletes both requests and publishes both notifications inside a single
+	// transaction. Any failure rolls the whole transaction back, leaving both
+	// requests queued for a later run.
 	match(models.MatchmakingRequest, models.MatchmakingRequest) error
 }
 
@@ -25,52 +37,60 @@ func (p DbPool) requests() ([]models.MatchmakingRequest, error) {
 	return p.repo.GetMatchmakingRequests()
 }
 
+func (p DbPool) enqueue(user models.User, delta int) (*models.MatchmakingRequest, error) {
+	return p.repo.CreateMatchmakingRequest(user, delta)
+}
+
 func (p DbPool) match(i models.MatchmakingRequest, j models.MatchmakingRequest) error {
 	log.Printf("matched: %+v, %+v", i, j)
 	users := []models.User{
 		{NodeFields: models.NodeFields{Id: i.User.Id}}, {NodeFields: models.NodeFields{Id: j.User.Id}},
 	}
 
-	err := p.repo.WithTx(func(r *repository.Repository) error {
+	// Everything below runs in one transaction. WithTx rolls back on any
+	// returned error, so a failure while creating the game, deleting either
+	// request or publishing either notification leaves both requests queued
+	// and never leaves a half-created game or a single notification behind.
+	return p.repo.WithTx(func(r *repository.Repository) error {
 		game, err := r.CreateGame(models.GameTypeStandard, 19, models.GameStateNegotiation, users)
 		if err != nil {
 			return err
 		}
 
-		err = r.DeleteMatchmakingRequest(i)
-		if err != nil {
+		if err := r.DeleteMatchmakingRequest(i); err != nil {
 			return err
 		}
 
-		err = r.DeleteMatchmakingRequest(j)
-		if err != nil {
+		if err := r.DeleteMatchmakingRequest(j); err != nil {
 			return err
 		}
 
 		payload := map[string]interface{}{
 			"game": game.Id,
 		}
-		err = r.Publish(pubsub.TopicCategoryMatchmakeRequests, pubsub.Event{i.User.Id, "matched", payload})
-		if err != nil {
+		if err := r.Publish(pubsub.TopicCategoryMatchmakeRequests, pubsub.Event{
+			Subject: i.User.Id,
+			Event:   "matched",
+			Payload: payload,
+		}); err != nil {
 			return err
 		}
 
+		// Fresh map for the second notification so the two events cannot
+		// accidentally share mutable state.
 		payload = map[string]interface{}{
 			"game": game.Id,
 		}
-		err = r.Publish(pubsub.TopicCategoryMatchmakeRequests, pubsub.Event{j.User.Id, "matched", payload})
-		if err != nil {
+		if err := r.Publish(pubsub.TopicCategoryMatchmakeRequests, pubsub.Event{
+			Subject: j.User.Id,
+			Event:   "matched",
+			Payload: payload,
+		}); err != nil {
 			return err
 		}
 
 		return nil
 	})
-
-	if err != nil {
-		return err
-	}
-
-	return nil
 }
 
 type match struct {
@@ -91,26 +111,35 @@ func newMatchmaker(pool pool, tick time.Duration) *matchmaker {
 }
 
 func (m *matchmaker) run() {
-	for true {
+	// A failed run must never kill the loop: log and continue to the next
+	// tick so transient database or notification errors are retried.
+	for {
 		log.Println("starting matchmaking run...")
 		start := time.Now()
+
 		matches, err := m.tick()
 		if err != nil {
 			log.Printf("error in matchmaking run: %s", err)
 		} else {
 			log.Printf("matchmaking done. matches: %d", len(matches))
-		}
-		duration := time.Since(start)
-		log.Printf("elapsed: %dms", duration/time.Millisecond)
 
-		for _, match := range matches {
-			m.pool.match(match.i, match.j)
+			for _, match := range matches {
+				if err := m.pool.match(match.i, match.j); err != nil {
+					// The transaction rolled back; both requests stay queued
+					// and will be retried on the next run.
+					log.Printf("error committing match %s/%s: %s", match.i.Id, match.j.Id, err)
+				}
+			}
 		}
 
+		log.Printf("elapsed: %dms", time.Since(start)/time.Millisecond)
 		time.Sleep(m.tickInterval)
 	}
 }
 
+// tick performs a single scan of the queue. Each player appears in at most
+// one pair per scan, a player is never paired with themselves and the same
+// pair of players is never produced twice in one scan.
 func (m *matchmaker) tick() ([]match, error) {
 	requests, err := m.pool.requests()
 	if err != nil {
@@ -126,7 +155,8 @@ func (m *matchmaker) tick() ([]match, error) {
 		}
 
 		r1 := requests[i]
-		pairs := make([]models.MatchmakingRequest, 0)
+		// Indices of every still-available, compatible candidate.
+		candidates := make([]int, 0)
 
 		for j := 0; j < len(requests); j++ {
 			if i == j || removed[j] {
@@ -134,28 +164,35 @@ func (m *matchmaker) tick() ([]match, error) {
 			}
 
 			r2 := requests[j]
+
+			// A player must never be matched with themselves, even if buggy
+			// enqueue logic somehow left more than one queued row for them.
+			if r1.User.Id == r2.User.Id {
+				continue
+			}
+
 			delta := abs(r1.Rank - r2.Rank)
 			if delta < r1.Delta && delta < r2.Delta {
-				pairs = append(pairs, r2)
+				candidates = append(candidates, j)
 			}
 		}
 
-		if len(pairs) > 0 {
-			sort.Slice(pairs, func(i, j int) bool {
-				di := abs(r1.Rank - pairs[i].Rank)
-				dj := abs(r1.Rank - pairs[j].Rank)
-				return di < dj
+		if len(candidates) > 0 {
+			// Pick the closest-ranked available candidate.
+			sort.Slice(candidates, func(a, b int) bool {
+				da := abs(r1.Rank - requests[candidates[a]].Rank)
+				db := abs(r1.Rank - requests[candidates[b]].Rank)
+				return da < db
 			})
 
-			removed[i] = true
-			// TODO(eac): bring j along
-			for j, r2 := range requests {
-				if r2 == pairs[0] {
-					removed[j] = true
-				}
-			}
+			partner := candidates[0]
 
-			matches = append(matches, match{r1, pairs[0]})
+			// Both players are consumed for the rest of this scan, so neither
+			// can show up in a second pair.
+			removed[i] = true
+			removed[partner] = true
+
+			matches = append(matches, match{r1, requests[partner]})
 		}
 	}
 

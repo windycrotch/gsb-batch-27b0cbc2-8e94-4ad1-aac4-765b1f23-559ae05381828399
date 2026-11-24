@@ -4,17 +4,18 @@ import (
 	"encoding/json"
 	"github.com/jmoiron/sqlx"
 	"github.com/tengen-io/server/pubsub"
+	"log"
 )
 
 type Repository struct {
-	db *sqlx.DB
-	tx *sqlx.Tx
+	db     *sqlx.DB
+	tx     *sqlx.Tx
 	pubsub *pubsub.DbPubSub
 }
 
 func NewRepository(db *sqlx.DB, pubsub *pubsub.DbPubSub) *Repository {
 	return &Repository{
-		db: db,
+		db:     db,
 		pubsub: pubsub,
 	}
 }
@@ -26,12 +27,19 @@ func (r *Repository) WithTx(f func(r *Repository) error) error {
 	}
 
 	rTx := &Repository{
-		db: r.db,
-		tx: tx,
+		db:     r.db,
+		tx:     tx,
+		pubsub: r.pubsub,
 	}
 
 	err = f(rTx)
 	if err != nil {
+		// Roll back so a failed game creation, request deletion or
+		// notification cannot leave half-applied state behind. A rollback
+		// error is logged but does not mask the original failure.
+		if rbErr := tx.Rollback(); rbErr != nil {
+			log.Printf("error rolling back transaction: %s", rbErr)
+		}
 		return err
 	}
 
