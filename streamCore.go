@@ -1,7 +1,6 @@
 package main
 
 import (
-	"math"
 	"time"
 
 	"github.com/deepch/vdk/av"
@@ -9,104 +8,195 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-// StreamServerRunStreamDo stream run do mux
+// Collector timing. Key ones are variables so tests can shorten them; package
+// variables are only mutated by tests that run in isolation.
+var (
+	// streamReconnectDelay is the pause between two upstream connection
+	// attempts of the same session.
+	streamReconnectDelay = 2 * time.Second
+	// streamKeyTestTimeout is how long a connection may stay silent (no
+	// keyframe) before it is considered dead and retried.
+	streamKeyTestTimeout = 20 * time.Second
+	// streamCheckClientsInterval is how often an on-demand session verifies
+	// that it still has viewers.
+	streamCheckClientsInterval = 20 * time.Second
+)
+
+// streamSource abstracts the upstream feed a collection session consumes. The
+// real implementation wraps deepch/vdk's RTSP client; tests inject a local
+// fake, so no real RTSP server or network access is needed.
+type streamSource interface {
+	// Codecs returns the codec information known at connection time. It may be
+	// empty when the codecs arrive later via SignalCodecUpdate.
+	Codecs() []av.CodecData
+	// SDP returns the raw session description at connection time.
+	SDP() []byte
+	// WaitCodec reports whether codecs must wait for SignalCodecUpdate.
+	WaitCodec() bool
+	// Packets delivers demuxed media packets.
+	Packets() <-chan *av.Packet
+	// RTP delivers raw RTP packets for proxy viewers.
+	RTP() <-chan *[]byte
+	// Signals delivers source side control signals (codec update, stop).
+	Signals() <-chan int
+	// Close releases the connection.
+	Close()
+}
+
+// streamSourceDialer opens an upstream source. It is a variable so tests can
+// substitute a local fake.
+var streamSourceDialer = func(opt StreamST) (streamSource, error) {
+	client, err := rtspv2.Dial(rtspv2.RTSPClientOptions{
+		URL:                opt.URL,
+		InsecureSkipVerify: opt.InsecureSkipVerify,
+		DisableAudio:       !opt.Audio,
+		DialTimeout:        3 * time.Second,
+		ReadWriteTimeout:   5 * time.Second,
+		Debug:              opt.Debug,
+		OutgoingProxy:      true,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &rtspStreamSource{client: client}, nil
+}
+
+// rtspStreamSource adapts deepch/vdk's RTSP client to streamSource.
+type rtspStreamSource struct {
+	client *rtspv2.RTSPClient
+}
+
+func (s *rtspStreamSource) Codecs() []av.CodecData     { return s.client.CodecData }
+func (s *rtspStreamSource) SDP() []byte                { return s.client.SDPRaw }
+func (s *rtspStreamSource) WaitCodec() bool            { return s.client.WaitCodec }
+func (s *rtspStreamSource) Packets() <-chan *av.Packet { return s.client.OutgoingPacketQueue }
+func (s *rtspStreamSource) RTP() <-chan *[]byte        { return s.client.OutgoingProxyQueue }
+func (s *rtspStreamSource) Signals() <-chan int        { return s.client.Signals }
+func (s *rtspStreamSource) Close()                     { s.client.Close() }
+
+// StreamServerRunStreamDo starts the collection session of streamID if it is
+// not already running. It exists for callers that only know the stream id;
+// normal session creation goes through StreamChannelAdd/GetOrCreate, which
+// start the collector atomically with the session.
 func StreamServerRunStreamDo(streamID string) {
-	var status int
-	defer func() {
-		//TODO fix it no need unlock run if delete stream
-		if status != 2 {
-			Storage.StreamChannelUnlock(streamID)
-		}
-	}()
+	Storage.mutex.Lock()
+	defer Storage.mutex.Unlock()
+	s, ok := Storage.Streams[streamID]
+	if !ok {
+		return
+	}
+	Storage.startCollectorLocked(streamID, s)
+}
+
+// runCollector owns one generation of a collection session. It reconnects the
+// upstream source until it is told to stop, the session is stopped, or an
+// on-demand session runs out of viewers.
+func (obj *StorageST) runCollector(streamID string, generation uint64, signals chan int, stop chan struct{}, done chan struct{}, opt StreamST) {
+	defer close(done)
+	defer obj.finalizeCollector(streamID, generation)
+
+	logger := log.WithFields(logrus.Fields{
+		"module": "core",
+		"stream": streamID,
+		"func":   "runCollector",
+	})
 	for {
-		baseLogger := log.WithFields(logrus.Fields{
-			"module": "core",
-			"stream": streamID,
-			"func":   "StreamServerRunStreamDo",
-		})
+		select {
+		case <-stop:
+			return
+		default:
+		}
 
-		baseLogger.WithFields(logrus.Fields{"call": "Run"}).Infoln("Run stream")
-		opt, err := Storage.StreamChannelControl(streamID)
+		if opt.OnDemand && !obj.ClientHas(streamID) {
+			logger.WithFields(logrus.Fields{"call": "ClientHas"}).Infoln("Stop stream no client")
+			return
+		}
+
+		status, err := obj.StreamServerRunStream(streamID, generation, signals, stop, opt)
 		if err != nil {
-			baseLogger.WithFields(logrus.Fields{
-				"call": "StreamChannelControl",
-			}).Infoln("Exit", err)
-			return
+			logger.WithFields(logrus.Fields{"call": "StreamServerRunStream"}).Infoln("Stream exit", err)
 		}
-		if opt.OnDemand && !Storage.ClientHas(streamID) {
-			baseLogger.WithFields(logrus.Fields{
-				"call": "ClientHas",
-			}).Infoln("Stop stream no client")
-			return
-		}
-		status, err = StreamServerRunStream(streamID, opt)
+		// A positive status means "do not reconnect": the session was stopped,
+		// the stream lost its last on-demand viewer, or the source asked to
+		// stop for good.
 		if status > 0 {
-			baseLogger.WithFields(logrus.Fields{
-				"call": "StreamServerRunStream",
-			}).Infoln("Stream exit by signal or not client")
 			return
 		}
-		if err != nil {
-			log.WithFields(logrus.Fields{
-				"call": "Restart",
-			}).Errorln("Stream error restart stream", err)
-		}
-		time.Sleep(2 * time.Second)
 
+		timer := time.NewTimer(streamReconnectDelay)
+		select {
+		case <-stop:
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
 	}
 }
 
-// StreamServerRunStream core stream
-func StreamServerRunStream(streamID string, opt *StreamST) (int, error) {
-	keyTest := time.NewTimer(20 * time.Second)
-	checkClients := time.NewTimer(20 * time.Second)
-	var start bool
-	var fps int
-	var preKeyTS = time.Duration(0)
-	var Seq []*av.Packet
-	RTSPClient, err := rtspv2.Dial(rtspv2.RTSPClientOptions{URL: opt.URL, InsecureSkipVerify: opt.InsecureSkipVerify, DisableAudio: !opt.Audio, DialTimeout: 3 * time.Second, ReadWriteTimeout: 5 * time.Second, Debug: opt.Debug, OutgoingProxy: true})
-	if err != nil {
-		return 0, err
-	}
-	Storage.StreamChannelStatus(streamID, ONLINE)
-	defer func() {
-		RTSPClient.Close()
-		Storage.StreamChannelStatus(streamID, OFFLINE)
-	}()
-	var WaitCodec bool
-	/*
-		Example wait codec
-	*/
-	if RTSPClient.WaitCodec {
-		WaitCodec = true
-	} else {
-		if len(RTSPClient.CodecData) > 0 {
-			Storage.StreamChannelCodecsUpdate(streamID, RTSPClient.CodecData, RTSPClient.SDPRaw)
-		}
-	}
-	log.WithFields(logrus.Fields{
+// StreamServerRunStream runs one upstream connection: it publishes the codec
+// information, then forwards packets to the session viewers until the
+// connection drops or the session is stopped. It returns a positive status
+// when the session must not reconnect.
+func (obj *StorageST) StreamServerRunStream(streamID string, generation uint64, signals <-chan int, stop <-chan struct{}, opt StreamST) (int, error) {
+	logger := log.WithFields(logrus.Fields{
 		"module": "core",
 		"stream": streamID,
 		"func":   "StreamServerRunStream",
-		"call":   "Start",
-	}).Infoln("Success connection RTSP")
-	var ProbeCount int
-	var ProbeFrame int
-	var ProbePTS time.Duration
+	})
+
+	src, err := streamSourceDialer(opt)
+	if err != nil {
+		return 0, err
+	}
+	defer src.Close()
+
+	// The session may have been stopped (or restarted) while dialing.
+	if !obj.streamChannelCurrent(streamID, generation) {
+		return 1, ErrorStreamChannelStopped
+	}
+
+	waitCodec := src.WaitCodec()
+	if !waitCodec {
+		obj.streamChannelConnectionUp(streamID, generation, src.Codecs(), src.SDP())
+	} else {
+		// Keep the session online but with no codec information yet; viewers
+		// wait for the codec update signal.
+		obj.streamChannelConnectionUp(streamID, generation, nil, nil)
+	}
+
+	logger.WithFields(logrus.Fields{"call": "Start"}).Infoln("Success connection to source")
+
+	// When this connection ends the encoding information is invalidated. The
+	// viewers stay attached and will resynchronise on the next keyframe.
+	defer obj.streamChannelConnectionDown(streamID, generation)
+
+	keyTest := time.NewTimer(streamKeyTestTimeout)
+	defer keyTest.Stop()
+	checkClients := time.NewTimer(streamCheckClientsInterval)
+	defer checkClients.Stop()
+
+	var start bool
+	var fps int
+	var probeCount int
+	var probeFrame int
+	var probePTS time.Duration
+
 	for {
 		select {
-		//Check stream have clients
+		case <-stop:
+			return 2, ErrorStreamStopCoreSignal
+
 		case <-checkClients.C:
-			if opt.OnDemand && !Storage.ClientHas(streamID) {
+			if opt.OnDemand && !obj.ClientHas(streamID) {
 				return 1, ErrorStreamNoClients
 			}
-			checkClients.Reset(20 * time.Second)
-		//Check stream send key
+			checkClients.Reset(streamCheckClientsInterval)
+
 		case <-keyTest.C:
 			return 0, ErrorStreamNoVideo
-		//Read core signals
-		case signals := <-opt.signals:
-			switch signals {
+
+		case signal := <-signals:
+			switch signal {
 			case SignalStreamStop:
 				return 2, ErrorStreamStopCoreSignal
 			case SignalStreamRestart:
@@ -114,56 +204,54 @@ func StreamServerRunStream(streamID string, opt *StreamST) (int, error) {
 			case SignalStreamClient:
 				return 1, ErrorStreamNoClients
 			}
-		//Read rtsp signals
-		case signals := <-RTSPClient.Signals:
-			switch signals {
+
+		case signal := <-src.Signals():
+			switch signal {
 			case rtspv2.SignalCodecUpdate:
-				Storage.StreamChannelCodecsUpdate(streamID, RTSPClient.CodecData, RTSPClient.SDPRaw)
-				WaitCodec = false
+				if obj.streamChannelPublishCodecs(streamID, generation, src.Codecs(), src.SDP()) {
+					waitCodec = false
+				}
 			case rtspv2.SignalStreamRTPStop:
 				return 0, ErrorStreamStopRTSPSignal
 			}
-		case packetRTP := <-RTSPClient.OutgoingProxyQueue:
-			Storage.StreamChannelCastProxy(streamID, packetRTP)
-		case packetAV := <-RTSPClient.OutgoingPacketQueue:
-			if WaitCodec {
+
+		case packetRTP, ok := <-src.RTP():
+			if !ok {
+				return 0, ErrorStreamStopRTSPSignal
+			}
+			obj.streamChannelCastProxyFor(streamID, generation, packetRTP)
+
+		case packetAV, ok := <-src.Packets():
+			if !ok {
+				return 0, ErrorStreamStopRTSPSignal
+			}
+			if waitCodec || packetAV == nil {
 				continue
 			}
-
 			if packetAV.IsKeyFrame {
-				keyTest.Reset(20 * time.Second)
-				if preKeyTS > 0 {
-					Seq = []*av.Packet{}
-				}
-				preKeyTS = packetAV.Time
+				keyTest.Reset(streamKeyTestTimeout)
 			}
-			Seq = append(Seq, packetAV)
-			Storage.StreamChannelCast(streamID, packetAV)
-			/*
-			   HLS LL Test
-			*/
 			if packetAV.IsKeyFrame && !start {
 				start = true
 			}
-			/*
-				FPS mode probe
-			*/
+			// FPS probe: normalise packet durations to a stable frame rate.
 			if start {
-				ProbePTS += packetAV.Duration
-				ProbeFrame++
-				if packetAV.IsKeyFrame && ProbePTS.Seconds() >= 1 {
-					ProbeCount++
-					if ProbeCount == 2 {
-						fps = int(math.Round(float64(ProbeFrame) / ProbePTS.Seconds()))
+				probePTS += packetAV.Duration
+				probeFrame++
+				if packetAV.IsKeyFrame && probePTS.Seconds() >= 1 {
+					probeCount++
+					if probeCount == 2 && probePTS > 0 {
+						fps = int(float64(probeFrame)/probePTS.Seconds() + 0.5)
 					}
-					ProbeFrame = 0
-					ProbePTS = 0
+					probeFrame = 0
+					probePTS = 0
 				}
 			}
-			if start && fps != 0 {
-				//TODO fix it
-				packetAV.Duration = time.Duration((float32(1000)/float32(fps))*1000*1000) * time.Nanosecond
+			if start && fps > 0 {
+				// A 1000/fps millisecond frame is time.Second/fps nanoseconds.
+				packetAV.Duration = time.Second / time.Duration(fps)
 			}
+			obj.streamChannelCastFor(streamID, generation, packetAV)
 		}
 	}
 }

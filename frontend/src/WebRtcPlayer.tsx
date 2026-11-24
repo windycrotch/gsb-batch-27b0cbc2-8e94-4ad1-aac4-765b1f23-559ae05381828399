@@ -52,7 +52,17 @@ const WebRtcPlayer: FC<WebRtcPlayerProps> = (props) => {
 
       const res = await Play(url, btoa(pc.localDescription.sdp));
 
-      if (!res || !pc.setRemoteDescription || pc.signalingState === "closed") {
+      // The backend returns a recognisable "error: ..." result (or an empty
+      // string) instead of an SDP answer when the session cannot be started.
+      // Surface it instead of trying to use it as an answer.
+      if (!res || res.startsWith("error: ")) {
+        setLoading(false);
+        console.error(res || "播放失败：服务端未返回应答");
+        return;
+      }
+
+      if (!pc.setRemoteDescription || pc.signalingState === "closed") {
+        setLoading(false);
         return;
       }
 
@@ -61,7 +71,10 @@ const WebRtcPlayer: FC<WebRtcPlayerProps> = (props) => {
           type: "answer",
           sdp: atob(res),
         })
-      );
+      ).catch((err: unknown) => {
+        setLoading(false);
+        console.error("setRemoteDescription failed", err);
+      });
     };
 
     pc.ontrack = (event): void => {
