@@ -43,3 +43,23 @@ Example to add an `image.Image` as a frame to the video:
     checkErr(aw.AddFrame(buf.Bytes()))
 
     checkErr(aw.Close())
+
+## Concurrency and error handling
+
+`AviWriter` is safe for concurrent use: `AddFrame` and `Close` may be called from
+multiple goroutines.
+
+- Frames are written in the order in which their `AddFrame` calls are serialized
+  internally. A successful `AddFrame` returns only after the frame data and its
+  index entry have been written, so the frame order in the file matches the order
+  of successful returns.
+- If writing a frame fails, that frame is rolled back (the file contains only
+  complete frames), the error is returned, and all subsequent `AddFrame` calls
+  keep failing without touching the file. `Close` reports that error too, while
+  still finalizing the successfully written frames.
+- `Close` is idempotent: repeated calls do not panic and return the result of the
+  first call. `AddFrame` calls after `Close` return `ErrClosed`.
+- The temporary `.idx_` index file is always removed, both on the normal path
+  (after `Close`) and when finalizing (backfilling the frame counts or splicing
+  the index) fails. If `New` fails, neither the avi file nor the `.idx_` file is
+  left behind.
