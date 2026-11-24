@@ -55,7 +55,7 @@ Mandatory option. Path to "encoding plan" configuration file.
 >    	Output directory to store results
 
 Mandatory option. Path to directory fo saving results. It will include plan execution
-report `report.json`, actual compressed clips, encoder logs, VQM logs, VQM plots etc.
+report `report.csv`, actual compressed clips, encoder logs, VQM logs, VQM plots etc.
 
 >  -dry-run
 >
@@ -171,13 +171,30 @@ out/
 ├── clip02_tbr_2000k.mp4
 ├── clip02_tbr_2000k.out
 ├── clip02_tbr_2000k_vqm.json
-└── report.json
+└── report.csv
 ```
 
 Compressed clips `*.mp4` along with encoder generated log output `*.out` and libvmaf log
 output `*.json` are saved into `out/` directory as specified by `-out-dir` commandline
-flag. Encoding run result is saved to `report.json`. Also, for each compressed file there
-is a subdirectory containing VQM plots `*.png` files.
+flag. Per-entry results are saved to `report.csv`. Also, for each successfully encoded
+and measured compressed file there is a subdirectory containing VQM plots `*.png` files.
+
+### Partial failures
+
+Failures of individual plan entries do not abort the whole batch. `run` keeps processing
+remaining entries, and the final `report.csv` always includes a row for every planned
+entry:
+
+- successfully evaluated entries have full VQM and bitrate metrics and a `Status` of
+  `ok`;
+- failed entries retain `Name`, `SourceFile`, `CompressedFile` and `Cmd`, while metric
+  fields are left empty/zero (no values are fabricated). Their `Status` column explains
+  the failure stage: `encoding_failed`, `vqm_failed` or `analysis_failed`.
+
+If at least one entry failed, `run` exits with a non-zero code. Plot directories are
+only created for successfully evaluated entries. Note that the same out directory
+cannot be reused: a repeated `run` into a non-empty `-out-dir` is rejected rather than
+overwriting existing results.
 
 ## Other subcommands
 

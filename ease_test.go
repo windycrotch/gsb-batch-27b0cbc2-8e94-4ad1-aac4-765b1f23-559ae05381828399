@@ -13,6 +13,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -61,6 +62,36 @@ func Test_RunApp_Run(t *testing.T) {
 			it.Should(t, got == 1, "Expecting one file matching glob \"%v\": got = %v", g, got)
 		}
 	})
+}
+
+// Repeated execution of the same plan into the same output directory should be
+// rejected, existing report must not be overwritten.
+func Test_RunApp_Run_RepeatIntoSameOutDirShouldBeRejected(t *testing.T) {
+	testutil.EnsureFfmpegWithVMAF(t)
+	plan := fixPlanConfig(t)
+	outDir := path.Join(t.TempDir(), "out")
+
+	// First run should succeed and produce a report.
+	err := CreateRunCommand().Run([]string{"-plan", plan, "-out-dir", outDir})
+	it.Must(t, err == nil, "First run should succeed: got = %v", err)
+
+	reportPath := path.Join(outDir, "report.csv")
+	origReport, err := os.ReadFile(reportPath)
+	it.Must(t, err == nil, "Unexpected error reading report: %v", err)
+
+	// Second run into the same out dir must be rejected.
+	gotErr := CreateRunCommand().Run([]string{"-plan", plan, "-out-dir", outDir})
+	it.Must(t, gotErr != nil, "Second run into non-empty out dir should fail")
+
+	var appErr *AppError
+	it.Must(t, errors.As(gotErr, &appErr), "Expecting error of type AppError: got = %v", gotErr)
+	it.Should(t, appErr.ExitCode() != 0, "Exit code should be non-zero: got = %v", appErr.ExitCode())
+	it.Should(t, strings.Contains(gotErr.Error(), "non-empty out dir"), "got = %v, want to contain %v", gotErr, "non-empty out dir")
+
+	// Existing report should be left intact.
+	gotReport, err := os.ReadFile(reportPath)
+	it.Must(t, err == nil, "Unexpected error reading report: %v", err)
+	it.Should(t, string(gotReport) == string(origReport), "Existing report should not be overwritten")
 }
 
 /*************************************
@@ -206,6 +237,284 @@ func Test_RunApp_Run_MisalignedFrames(t *testing.T) {
 	it.Must(t, errors.As(gotErr, &expErr), "Expecting error of type AppError: got = %v", gotErr)
 	wantErrMsg := "VQM calculations had errors, see log for reasons"
 	it.Should(t, strings.Contains(gotErr.Error(), wantErrMsg), "got = %v, want to contain %v", gotErr, wantErrMsg)
+}
+
+/*************************************
+* Partial failure tests for run sub-command.
+ *************************************/
+
+// reportRow is a decoded CSV report row keyed by header name.
+type reportRow map[string]string
+
+// readReport reads CSV report from given output directory.
+func readReport(t *testing.T, outDir string) (header []string, rows []reportRow) {
+	t.Helper()
+	fd, err := os.Open(path.Join(outDir, "report.csv"))
+	it.Must(t, err == nil, "Unexpected error opening report.csv: got = %v, want = nil", err)
+	defer fd.Close()
+
+	records, err := csv.NewReader(fd).ReadAll()
+	it.Must(t, err == nil, "Unexpected error reading CSV records: got = %v, want = nil", err)
+	it.Must(t, len(records) > 0, "Report should have at least a header row")
+
+	header = records[0]
+	for _, r := range records[1:] {
+		row := make(reportRow, len(header))
+		for i, h := range header {
+			row[h] = r[i]
+		}
+		rows = append(rows, row)
+	}
+	return header, rows
+}
+
+// plotDirs returns names of analysis/plot subdirectories under given output directory.
+func plotDirs(t *testing.T, outDir string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(outDir)
+	it.Must(t, err == nil, "Unexpected error reading out dir: %v", err)
+	var dirs []string
+	for _, e := range entries {
+		if e.IsDir() {
+			dirs = append(dirs, e.Name())
+		}
+	}
+	return dirs
+}
+
+// assertNoPlots checks that no analysis/plot subdirectories were created in outDir.
+func assertNoPlots(t *testing.T, outDir string) {
+	t.Helper()
+	gotDirs := plotDirs(t, outDir)
+	it.Should(t, len(gotDirs) == 0, "No plot directories expected: got = %v", gotDirs)
+}
+
+// assertPlotsForEntries checks that plot directories exist exactly for the given
+// successfully measured entries and that each such directory contains required plots.
+func assertPlotsForEntries(t *testing.T, outDir string, okRows []reportRow) {
+	t.Helper()
+	wantDirs := make(map[string]struct{}, len(okRows))
+	for _, r := range okRows {
+		base := path.Base(r["CompressedFile"])
+		base = strings.TrimSuffix(base, path.Ext(base))
+		wantDirs[base] = struct{}{}
+
+		// These plots are always produced by the default VMAF template.
+		for _, suffix := range []string{"_bitrate.png", "_vmaf.png", "_psnr.png"} {
+			p := path.Join(outDir, base, base+suffix)
+			it.Should(t, testutil.FileExists(p), "Missing plot file %s for successful entry", p)
+		}
+	}
+
+	gotDirs := plotDirs(t, outDir)
+	it.Must(t, len(gotDirs) == len(wantDirs), "Unexpected plot directories: got = %v, want = %v", gotDirs, wantDirs)
+	for _, d := range gotDirs {
+		_, ok := wantDirs[d]
+		it.Should(t, ok, "Unexpected plot directory for failed entry: %s", d)
+	}
+}
+
+// When some encodings fail, remaining entries should still be processed and reported,
+// report should include all planned entries and command should exit with non-zero code.
+func Test_RunApp_Run_PartialEncodeFailure(t *testing.T) {
+	testutil.EnsureFfmpegWithVMAF(t)
+	plan := fixPlanConfigMixed(t)
+	outDir := path.Join(t.TempDir(), "out")
+
+	app := CreateRunCommand()
+	gotErr := app.Run([]string{"-plan", plan, "-out-dir", outDir})
+
+	t.Run("Should exit with non-zero code", func(t *testing.T) {
+		var appErr *AppError
+		it.Must(t, errors.As(gotErr, &appErr), "Expecting error of type AppError: got = %v", gotErr)
+		it.Should(t, appErr.ExitCode() != 0, "Exit code should be non-zero: got = %v", appErr.ExitCode())
+	})
+
+	t.Run("Report should be written and parseable", func(t *testing.T) {
+		// Report should be present despite the failure.
+		it.Should(t, testutil.FileExists(path.Join(outDir, "report.csv")), "report.csv should exist")
+	})
+
+	_, rows := readReport(t, outDir)
+	// 2 inputs * 2 schemes = 4 planned entries.
+	wantCount := 4
+	it.Must(t, len(rows) == wantCount, "Report should contain all planned entries: got = %v, want = %v", len(rows), wantCount)
+
+	var okRows, failedRows []reportRow
+	for _, r := range rows {
+		if r["Status"] == "ok" {
+			okRows = append(okRows, r)
+		} else {
+			failedRows = append(failedRows, r)
+		}
+	}
+
+	t.Run("Should have both successful and failed entries", func(t *testing.T) {
+		it.Must(t, len(okRows) == 2, "Expecting 2 successful entries: got = %v", len(okRows))
+		it.Must(t, len(failedRows) == 2, "Expecting 2 failed entries: got = %v", len(failedRows))
+	})
+
+	t.Run("Failed entries should retain command and source file info", func(t *testing.T) {
+		for _, r := range failedRows {
+			it.Should(t, r["Status"] == "encoding_failed", "Unexpected status: got = %v, want = %v", r["Status"], "encoding_failed")
+			it.Should(t, r["Cmd"] != "", "Failed entry should retain Cmd: got = %q, want non-empty", r["Cmd"])
+			it.Should(t, r["SourceFile"] != "", "Failed entry should retain SourceFile: got = %q, want non-empty", r["SourceFile"])
+			it.Should(t, strings.Contains(r["Cmd"], "exit"), "Failed entry Cmd should be retained verbatim: got = %q", r["Cmd"])
+		}
+	})
+
+	t.Run("Failed entries should have empty/zero metrics", func(t *testing.T) {
+		metricFields := []string{
+			"VMAFMean", "VMAFMin", "VMAFMax", "VMAFHarmonicMean", "VMAFStDev", "VMAFVariance",
+			"PSNRMean", "PSNRMin", "PSNRMax", "PSNRHarmonicMean", "PSNRStDev", "PSNRVariance",
+			"MS_SSIMMean", "MS_SSIMMin", "MS_SSIMMax", "MS_SSIMHarmonicMean", "MS_SSIMStDev", "MS_SSIMVariance",
+			"BitrateMean", "BitrateMin", "BitrateMax",
+			"VQMResultFile",
+		}
+		for _, r := range failedRows {
+			for _, f := range metricFields {
+				got := r[f]
+				it.Should(t, got == "" || got == "0", "Metric field %q of failed entry should be empty or zero: got = %q", f, got)
+			}
+		}
+	})
+
+	t.Run("Successful entries should have full metrics", func(t *testing.T) {
+		for _, r := range okRows {
+			it.Should(t, r["VMAFMean"] != "" && r["VMAFMean"] != "0", "VMAFMean should be measured: got = %q", r["VMAFMean"])
+			it.Should(t, r["PSNRMean"] != "" && r["PSNRMean"] != "0", "PSNRMean should be measured: got = %q", r["PSNRMean"])
+			it.Should(t, r["BitrateMean"] != "" && r["BitrateMean"] != "0", "BitrateMean should be measured: got = %q", r["BitrateMean"])
+			it.Should(t, r["VQMResultFile"] != "", "VQMResultFile should be set for successful entry: got = %q", r["VQMResultFile"])
+		}
+	})
+
+	t.Run("Plots should exist only for successful entries", func(t *testing.T) {
+		assertPlotsForEntries(t, outDir, okRows)
+	})
+}
+
+// When all encodings fail, command should exit with non-zero code, but report must still
+// be written and parseable.
+func Test_RunApp_Run_AllEncodeFailed(t *testing.T) {
+	plan := fixPlanConfigAllFailing(t)
+	outDir := path.Join(t.TempDir(), "out")
+
+	app := CreateRunCommand()
+	gotErr := app.Run([]string{"-plan", plan, "-out-dir", outDir})
+
+	var appErr *AppError
+	it.Must(t, errors.As(gotErr, &appErr), "Expecting error of type AppError: got = %v", gotErr)
+	it.Should(t, appErr.ExitCode() != 0, "Exit code should be non-zero: got = %v", appErr.ExitCode())
+
+	it.Should(t, testutil.FileExists(path.Join(outDir, "report.csv")), "report.csv should exist even if all entries failed")
+
+	_, rows := readReport(t, outDir)
+	it.Must(t, len(rows) == 2, "Report should contain all planned entries: got = %v, want = %v", len(rows), 2)
+	for _, r := range rows {
+		it.Should(t, r["Status"] == "encoding_failed", "Unexpected status: got = %v, want = %v", r["Status"], "encoding_failed")
+		it.Should(t, r["Cmd"] != "", "Failed entry should retain Cmd: got = %q, want non-empty", r["Cmd"])
+		it.Should(t, r["SourceFile"] != "", "Failed entry should retain SourceFile: got = %q, want non-empty", r["SourceFile"])
+	}
+
+	// No plots for failed entries.
+	assertNoPlots(t, outDir)
+}
+
+// When VQM measurement fails for a single entry, that entry should be marked as failed,
+// while other entries should still be measured, plotted and reported.
+func Test_RunApp_Run_PartialVQMFailure(t *testing.T) {
+	testutil.EnsureFfmpegWithVMAF(t)
+	plan := fixPlanConfigOneVQMFailing(t)
+	outDir := path.Join(t.TempDir(), "out")
+
+	app := CreateRunCommand()
+	gotErr := app.Run([]string{"-plan", plan, "-out-dir", outDir})
+
+	var appErr *AppError
+	it.Must(t, errors.As(gotErr, &appErr), "Expecting error of type AppError: got = %v", gotErr)
+	it.Should(t, appErr.ExitCode() != 0, "Exit code should be non-zero: got = %v", appErr.ExitCode())
+	wantErrMsg := "VQM calculations had errors, see log for reasons"
+	it.Should(t, strings.Contains(gotErr.Error(), wantErrMsg), "got = %v, want to contain %v", gotErr, wantErrMsg)
+
+	it.Should(t, testutil.FileExists(path.Join(outDir, "report.csv")), "report.csv should exist")
+
+	_, rows := readReport(t, outDir)
+	// 2 inputs * 2 schemes = 4 planned entries.
+	it.Must(t, len(rows) == 4, "Report should contain all planned entries: got = %v, want = %v", len(rows), 4)
+
+	var ok, failed []reportRow
+	for _, r := range rows {
+		switch r["Status"] {
+		case "vqm_failed":
+			failed = append(failed, r)
+		case "ok":
+			ok = append(ok, r)
+		default:
+			t.Errorf("Unexpected status: got = %v", r["Status"])
+		}
+	}
+	it.Should(t, len(failed) == 2, "Expecting 2 VQM-failed entries: got = %v", len(failed))
+	it.Should(t, len(ok) == 2, "Expecting 2 successful entries: got = %v", len(ok))
+
+	for _, r := range failed {
+		it.Should(t, r["VMAFMean"] == "" || r["VMAFMean"] == "0", "VQM-failed entry should have no fabricated metrics: got = %q", r["VMAFMean"])
+		it.Should(t, r["Cmd"] != "", "VQM-failed entry should retain Cmd: got = %q", r["Cmd"])
+	}
+	for _, r := range ok {
+		it.Should(t, r["VMAFMean"] != "" && r["VMAFMean"] != "0", "Successful entry should have measured metrics: got = %q", r["VMAFMean"])
+	}
+
+	// Plots should exist only for successfully measured entries.
+	assertPlotsForEntries(t, outDir, ok)
+}
+
+// Deterministic end-to-end test of partial VQM failure using fake ffmpeg/ffprobe
+// binaries, thus not requiring real libvmaf support.
+func Test_RunApp_Run_PartialVQMFailureWithFakeTools(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake ffmpeg/ffprobe are POSIX shell scripts")
+	}
+	fixCreateFakeFfmpegAndFfprobeOnPath(t)
+
+	plan := fixPlanConfigWithFakeVQM(t)
+	outDir := path.Join(t.TempDir(), "out")
+
+	app := CreateRunCommand()
+	gotErr := app.Run([]string{"-plan", plan, "-out-dir", outDir})
+
+	var appErr *AppError
+	it.Must(t, errors.As(gotErr, &appErr), "Expecting error of type AppError: got = %v", gotErr)
+	it.Should(t, appErr.ExitCode() != 0, "Exit code should be non-zero: got = %v", appErr.ExitCode())
+
+	it.Should(t, testutil.FileExists(path.Join(outDir, "report.csv")), "report.csv should exist")
+
+	_, rows := readReport(t, outDir)
+	it.Must(t, len(rows) == 2, "Report should contain all planned entries: got = %v, want = %v", len(rows), 2)
+
+	var ok, failed []reportRow
+	for _, r := range rows {
+		switch r["Status"] {
+		case "vqm_failed":
+			failed = append(failed, r)
+		case "ok":
+			ok = append(ok, r)
+		default:
+			t.Errorf("Unexpected status: got = %v", r["Status"])
+		}
+	}
+	it.Should(t, len(failed) == 1, "Expecting 1 VQM-failed entry: got = %v", len(failed))
+	it.Should(t, len(ok) == 1, "Expecting 1 successful entry: got = %v", len(ok))
+
+	for _, r := range failed {
+		it.Should(t, r["VMAFMean"] == "" || r["VMAFMean"] == "0", "VQM-failed entry should have no fabricated metrics: got = %q", r["VMAFMean"])
+		it.Should(t, r["Cmd"] != "", "VQM-failed entry should retain Cmd: got = %q", r["Cmd"])
+	}
+	for _, r := range ok {
+		// Fake ffmpeg emits VMAF values 90..94, mean is 92.
+		it.Should(t, r["VMAFMean"] == "92", "Successful entry should have measured VMAF mean: got = %q, want = %q", r["VMAFMean"], "92")
+	}
+
+	assertPlotsForEntries(t, outDir, ok)
 }
 
 /*************************************

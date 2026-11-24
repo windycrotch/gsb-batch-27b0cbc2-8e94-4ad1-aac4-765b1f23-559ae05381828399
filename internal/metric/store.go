@@ -138,4 +138,9 @@ type Record struct {
 	BitrateMin  float64
 	BitrateMax  float64
 	BitrateMean float64
+
+	// Status of plan entry evaluation, e.g. "ok", "encoding_failed", "vqm_failed"
+	// or "analysis_failed". Metric fields above are zero when evaluation failed and
+	// must not be interpreted as measured values in that case.
+	Status string
 }

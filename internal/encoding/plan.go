@@ -237,15 +237,16 @@ func NewPlan(pc PlanConfig, outDir string) Plan {
 func (s *Plan) Run() (PlanResult, error) {
 	var runError error
 	result := PlanResult{
-		StartTime:  time.Now(),
-		RunResults: make([]RunResult, len(s.Commands)),
+		StartTime: time.Now(),
 	}
 
-	// Start by creating output dir s.OutDir.
+	// Start by creating output dir s.OutDir. If this fails, then no encoding command
+	// was executed, so RunResults is left empty to signal this to the caller.
 	if err := s.ensureOutDir(); err != nil {
 		return result, err
 	}
 
+	result.RunResults = make([]RunResult, len(s.Commands))
 	for i := range s.Commands {
 		logging.Infof("Encoding %s -> %s", s.Commands[i].SourceFile, s.Commands[i].CompressedFile)
 		result.RunResults[i] = s.Commands[i].Run()
@@ -294,9 +295,10 @@ type RunResult struct {
 
 // ExitCode returns exit code of executed encoding run.
 //
-// Returns -1 if command has not been executed.
+// Returns -1 if command has not been executed, e.g. process state is not available
+// because command failed to start.
 func (s *RunResult) ExitCode() int {
-	if s.cmd == nil {
+	if s.cmd == nil || s.cmd.ProcessState == nil {
 		return -1
 	}
 	return s.cmd.ProcessState.ExitCode()
