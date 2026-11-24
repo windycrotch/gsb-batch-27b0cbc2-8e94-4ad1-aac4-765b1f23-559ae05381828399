@@ -3,7 +3,9 @@ package oss
 
 import (
 	"errors"
+	"fmt"
 	"os"
+	"sync"
 )
 
 // ErrNotPlayback is returned by Write when the device was not opened for playback.
@@ -12,12 +14,53 @@ var ErrNotPlayback = errors.New("oss: device not opened for playback")
 // ErrNotCapture is returned by Read when the device was not opened for recording.
 var ErrNotCapture = errors.New("oss: device not opened for recording")
 
+// ErrClosed is returned by any Audio method called after the device was closed.
+// It also matches os.ErrClosed via errors.Is.
+var ErrClosed = fmt.Errorf("oss: device closed: %w", os.ErrClosed)
+
+// audioFile is the part of *os.File used by Audio. It is an interface so the
+// state machine can be exercised with a fake device in tests.
+type audioFile interface {
+	Write([]byte) (int, error)
+	Read([]byte) (int, error)
+	Fd() uintptr
+	Close() error
+}
+
+type ioctlFunc func(fd uintptr, req uint, val int) (int, error)
+
+type ioctlInfoFunc func(fd uintptr, req uint) (audioBufInfo, error)
+
 // Audio represents an audio device.
+//
+// An Audio is safe for concurrent use. State changes from Start, Reset, Write,
+// Read and Close are serialized so that Playing and Recording always describe
+// the last completed operation. In particular, once Close returns no method
+// touches the underlying file descriptor anymore.
 type Audio struct {
-	file      *os.File
-	mode      int
+	file audioFile
+	mode int
+
+	// mu guards closed, playing and recording. It is held for the duration of
+	// every ioctl so an ioctl can never be issued on a closed descriptor.
+	// Write and Read only take it to check/publish state, never across the
+	// blocking I/O itself.
+	mu        sync.Mutex
+	closed    bool
 	playing   bool
 	recording bool
+
+	ioctlFn  ioctlFunc
+	ioctlIFn ioctlInfoFunc
+}
+
+func newAudio(file audioFile, mode int) *Audio {
+	return &Audio{
+		file:     file,
+		mode:     mode,
+		ioctlFn:  ioctl,
+		ioctlIFn: ioctlI,
+	}
 }
 
 func audioPath(path []string) string {
@@ -51,7 +94,7 @@ func openAudio(mode int, path []string) (*Audio, error) {
 		}
 	}
 
-	return &Audio{file: file, mode: mode}, nil
+	return newAudio(file, mode), nil
 }
 
 // OpenAudio opens the audio device for playback.
@@ -69,19 +112,81 @@ func OpenDuplex(path ...string) (*Audio, error) {
 	return openAudio(os.O_RDWR, path)
 }
 
+// normErr maps the errors produced by a closed *os.File to ErrClosed so callers
+// get one recognizable error whether the close happened before or during a call.
+func normErr(err error) error {
+	if err != nil && errors.Is(err, os.ErrClosed) {
+		return ErrClosed
+	}
+
+	return err
+}
+
+// doIoctl runs an ioctl while holding the device lock, so it can never race
+// with Close and never touches a closed file descriptor.
+func (a *Audio) doIoctl(req uint, val int) (int, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if a.closed {
+		return 0, ErrClosed
+	}
+
+	value, err := a.ioctlFn(a.file.Fd(), req, val)
+
+	return value, normErr(err)
+}
+
+// doIoctlI is doIoctl for ioctls that fill an audioBufInfo.
+func (a *Audio) doIoctlI(req uint) (audioBufInfo, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if a.closed {
+		return audioBufInfo{}, ErrClosed
+	}
+
+	info, err := a.ioctlIFn(a.file.Fd(), req)
+
+	return info, normErr(err)
+}
+
+// checkOpen reports ErrClosed if the device has been closed.
+func (a *Audio) checkOpen() error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if a.closed {
+		return ErrClosed
+	}
+
+	return nil
+}
+
 // Close closes the audio device.
+//
+// After Close returns, every other method returns ErrClosed. Calling Close more
+// than once is safe and returns ErrClosed as well.
 func (a *Audio) Close() error {
+	a.mu.Lock()
+	if a.closed {
+		a.mu.Unlock()
+		return ErrClosed
+	}
+	a.closed = true
 	a.playing = false
 	a.recording = false
+	a.mu.Unlock()
 
+	// No ioctl can start now (they check a.closed under a.mu) and an in-flight
+	// ioctl holds a.mu, so the descriptor is no longer used by this package.
+	// *os.File itself makes concurrent Read/Write against Close safe.
 	return a.file.Close()
 }
 
 // Caps returns the capability mask of an audio device.
 func (a *Audio) Caps() (int, error) {
-	value, err := ioctl(a.file.Fd(), sndctlDspGetcaps, 0)
-
-	return value, err
+	return a.doIoctl(sndctlDspGetcaps, 0)
 }
 
 // IsCap checks if capability is supported.
@@ -100,9 +205,7 @@ func (a *Audio) IsCap(c Cap) (bool, error) {
 
 // Formats returns the supported formats mask.
 func (a *Audio) Formats() (int, error) {
-	value, err := ioctl(a.file.Fd(), sndctlDspGetfmts, 0)
-
-	return value, err
+	return a.doIoctl(sndctlDspGetfmts, 0)
 }
 
 // IsFormat checks if format is supported.
@@ -121,24 +224,28 @@ func (a *Audio) IsFormat(format Format) (bool, error) {
 
 // Playing checks if audio is playing.
 func (a *Audio) Playing() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
 	return a.playing
 }
 
 // Recording checks if audio is being recorded.
 func (a *Audio) Recording() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
 	return a.recording
 }
 
 // Nonblock forces non-blocking mode regardless of the O_NONBLOCK file mode flag.
 func (a *Audio) Nonblock() (int, error) {
-	value, err := ioctl(a.file.Fd(), sndctlDspNonblock, 0)
-
-	return value, err
+	return a.doIoctl(sndctlDspNonblock, 0)
 }
 
 // Format sets the audio format.
 func (a *Audio) Format(format Format) (Format, error) {
-	value, err := ioctl(a.file.Fd(), sndctlDspSetfmt, int(format))
+	value, err := a.doIoctl(sndctlDspSetfmt, int(format))
 
 	return Format(value), err
 }
@@ -148,14 +255,14 @@ func (a *Audio) Format(format Format) (Format, error) {
 // In some cases it's not possible to support the samplerate requested.
 // In that case the nearest possible sampling rate will be used.
 func (a *Audio) Samplerate(samplerate int) (int, error) {
-	return ioctl(a.file.Fd(), sndctlDspSpeed, samplerate)
+	return a.doIoctl(sndctlDspSpeed, samplerate)
 }
 
 // Channels sets the number of audio channels.
 //
 // The returned value may be different from the one requested.
 func (a *Audio) Channels(channels int) (int, error) {
-	return ioctl(a.file.Fd(), sndctlDspChannels, channels)
+	return a.doIoctl(sndctlDspChannels, channels)
 }
 
 // SetBufferSize sets the buffer size hint.
@@ -167,44 +274,72 @@ func (a *Audio) Channels(channels int) (int, error) {
 // fragsize is the fragment size selector, i.e. for selector N the size is 1<<N.
 func (a *Audio) SetBufferSize(fragments, fragsize int) error {
 	arg := (fragments << 16) | fragsize
-	_, err := ioctl(a.file.Fd(), sndctlDspSetfragment, arg)
+	_, err := a.doIoctl(sndctlDspSetfragment, arg)
 
 	return err
 }
 
 // BufferSize returns the buffer size.
+//
+// For a playback device this is the total playback buffer, for a capture-only
+// device it is the total recording buffer.
 func (a *Audio) BufferSize() (int, error) {
+	if err := a.checkOpen(); err != nil {
+		return 0, err
+	}
+
 	req := sndctlDspGetospace
 	if a.mode == os.O_RDONLY {
 		req = sndctlDspGetispace
 	}
 
-	info, err := ioctlI(a.file.Fd(), req)
+	info, err := a.doIoctlI(req)
 	if err != nil {
 		return 0, err
 	}
 
-	return int(info.fragstotal * info.fragsize), err
+	return int(info.fragstotal * info.fragsize), nil
 }
 
 // RecordedBufferSize returns the number of bytes that can be read from the device.
+//
+// It returns ErrNotCapture on a playback-only device.
 func (a *Audio) RecordedBufferSize() (int, error) {
-	info, err := ioctlI(a.file.Fd(), sndctlDspGetispace)
+	if err := a.checkOpen(); err != nil {
+		return 0, err
+	}
+
+	if a.mode == os.O_WRONLY {
+		return 0, ErrNotCapture
+	}
+
+	info, err := a.doIoctlI(sndctlDspGetispace)
 	if err != nil {
 		return 0, err
 	}
 
-	return int(info.bytes), err
+	return int(info.bytes), nil
 }
 
 // UnplayedBufferSize returns the size of buffer that is not yet played.
+//
+// It returns ErrNotPlayback on a capture-only device, where there is no
+// playback buffer to query.
 func (a *Audio) UnplayedBufferSize() (int, error) {
-	info, err := ioctlI(a.file.Fd(), sndctlDspGetospace)
+	if err := a.checkOpen(); err != nil {
+		return 0, err
+	}
+
+	if a.mode == os.O_RDONLY {
+		return 0, ErrNotPlayback
+	}
+
+	info, err := a.doIoctlI(sndctlDspGetospace)
 	if err != nil {
 		return 0, err
 	}
 
-	return int(info.fragstotal*info.fragsize - info.bytes), err
+	return int(info.fragstotal*info.fragsize - info.bytes), nil
 }
 
 // Delay returns the playback buffering delay.
@@ -214,13 +349,20 @@ func (a *Audio) UnplayedBufferSize() (int, error) {
 //
 //	samplerate*channels*sampleSizeInBytes.
 func (a *Audio) Delay() (int, error) {
-	return ioctl(a.file.Fd(), sndctlDspGetodelay, 0)
+	return a.doIoctl(sndctlDspGetodelay, 0)
 }
 
 // Start starts audio playback and/or recording, depending on how the device was opened.
 //
 // Note that the Write and Read calls will automatically start the actual operation.
 func (a *Audio) Start() error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if a.closed {
+		return ErrClosed
+	}
+
 	var trigger int
 	if a.mode != os.O_WRONLY {
 		trigger |= pcmEnableInput
@@ -229,47 +371,77 @@ func (a *Audio) Start() error {
 		trigger |= pcmEnableOutput
 	}
 
-	_, err := ioctl(a.file.Fd(), sndctlDspSettrigger, trigger)
-	if err == nil {
-		a.playing = a.mode != os.O_RDONLY
-		a.recording = a.mode != os.O_WRONLY
+	if _, err := a.ioctlFn(a.file.Fd(), sndctlDspSettrigger, trigger); err != nil {
+		return normErr(err)
 	}
 
-	return err
+	a.playing = a.mode != os.O_RDONLY
+	a.recording = a.mode != os.O_WRONLY
+
+	return nil
 }
 
 // Write queues one audio buffer to the hardware.
 func (a *Audio) Write(b []byte) (int, error) {
+	if err := a.checkOpen(); err != nil {
+		return 0, err
+	}
+
 	if a.mode == os.O_RDONLY {
 		return 0, ErrNotPlayback
 	}
 
 	n, err := a.file.Write(b)
 	if err != nil {
-		a.playing = false
+		if errors.Is(err, os.ErrClosed) {
+			return n, ErrClosed
+		}
+
+		// Do not resurrect stale state if Close won the race.
+		a.mu.Lock()
+		if !a.closed {
+			a.playing = false
+		}
+		a.mu.Unlock()
+
+		return n, err
 	}
 
-	return n, err
+	return n, nil
 }
 
 // Read reads one audio buffer from the hardware.
 func (a *Audio) Read(b []byte) (int, error) {
+	if err := a.checkOpen(); err != nil {
+		return 0, err
+	}
+
 	if a.mode == os.O_WRONLY {
 		return 0, ErrNotCapture
 	}
 
 	n, err := a.file.Read(b)
 	if err != nil {
-		a.recording = false
+		if errors.Is(err, os.ErrClosed) {
+			return n, ErrClosed
+		}
+
+		a.mu.Lock()
+		if !a.closed {
+			a.recording = false
+		}
+		a.mu.Unlock()
+
+		return n, err
 	}
 
-	return n, err
+	return n, nil
 }
 
 // Post tells the driver to start playing buffered samples immediately without
 // waiting for the buffer to fill, for example after a pause or between segments.
 func (a *Audio) Post() error {
-	_, err := ioctl(a.file.Fd(), sndctlDspPost, 0)
+	_, err := a.doIoctl(sndctlDspPost, 0)
 
 	return err
 }
@@ -278,18 +450,28 @@ func (a *Audio) Post() error {
 //
 // There is no need to use this call after opening the device.
 // The Open operation automatically initializes the device.
+//
+// On success Playing and Recording both report false.
 func (a *Audio) Reset() error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if a.closed {
+		return ErrClosed
+	}
+
+	if _, err := a.ioctlFn(a.file.Fd(), sndctlDspReset, 0); err != nil {
+		return normErr(err)
+	}
+
 	a.playing = false
 	a.recording = false
 
-	_, err := ioctl(a.file.Fd(), sndctlDspReset, 0)
-	if err != nil {
-		return err
+	if _, err := a.ioctlFn(a.file.Fd(), sndctlDspSettrigger, 0); err != nil {
+		return normErr(err)
 	}
 
-	_, err = ioctl(a.file.Fd(), sndctlDspSettrigger, 0)
-
-	return err
+	return nil
 }
 
 // Sync can be used to wait until all samples written to the audio device have been played.
@@ -300,7 +482,7 @@ func (a *Audio) Reset() error {
 // Closing the device will perform the sync operation automatically so using this ioctl call
 // is unnecessary before calling Close.
 func (a *Audio) Sync() error {
-	_, err := ioctl(a.file.Fd(), sndctlDspSync, 0)
+	_, err := a.doIoctl(sndctlDspSync, 0)
 
 	return err
 }
