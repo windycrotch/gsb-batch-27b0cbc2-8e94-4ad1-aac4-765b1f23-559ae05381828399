@@ -49,12 +49,12 @@ func main() {
 	}
 
 	srcFormat := types.PCMFormatFromString(*srcFormatFlag)
-	if srcFormat == types.PCMFormatUndefined {
+	if srcFormat == types.UndefinedPCMFormat {
 		panic(fmt.Errorf("unknown PCM format '%s'", *srcFormatFlag))
 	}
 
 	dstFormat := types.PCMFormatFromString(*dstFormatFlag)
-	if srcFormat == types.PCMFormatUndefined {
+	if dstFormat == types.UndefinedPCMFormat {
 		panic(fmt.Errorf("unknown PCM format '%s'", *dstFormatFlag))
 	}
 
