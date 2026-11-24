@@ -4,15 +4,17 @@ import (
 	"errors"
 	"image/color"
 	"io"
+	"sync"
 
 	"github.com/fogleman/gg"
 	"golang.org/x/image/font"
 )
 
 var (
-	errNoRows      = errors.New("no rows provided")
-	errNoColumns   = errors.New("no columns provided")
-	errOutOfBounds = errors.New("out of bounds")
+	errNoRows       = errors.New("no rows provided")
+	errNoColumns    = errors.New("no columns provided")
+	errOutOfBounds  = errors.New("out of bounds")
+	errEmptyPNGName = errors.New("empty file name")
 )
 
 // New creates a new gridder and sets it up with its configuration
@@ -37,7 +39,14 @@ func New(imageConfig ImageConfig, gridConfig GridConfig) (*Gridder, error) {
 }
 
 // Gridder gridder structure
+//
+// All access to the shared drawing context is guarded by mu. Export methods
+// (EncodePNG/SavePNG) never draw onto the shared context: they take a pixel
+// snapshot under mu.RLock and render the grid lines and border onto their own
+// private context, so repeated and concurrent exports can never accumulate
+// strokes or observe each other's intermediate state.
 type Gridder struct {
+	mu          sync.RWMutex
 	imageConfig ImageConfig
 	gridConfig  GridConfig
 	ctx         *gg.Context
@@ -45,40 +54,69 @@ type Gridder struct {
 
 // SavePNG saves to PNG
 func (g *Gridder) SavePNG() error {
-	g.paintGrid()
-	g.paintBorder()
-	return g.ctx.SavePNG(g.imageConfig.GetName())
+	name := g.imageConfig.GetName()
+	if name == "" {
+		return errEmptyPNGName
+	}
+
+	// Render onto an isolated snapshot; the shared canvas is left untouched,
+	// so a failed export never compromises later exports.
+	return gg.SavePNG(name, g.render().Image())
 }
 
 // EncodePNG encodes the image as a PNG and writes it to the provided io.Writer.
 func (g *Gridder) EncodePNG(w io.Writer) error {
-	g.paintGrid()
-	g.paintBorder()
-	return g.ctx.EncodePNG(w)
+	return g.render().EncodePNG(w)
+}
+
+// render builds a private context holding a consistent snapshot of the
+// current canvas together with the grid lines and the border. It does not
+// mutate the gridder's own context, which keeps every export independent,
+// repeatable and safe for concurrent use.
+func (g *Gridder) render() *gg.Context {
+	g.mu.RLock()
+	// NewContextForImage copies the source pixels into a fresh RGBA buffer.
+	snapshot := gg.NewContextForImage(g.ctx.Image())
+	g.mu.RUnlock()
+
+	// The shared context carries the margin translation applied in
+	// paintBackground; the snapshot starts with an identity matrix, so apply
+	// the same translation before painting grid lines and the border.
+	margin := float64(g.gridConfig.GetMarginWidth())
+	snapshot.Translate(margin, margin)
+	g.paintGrid(snapshot)
+	g.paintBorder(snapshot)
+	return snapshot
 }
 
 // PaintCell paints Cell
-func (g *Gridder) PaintCell(row int, column int, color color.Color) error {
-	err := g.verifyInBounds(row, column)
-	if err != nil {
+func (g *Gridder) PaintCell(row int, column int, paintColor color.Color) error {
+	if err := g.verifyInBounds(row, column); err != nil {
 		return err
 	}
 
 	cellWidth, cellHeight := g.getCellDimensions()
 	paintWidth := cellWidth - g.gridConfig.GetLineStrokeWidth()
 	paintHeight := cellHeight - g.gridConfig.GetLineStrokeWidth()
-	return g.DrawRectangle(row, column, RectangleConfig{Width: paintWidth, Height: paintHeight, Color: color})
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.drawRectangle(row, column, RectangleConfig{Width: paintWidth, Height: paintHeight, Color: paintColor})
 }
 
 // DrawRectangle draws a rectangle in a cell
 func (g *Gridder) DrawRectangle(row int, column int, rectangleConfigs ...RectangleConfig) error {
-	err := g.verifyInBounds(row, column)
-	if err != nil {
+	if err := g.verifyInBounds(row, column); err != nil {
 		return err
 	}
 
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.drawRectangle(row, column, getFirstRectangleConfig(rectangleConfigs...))
+}
+
+func (g *Gridder) drawRectangle(row int, column int, rectangleConfig RectangleConfig) error {
 	center := g.getCellCenter(row, column)
-	rectangleConfig := getFirstRectangleConfig(rectangleConfigs...)
 	rectangleWidth := rectangleConfig.GetWidth()
 	rectangleHeight := rectangleConfig.GetHeight()
 
@@ -107,13 +145,17 @@ func (g *Gridder) DrawRectangle(row int, column int, rectangleConfigs ...Rectang
 
 // DrawCircle draws a circle in a cell
 func (g *Gridder) DrawCircle(row int, column int, circleConfigs ...CircleConfig) error {
-	err := g.verifyInBounds(row, column)
-	if err != nil {
+	if err := g.verifyInBounds(row, column); err != nil {
 		return err
 	}
 
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.drawCircle(row, column, getFirstCircleConfig(circleConfigs...))
+}
+
+func (g *Gridder) drawCircle(row int, column int, circleConfig CircleConfig) error {
 	center := g.getCellCenter(row, column)
-	circleConfig := getFirstCircleConfig(circleConfigs...)
 
 	g.ctx.Push()
 	dashes := circleConfig.GetDashes()
@@ -136,19 +178,20 @@ func (g *Gridder) DrawCircle(row int, column int, circleConfigs ...CircleConfig)
 
 // DrawPath draws a path between two cells
 func (g *Gridder) DrawPath(row1 int, column1 int, row2 int, column2 int, pathConfigs ...PathConfig) error {
-	err := g.verifyInBounds(row1, column1)
-	if err != nil {
+	if err := g.verifyInBounds(row1, column1); err != nil {
 		return err
 	}
 
-	err = g.verifyInBounds(row2, column2)
-	if err != nil {
+	if err := g.verifyInBounds(row2, column2); err != nil {
 		return err
 	}
 
 	center1 := g.getCellCenter(row1, column1)
 	center2 := g.getCellCenter(row2, column2)
 	pathConfig := getFirstPathConfig(pathConfigs...)
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
 
 	g.ctx.Push()
 	dashes := pathConfig.GetDashes()
@@ -167,13 +210,17 @@ func (g *Gridder) DrawPath(row1 int, column1 int, row2 int, column2 int, pathCon
 
 // DrawLine draws a line in a cell
 func (g *Gridder) DrawLine(row int, column int, lineConfigs ...LineConfig) error {
-	err := g.verifyInBounds(row, column)
-	if err != nil {
+	if err := g.verifyInBounds(row, column); err != nil {
 		return err
 	}
 
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.drawLine(row, column, getFirstLineConfig(lineConfigs...))
+}
+
+func (g *Gridder) drawLine(row int, column int, lineConfig LineConfig) error {
 	center := g.getCellCenter(row, column)
-	lineConfig := getFirstLineConfig(lineConfigs...)
 	length := lineConfig.GetLength()
 
 	x1 := center.X - length/2
@@ -198,13 +245,16 @@ func (g *Gridder) DrawLine(row int, column int, lineConfigs ...LineConfig) error
 
 // DrawString draws a string in a cell
 func (g *Gridder) DrawString(row int, column int, text string, fontFace font.Face, stringConfigs ...StringConfig) error {
-	err := g.verifyInBounds(row, column)
-	if err != nil {
+	if err := g.verifyInBounds(row, column); err != nil {
 		return err
 	}
 
 	center := g.getCellCenter(row, column)
 	stringConfig := getFirstStringConfig(stringConfigs...)
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
 	g.ctx.Push()
 	g.ctx.SetFontFace(fontFace)
 	g.ctx.SetColor(stringConfig.GetColor())
@@ -221,65 +271,71 @@ func (g *Gridder) paintBackground() {
 	g.ctx.Clear()
 }
 
-func (g *Gridder) paintGrid() {
+// paintGrid paints the grid lines onto the supplied context. It never touches
+// the gridder's shared canvas, so it can be invoked per export on an isolated
+// snapshot without accumulating strokes across exports.
+func (g *Gridder) paintGrid(ctx *gg.Context) {
 	canvasWidth, canvasHeight := g.getGridDimensions()
 	cellWidth, cellHeight := g.getCellDimensions()
 
 	columns := float64(g.gridConfig.GetColumns())
 
-	g.ctx.Push()
+	ctx.Push()
 	for i := 1.0; i < columns; i++ {
 		x := i * cellWidth
-		g.ctx.MoveTo(x, 0)
-		g.ctx.LineTo(x, canvasHeight)
+		ctx.MoveTo(x, 0)
+		ctx.LineTo(x, canvasHeight)
 	}
 
 	rows := float64(g.gridConfig.GetRows())
 	for i := 1.0; i < rows; i++ {
 		y := i * cellHeight
-		g.ctx.MoveTo(0, y)
-		g.ctx.LineTo(canvasWidth, y)
+		ctx.MoveTo(0, y)
+		ctx.LineTo(canvasWidth, y)
 	}
 
 	dashes := g.gridConfig.GetLineDashes()
 	if dashes > 0 {
-		g.ctx.SetDash(dashes)
+		ctx.SetDash(dashes)
 	} else {
-		g.ctx.SetDash()
+		ctx.SetDash()
 	}
-	g.ctx.SetColor(g.gridConfig.GetLineColor())
-	g.ctx.SetLineWidth(g.gridConfig.GetLineStrokeWidth())
-	g.ctx.Stroke()
-	g.ctx.Pop()
+	ctx.SetColor(g.gridConfig.GetLineColor())
+	ctx.SetLineWidth(g.gridConfig.GetLineStrokeWidth())
+	ctx.Stroke()
+	ctx.Pop()
 }
 
-func (g *Gridder) paintBorder() {
+// paintBorder paints the border onto the supplied context. It never touches
+// the gridder's shared canvas, so it can be invoked per export on an isolated
+// snapshot without accumulating strokes across exports.
+func (g *Gridder) paintBorder(ctx *gg.Context) {
 	canvasWidth, canvasHeight := g.getGridDimensions()
 	cellWidth, cellHeight := g.getCellDimensions()
 
 	columns := float64(g.gridConfig.GetColumns())
-	g.ctx.Push()
-	g.ctx.MoveTo(0, 0)
-	g.ctx.LineTo(0, canvasHeight)
-	g.ctx.MoveTo(cellWidth*columns, 0)
-	g.ctx.LineTo(cellWidth*columns, canvasHeight)
+	ctx.Push()
+	ctx.MoveTo(0, 0)
+	ctx.LineTo(0, canvasHeight)
+	ctx.MoveTo(cellWidth*columns, 0)
+	ctx.LineTo(cellWidth*columns, canvasHeight)
 
 	rows := float64(g.gridConfig.GetRows())
-	g.ctx.MoveTo(0, 0)
-	g.ctx.LineTo(canvasWidth, 0)
-	g.ctx.MoveTo(0, cellHeight*rows)
-	g.ctx.LineTo(canvasWidth, cellHeight*rows)
+	ctx.MoveTo(0, 0)
+	ctx.LineTo(canvasWidth, 0)
+	ctx.MoveTo(0, cellHeight*rows)
+	ctx.LineTo(canvasWidth, cellHeight*rows)
 
 	dashes := g.gridConfig.GetBorderDashes()
 	if dashes > 0 {
-		g.ctx.SetDash(dashes)
+		ctx.SetDash(dashes)
 	} else {
-		g.ctx.SetDash()
+		ctx.SetDash()
 	}
-	g.ctx.SetLineWidth(g.gridConfig.GetBorderStrokeWidth())
-	g.ctx.SetColor(g.gridConfig.GetBorderColor())
-	g.ctx.Stroke()
-	g.ctx.Pop()
+	ctx.SetLineWidth(g.gridConfig.GetBorderStrokeWidth())
+	ctx.SetColor(g.gridConfig.GetBorderColor())
+	ctx.Stroke()
+	ctx.Pop()
 }
 
 func (g *Gridder) getCellDimensions() (float64, float64) {
