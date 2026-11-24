@@ -1,17 +1,48 @@
 package encoder
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"os/exec"
 )
 
-const ffprobeCmd = "ffprobe"
+// ffprobeCmd is the ffprobe executable. It is a variable so tests can point it
+// at a fake binary.
+var ffprobeCmd = "ffprobe"
+
+// SetFFprobeCommand overrides the ffprobe executable and returns a function that
+// restores the previous value. It is intended for tests.
+func SetFFprobeCommand(cmd string) func() {
+	previous := ffprobeCmd
+	ffprobeCmd = cmd
+	return func() { ffprobeCmd = previous }
+}
 
 // FFProbe struct.
 type FFProbe struct{}
 
-// Run runs an FFProbe command.
+// Run runs an FFProbe command. It returns an empty response when the probe fails
+// and keeps the historical signature for callers that do not need the error.
 func (f FFProbe) Run(input string) *FFProbeResponse {
+	resp, err := RunFFProbe(context.Background(), input)
+	if err != nil || resp == nil {
+		return &FFProbeResponse{}
+	}
+	return resp
+}
+
+// RunFFProbe runs ffprobe and decodes its JSON output. The context kills the
+// probe process when the job is cancelled, so a long probe does not outlive its
+// execution.
+func RunFFProbe(ctx context.Context, input string) (*FFProbeResponse, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	args := []string{
 		"-i", input,
 		"-show_streams",
@@ -20,27 +51,36 @@ func (f FFProbe) Run(input string) *FFProbeResponse {
 	}
 
 	// Execute command.
-	cmd := exec.Command(ffprobeCmd, args...)
+	cmd := exec.CommandContext(ctx, ffprobeCmd, args...)
 	log.Info("Running FFprobe...")
-	stdout, err := cmd.CombinedOutput()
+	stdout, err := cmd.Output()
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
+	}
 	if err != nil {
+		// ffprobe writes a JSON document even when it exits non-zero for a
+		// stream it could not fully read; only reject the output if it is not
+		// JSON below.
 		log.Error(err.Error())
 	}
-	// log.Info((string(stdout))
 
 	dat := &FFProbeResponse{}
-	if err := json.Unmarshal([]byte(stdout), &dat); err != nil {
-		panic(err)
+	if err := json.Unmarshal(stdout, &dat); err != nil {
+		if len(stdout) == 0 {
+			return nil, errors.New("ffprobe returned no output")
+		}
+		return nil, err
 	}
-	return dat
+	return dat, nil
 }
 
 // FFProbeResponse defines the response from ffprobe.
 type FFProbeResponse struct {
-	Streams []stream `json:"streams"`
+	Streams []Stream `json:"streams"`
 }
 
-type stream struct {
+// Stream describes a single media stream reported by ffprobe.
+type Stream struct {
 	Index              int         `json:"index"`
 	CodecName          string      `json:"codec_name"`
 	CodecLongName      string      `json:"codec_long_name"`

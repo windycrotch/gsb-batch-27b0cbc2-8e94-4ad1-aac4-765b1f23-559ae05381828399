@@ -3,6 +3,7 @@ package types
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 )
 
 // Job status types.
@@ -41,6 +42,17 @@ type Job struct {
 	Source      string `db:"source" json:"source"`
 	Destination string `db:"destination" json:"destination"`
 
+	// RunID identifies the execution that currently owns this job. It is
+	// NULL while no execution owns the job (queued, or finished). Restarting a
+	// job clears it so that late writes from the previous execution are
+	// rejected by the store.
+	RunID NullString `db:"run_id" json:"-"`
+
+	// CancelRequested is set by the operator cancel endpoint and cleared when a
+	// new execution claims the job. It records the intent to cancel even if
+	// the status column is overwritten by a concurrent write.
+	CancelRequested bool `db:"cancel_requested" json:"-"`
+
 	// EncodeData.
 	Encode `db:"encode"`
 
@@ -48,6 +60,37 @@ type Job struct {
 	LocalDestination string `json:"local_destination,omitempty"`
 	Streaming        bool   `json:"streaming"`
 }
+
+// JobRunState is the minimal view of a job used to detect cancellation,
+// terminal states and superseded executions.
+type JobRunState struct {
+	GUID            string     `db:"guid" json:"guid"`
+	Status          string     `db:"status" json:"status"`
+	RunID           NullString `db:"run_id" json:"run_id"`
+	CancelRequested bool       `db:"cancel_requested" json:"cancel_requested"`
+}
+
+// IsTerminalStatus reports whether a job status is final. A terminal status can
+// not be changed by progress reports or by another execution.
+func IsTerminalStatus(status string) bool {
+	switch status {
+	case JobCompleted, JobError, JobCancelled:
+		return true
+	}
+	return false
+}
+
+// Errors returned while running a job.
+var (
+	// ErrCancelled is returned when an execution stops because the job was
+	// cancelled.
+	ErrCancelled = errors.New(JobCancelled)
+
+	// ErrStaleRun is returned when a guarded write is rejected because the job
+	// is no longer owned by the calling execution: it was cancelled, finished,
+	// or restarted with a new run id.
+	ErrStaleRun = errors.New("job run is stale")
+)
 
 // Encode describes the encode data.
 type Encode struct {

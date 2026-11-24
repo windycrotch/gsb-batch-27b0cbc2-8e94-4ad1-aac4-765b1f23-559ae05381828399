@@ -20,5 +20,7 @@ const (
 var (
 	EndpointDigitalOceanSpacesRegion = func(region string) string { return region + EndpointDigitalOceanSpaces }
 	EndpointAmazonAWSRegion          = func(region string) string { return "s3." + region + EndpointAmazonAWS }
-	progressCh                       chan struct{}
 )
+
+// ProgressFunc receives a transfer progress percentage in the range [0, 100].
+type ProgressFunc func(progress float64)

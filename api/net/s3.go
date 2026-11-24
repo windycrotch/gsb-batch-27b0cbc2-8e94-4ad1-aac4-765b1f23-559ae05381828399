@@ -1,13 +1,13 @@
 package net
 
 import (
-	"fmt"
+	"context"
 	"net/url"
 	"os"
 	"path"
 	"path/filepath"
 	"strings"
-	"time"
+	"sync/atomic"
 
 	"github.com/alfg/openencoder/api/data"
 	"github.com/alfg/openencoder/api/types"
@@ -31,16 +31,10 @@ type S3Config struct {
 
 // S3 creates a new S3 instance.
 type S3 struct {
-	Progress progress
-	Writer   *ProgressWriter
-	Reader   *ProgressReader
+	Writer *ProgressWriter
+	Reader *ProgressReader
 
 	Config S3Config
-}
-
-type progress struct {
-	quit     chan struct{}
-	Progress float32
 }
 
 // NewS3 creates a new S3 instance.
@@ -53,7 +47,10 @@ func NewS3(config S3Config) *S3 {
 }
 
 // Download downloads source files from S3.
-func (s *S3) Download(job types.Job) error {
+func (s *S3) Download(ctx context.Context, job types.Job) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	log.Info("downloading from S3: ", job.Source)
 
 	// Open file for writing.
@@ -61,6 +58,7 @@ func (s *S3) Download(job types.Job) error {
 	if err != nil {
 		return err
 	}
+	defer file.Close()
 
 	// Create session and client.
 	sess, err := session.NewSession(&aws.Config{
@@ -69,7 +67,7 @@ func (s *S3) Download(job types.Job) error {
 		Credentials: credentials.NewStaticCredentials(s.Config.AccessKey, s.Config.SecretKey, ""),
 	})
 	if err != nil {
-		panic(err)
+		return err
 	}
 	s3Client := s3.New(sess)
 	downloader := s3manager.NewDownloader(sess)
@@ -79,7 +77,7 @@ func (s *S3) Download(job types.Job) error {
 
 	size, err := getFileSize(s3Client, s.Config.InboundBucket, key)
 	if err != nil {
-		panic(err)
+		return err
 	}
 	log.Println("starting download, size: ", byteCountDecimal(size))
 
@@ -91,106 +89,97 @@ func (s *S3) Download(job types.Job) error {
 	}
 
 	// Download file to local.
-	go s.trackProgress("download")
-	if _, err = downloader.Download(s.Writer, &objInput); err != nil {
+	if _, err = downloader.DownloadWithContext(ctx, s.Writer, &objInput); err != nil {
 		log.Printf("download failed! deleting file: %s", file.Name())
 		os.Remove(file.Name())
-		panic(err)
+		return err
 	}
-	file.Close()
-
-	s.finish()
-	return err
+	return ctx.Err()
 }
 
-func (s *S3) trackProgress(t string) {
-	s.Progress.quit = make(chan struct{})
-	ticker := time.NewTicker(1 * time.Second)
-
-	for {
-		select {
-		case <-s.Progress.quit:
-			ticker.Stop()
-			return
-		case <-ticker.C:
-			if t == "download" {
-				// Download progress.
-				s.Progress.Progress = float32(s.Writer.written*100) / float32(s.Writer.size)
-			} else if t == "upload" {
-				// Upload progress.
-				s.Progress.Progress = float32(s.Reader.read*100/2) / float32(s.Reader.size) // Upload.
-			}
-
-		}
+// ProgressPercent returns the current transfer progress as a percentage between
+// 0 and 100. Callers report it periodically; the transfer itself never writes to
+// the database.
+func (s *S3) ProgressPercent() float64 {
+	if s.Writer != nil && s.Writer.size > 0 {
+		written := atomic.LoadInt64(&s.Writer.written)
+		return float64(written*100) / float64(s.Writer.size)
 	}
-}
-
-func (s *S3) finish() {
-	close(s.Progress.quit)
+	if s.Reader != nil && s.Reader.size > 0 {
+		read := atomic.LoadInt64(&s.Reader.read)
+		return float64(read*100) / float64(s.Reader.size)
+	}
+	return 0
 }
 
 // Upload uploads a file to S3.
-func (s *S3) Upload(job types.Job) error {
+func (s *S3) Upload(ctx context.Context, job types.Job) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	log.Info("uploading files to S3: ", job.Destination)
 	defer log.Info("upload complete")
 
 	// Get list of files in output dir.
-	filelist := []string{}
-	filepath.Walk(path.Dir(job.LocalSource)+"/dst", func(path string, f os.FileInfo, err error) error {
-		if isDirectory(path) {
-			return nil
-		}
-		filelist = append(filelist, path)
-		return nil
-	})
-
-	s.uploadDir(filelist, job)
-	return nil
-}
-
-func (s *S3) uploadDir(filelist []string, job types.Job) {
-	for _, file := range filelist {
-		s.uploadFile(file, job)
-	}
-}
-
-func (s *S3) uploadFile(path string, job types.Job) error {
-	log.Info("uploading file to S3.", job.Destination)
-
-	// Open source path file.
-	file, err := os.Open(path)
+	filelist, err := listFiles(path.Dir(job.LocalSource) + "/dst")
 	if err != nil {
 		return err
 	}
 
+	return s.uploadDir(ctx, filelist, job)
+}
+
+func (s *S3) uploadDir(ctx context.Context, filelist []string, job types.Job) error {
+	for _, file := range filelist {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := s.uploadFile(ctx, file, job); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *S3) uploadFile(ctx context.Context, filePath string, job types.Job) error {
+	log.Info("uploading file to S3.", job.Destination)
+
+	// Open source path file.
+	file, err := os.Open(filePath)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
 	fileInfo, err := file.Stat()
 	if err != nil {
-		log.Println("upload error: ", err)
+		log.Error("upload error: ", err)
 		return err
 	}
 
 	// Set key.
 	parsedURL, _ := url.Parse(job.Destination)
-	key := parsedURL.Path + filepath.Base(path)
+	key := parsedURL.Path + filepath.Base(filePath)
 
 	s.Reader = &ProgressReader{
 		fp:   file,
 		size: fileInfo.Size(),
 	}
 
-	go s.trackProgress("upload")
-
 	sess, err := session.NewSession(&aws.Config{
 		Endpoint:    aws.String(s.Config.Endpoint),
 		Region:      aws.String(s.Config.Region),
 		Credentials: credentials.NewStaticCredentials(s.Config.AccessKey, s.Config.SecretKey, ""),
 	})
+	if err != nil {
+		return err
+	}
 	uploader := s3manager.NewUploader(sess, func(u *s3manager.Uploader) {
 		u.PartSize = 5 * 1024 * 1024
 		u.LeavePartsOnError = true
 	})
 
-	_, err = uploader.Upload(&s3manager.UploadInput{
+	_, err = uploader.UploadWithContext(ctx, &s3manager.UploadInput{
 		Body:   s.Reader,
 		Bucket: aws.String(s.Config.OutboundBucket),
 		Key:    aws.String(key),
@@ -198,8 +187,7 @@ func (s *S3) uploadFile(path string, job types.Job) error {
 	if err != nil {
 		return err
 	}
-	file.Close()
-	return nil
+	return ctx.Err()
 }
 
 // S3ListFiles lists s3 objects for a given prefix.
@@ -209,6 +197,9 @@ func (s *S3) S3ListFiles(prefix string) (*s3.ListObjectsV2Output, error) {
 		Region:      aws.String(s.Config.Region),
 		Credentials: credentials.NewStaticCredentials(s.Config.AccessKey, s.Config.SecretKey, ""),
 	})
+	if err != nil {
+		return nil, err
+	}
 	svc := s3.New(sess)
 
 	resp, err := svc.ListObjectsV2(
@@ -228,6 +219,9 @@ func (s *S3) GetPresignedURL(job types.Job) (string, error) {
 		Region:      aws.String(s.Config.Region),
 		Credentials: credentials.NewStaticCredentials(s.Config.AccessKey, s.Config.SecretKey, ""),
 	})
+	if err != nil {
+		return "", err
+	}
 	svc := s3.New(sess)
 
 	parsedURL, _ := url.Parse(job.Source)
@@ -244,19 +238,21 @@ func (s *S3) GetPresignedURL(job types.Job) (string, error) {
 	return urlStr, err
 }
 
-func isDirectory(path string) bool {
-	fd, err := os.Stat(path)
-	if err != nil {
-		log.Error(err)
-		os.Exit(2)
-	}
-	switch mode := fd.Mode(); {
-	case mode.IsDir():
-		return true
-	case mode.IsRegular():
-		return false
-	}
-	return false
+// listFiles returns every regular file below dir. A missing directory is an
+// error: it means the encode produced no output to upload.
+func listFiles(dir string) ([]string, error) {
+	var files []string
+	err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			return nil
+		}
+		files = append(files, path)
+		return nil
+	})
+	return files, err
 }
 
 func getEndpoint(provider, region string) string {
@@ -271,25 +267,4 @@ func getEndpoint(provider, region string) string {
 		return EndpointDigitalOceanSpacesRegion(region)
 	}
 	return EndpointAmazonAWSRegion(region)
-}
-
-func trackTransferProgress(encodeID int64, s3 *S3) {
-	db := data.New()
-	progressCh = make(chan struct{})
-	ticker := time.NewTicker(ProgressInterval)
-
-	for {
-		select {
-		case <-progressCh:
-			ticker.Stop()
-			return
-		case <-ticker.C:
-			log.Info("transfer progress: ", s3.Progress.Progress)
-			err := db.Jobs.UpdateTransferProgressByID(encodeID, float64(s3.Progress.Progress))
-			fmt.Println(float64(s3.Progress.Progress))
-			if err != nil {
-				log.Error(err)
-			}
-		}
-	}
 }

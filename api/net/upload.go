@@ -1,6 +1,7 @@
 package net
 
 import (
+	"context"
 	"errors"
 
 	"github.com/alfg/openencoder/api/data"
@@ -8,7 +9,11 @@ import (
 )
 
 // Upload uploads a job based on the driver setting.
-func Upload(job types.Job) error {
+//
+// report, when not nil, is called periodically with the upload percentage. The
+// context aborts a running upload when the job is cancelled; the transfer never
+// writes to the database itself.
+func Upload(ctx context.Context, job types.Job, report ProgressFunc) error {
 	db := data.New()
 	driver, err := db.Settings.GetSetting(types.StorageDriver)
 	if err != nil {
@@ -16,21 +21,15 @@ func Upload(job types.Job) error {
 	}
 
 	if driver.Value == "s3" {
-		if err := s3Upload(job); err != nil {
-			return err
-		}
-		return nil
+		return s3Upload(ctx, job, report)
 	} else if driver.Value == "ftp" {
-		if err := ftpUpload(job); err != nil {
-			return err
-		}
-		return nil
+		return ftpUpload(ctx, job)
 	}
 	return errors.New("no driver set")
 }
 
-// GetUploader gets the upload function.
-func s3Upload(job types.Job) error {
+// s3Upload uploads a job's output to S3.
+func s3Upload(ctx context.Context, job types.Job, report ProgressFunc) error {
 	// Get credentials from settings.
 	db := data.New()
 	settings := db.Settings.GetSettings()
@@ -44,24 +43,17 @@ func s3Upload(job types.Job) error {
 		OutboundBucket: types.GetSetting(types.S3OutboundBucket, settings),
 	}
 
-	// Get job data.
-	j, err := db.Jobs.GetJobByGUID(job.GUID)
-	if err != nil {
-		log.Error(err)
-		return err
-	}
-	encodeID := j.EncodeID
-
 	s3 := NewS3(config)
-	go trackTransferProgress(encodeID, s3)
-	err = s3.Upload(job)
-	close(progressCh)
+
+	stop := startProgressReporter(ctx, ProgressInterval, s3.ProgressPercent, report)
+	err := s3.Upload(ctx, job)
+	stop()
 
 	return err
 }
 
-// GetFTPUploader sets the FTP upload function.
-func ftpUpload(job types.Job) error {
+// ftpUpload uploads a job's output to FTP.
+func ftpUpload(ctx context.Context, job types.Job) error {
 	db := data.New()
 	settings := db.Settings.GetSettings()
 
@@ -70,6 +62,5 @@ func ftpUpload(job types.Job) error {
 	pass := types.GetSetting(types.FTPPassword, settings)
 
 	f := NewFTP(addr, user, pass)
-	err := f.Upload(job)
-	return err
+	return f.Upload(ctx, job)
 }

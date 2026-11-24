@@ -1,14 +1,20 @@
 package net
 
 import (
+	"context"
 	"errors"
+	"time"
 
 	"github.com/alfg/openencoder/api/data"
 	"github.com/alfg/openencoder/api/types"
 )
 
 // Download downloads a job source based on the driver setting.
-func Download(job types.Job) error {
+//
+// report, when not nil, is called periodically with the transfer percentage.
+// The context aborts a running download when the job is cancelled; the transfer
+// never writes to the database itself.
+func Download(ctx context.Context, job types.Job, report ProgressFunc) error {
 	db := data.New()
 	setting, err := db.Settings.GetSetting(types.StorageDriver)
 	if err != nil {
@@ -17,15 +23,9 @@ func Download(job types.Job) error {
 	driver := setting.Value
 
 	if driver == "s3" {
-		if err := s3Download(job); err != nil {
-			return err
-		}
-		return nil
+		return s3Download(ctx, job, report)
 	} else if driver == "ftp" {
-		if err := ftpDownload(job); err != nil {
-			return err
-		}
-		return nil
+		return ftpDownload(ctx, job)
 	}
 	return errors.New("no driver set")
 }
@@ -52,17 +52,9 @@ func GetPresignedURL(job types.Job) (string, error) {
 }
 
 // S3Download sets the download function.
-func s3Download(job types.Job) error {
+func s3Download(ctx context.Context, job types.Job, report ProgressFunc) error {
 	db := data.New()
 	settings := db.Settings.GetSettings()
-
-	// Get job data.
-	j, err := db.Jobs.GetJobByGUID(job.GUID)
-	if err != nil {
-		log.Error(err)
-		return err
-	}
-	encodeID := j.EncodeID
 
 	config := S3Config{
 		AccessKey:      types.GetSetting(types.S3AccessKey, settings),
@@ -74,16 +66,18 @@ func s3Download(job types.Job) error {
 	}
 	s3 := NewS3(config)
 
-	// Download with progress updates.
-	go trackTransferProgress(encodeID, s3)
-	err = s3.Download(job)
-	close(progressCh)
+	// Report transfer progress while the download runs. The reporter is
+	// stopped and awaited before returning, so no progress write can happen
+	// after the stage finished.
+	stop := startProgressReporter(ctx, ProgressInterval, s3.ProgressPercent, report)
+	err := s3.Download(ctx, job)
+	stop()
 
 	return err
 }
 
 // FTPDownload sets the FTP download function.
-func ftpDownload(job types.Job) error {
+func ftpDownload(ctx context.Context, job types.Job) error {
 	db := data.New()
 	settings := db.Settings.GetSettings()
 
@@ -92,6 +86,44 @@ func ftpDownload(job types.Job) error {
 	pass := types.GetSetting(types.FTPPassword, settings)
 
 	f := NewFTP(addr, user, pass)
-	err := f.Download(job)
-	return err
+	return f.Download(ctx, job)
+}
+
+// startProgressReporter starts a goroutine that reports transfer progress every
+// interval until the returned stop function is called or ctx is done. The
+// returned stop function blocks until the reporter has exited so callers can
+// guarantee that no progress write happens after it returns.
+func startProgressReporter(ctx context.Context, interval time.Duration, read func() float64, report ProgressFunc) func() {
+	if report == nil {
+		return func() {}
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if interval <= 0 {
+		interval = ProgressInterval
+	}
+
+	done := make(chan struct{})
+	exited := make(chan struct{})
+	go func() {
+		defer close(exited)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				report(read())
+			}
+		}
+	}()
+
+	return func() {
+		close(done)
+		<-exited
+	}
 }

@@ -3,6 +3,7 @@ module github.com/alfg/openencoder
 go 1.14
 
 require (
+	github.com/DATA-DOG/go-sqlmock v1.5.0
 	github.com/appleboy/gin-jwt/v2 v2.6.2
 	github.com/aws/aws-sdk-go v1.20.15
 	github.com/digitalocean/godo v1.42.0

@@ -2,32 +2,67 @@ package encoder
 
 import (
 	"bufio"
-	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"io/ioutil"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
-const (
-	ffmpegCmd      = "ffmpeg"
-	updateInterval = time.Second * 5
-)
+// ffmpegCmd is the ffmpeg executable. It is a variable so tests can point it at
+// a fake binary and exercise the real process handling code.
+var ffmpegCmd = "ffmpeg"
+
+// pipeDrainTimeout bounds how long Run waits for the encoder output pipe to
+// close after the process exited. A process that inherited the pipe (for
+// example a shell wrapper on Windows) must never keep a job from converging.
+const pipeDrainTimeout = 2 * time.Second
+
+// ErrCancelled is returned by Run when the encoder was stopped because the job
+// was cancelled or its execution was superseded.
+var ErrCancelled = errors.New("cancelled")
+
+// SetFFmpegCommand overrides the ffmpeg executable and returns a function that
+// restores the previous value. It is intended for tests.
+func SetFFmpegCommand(cmd string) func() {
+	previous := ffmpegCmd
+	ffmpegCmd = cmd
+	return func() { ffmpegCmd = previous }
+}
 
 // FFmpeg struct.
 type FFmpeg struct {
-	Progress    progress
-	cmd         *exec.Cmd
-	isCancelled bool
+	cmd *exec.Cmd
+
+	mu       sync.Mutex
+	progress progress
+	cancel   bool
+	finished bool
 }
 
 type progress struct {
-	quit chan struct{}
+	Frame      int
+	FPS        float64
+	Bitrate    float64
+	TotalSize  int
+	OutTimeMS  int
+	OutTime    string
+	DupFrames  int
+	DropFrames int
+	Speed      string
+	Progress   float64
+}
 
+// Snapshot is a point in time copy of the encoder progress. It is safe to read
+// from another goroutine while the encoder is running.
+type Snapshot struct {
 	Frame      int
 	FPS        float64
 	Bitrate    float64
@@ -108,50 +143,149 @@ type filterOptions struct {
 }
 
 // Run runs the ffmpeg encoder with options.
-func (f *FFmpeg) Run(input, output, data string) error {
+//
+// The context controls the lifetime of the encoder process: cancelling it kills
+// the running ffmpeg process immediately instead of waiting for the next
+// progress poll. Run is safe to call from one goroutine while Cancel is called
+// from another.
+func (f *FFmpeg) Run(ctx context.Context, input, output, data string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 
-	// Parse options and add to args slice.
-	args := parseOptions(input, output, data)
+	// Parse options and build the command.
+	args, err := parseOptions(input, output, data)
+	if err != nil {
+		return err
+	}
 
-	// Execute command.
 	log.Info("running FFmpeg with options: ", args)
-	f.cmd = exec.Command(ffmpegCmd, args...)
-	stdout, _ := f.cmd.StdoutPipe()
-
-	// Capture stderr (if any).
-	var stderr bytes.Buffer
-	f.cmd.Stderr = &stderr
-	err := f.cmd.Start()
+	cmd := exec.CommandContext(ctx, ffmpegCmd, args...)
+	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return err
 	}
 
-	// Send progress updates.
-	go f.trackProgress()
-
-	// Update progress struct.
-	f.updateProgress(stdout)
-
-	err = f.cmd.Wait()
+	// Capture stderr (if any) in a temporary file. Using a file instead of an
+	// io.Writer keeps exec from starting a copy goroutine, so Wait can not block
+	// on a descendant process that inherited the pipe.
+	stderrFile, err := ioutil.TempFile("", "openencoder-ffmpeg-*.log")
 	if err != nil {
-		if f.isCancelled {
-			return errors.New("cancelled")
+		return err
+	}
+	stderrPath := stderrFile.Name()
+	defer func() {
+		stderrFile.Close()
+		os.Remove(stderrPath)
+	}()
+	cmd.Stderr = stderrFile
+
+	// A Cancel that arrives before Run starts still has to win.
+	f.mu.Lock()
+	if f.finished {
+		f.mu.Unlock()
+		return ErrCancelled
+	}
+	alreadyCancelled := f.cancel
+	f.cmd = cmd
+	f.mu.Unlock()
+	if alreadyCancelled {
+		return ErrCancelled
+	}
+
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+
+	// A Cancel that raced with Start could not see the process yet; kill it now.
+	if f.wasCancelled() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
 		}
-		f.finish()
-		return err
+		_ = cmd.Wait()
+		return ErrCancelled
 	}
-	f.finish()
+
+	// Drain stdout and record the latest progress until the pipe closes. This
+	// must run concurrently, otherwise a cancelled process could block while
+	// writing to a pipe nobody reads.
+	drainDone := make(chan struct{})
+	go func() {
+		defer close(drainDone)
+		f.updateProgress(stdout)
+	}()
+
+	waitErr := cmd.Wait()
+
+	// Unblock the progress reader in case a descendant process still holds the
+	// write end of the pipe; the job must converge either way.
+	_ = stdout.Close()
+	select {
+	case <-drainDone:
+	case <-time.After(pipeDrainTimeout):
+		log.Warn("ffmpeg output pipe is still open; continuing")
+	}
+
+	if f.wasCancelled() || ctx.Err() != nil {
+		return ErrCancelled
+	}
+	if waitErr != nil {
+		return fmt.Errorf("%w: %s", waitErr, lastLine(readTempFile(stderrFile)))
+	}
 	return nil
 }
 
-// Cancel stops an FFmpeg job from running.
+// Cancel stops a running FFmpeg job immediately.
 func (f *FFmpeg) Cancel() {
+	f.mu.Lock()
+	if f.finished {
+		f.mu.Unlock()
+		return
+	}
+	f.cancel = true
+	cmd := f.cmd
+	f.mu.Unlock()
+
+	if cmd == nil || cmd.Process == nil {
+		return
+	}
 	log.Warn("killing ffmpeg process")
-	f.isCancelled = true
-	if err := f.cmd.Process.Kill(); err != nil {
+	if err := cmd.Process.Kill(); err != nil {
+		// Killing an already exited process is not an error for our purposes.
 		log.Warn("failed to kill process: ", err)
 	}
-	log.Warn("killed ffmpeg process")
+}
+
+// Done marks the encoder as finished. Calls to Cancel after Done are no-ops, so
+// a late cancel can never affect a job that already finished.
+func (f *FFmpeg) Done() {
+	f.mu.Lock()
+	f.finished = true
+	f.mu.Unlock()
+}
+
+// ProgressSnapshot returns a consistent copy of the encoder progress.
+func (f *FFmpeg) ProgressSnapshot() Snapshot {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return Snapshot{
+		Frame:      f.progress.Frame,
+		FPS:        f.progress.FPS,
+		Bitrate:    f.progress.Bitrate,
+		TotalSize:  f.progress.TotalSize,
+		OutTimeMS:  f.progress.OutTimeMS,
+		OutTime:    f.progress.OutTime,
+		DupFrames:  f.progress.DupFrames,
+		DropFrames: f.progress.DropFrames,
+		Speed:      f.progress.Speed,
+		Progress:   f.progress.Progress,
+	}
+}
+
+func (f *FFmpeg) wasCancelled() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.cancel
 }
 
 // Version gets the ffmpeg version.
@@ -162,6 +296,7 @@ func (f *FFmpeg) Version() string {
 
 func (f *FFmpeg) updateProgress(stdout io.ReadCloser) {
 	scanner := bufio.NewScanner(stdout)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -173,66 +308,83 @@ func (f *FFmpeg) updateProgress(stdout io.ReadCloser) {
 }
 
 func (f *FFmpeg) setProgressParts(parts []string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
 	for i := 0; i < len(parts); i++ {
-		progressSplit := strings.Split(parts[i], "=")
+		progressSplit := strings.SplitN(parts[i], "=", 2)
+		if len(progressSplit) != 2 {
+			continue
+		}
 		k := progressSplit[0]
 		v := progressSplit[1]
 
 		switch k {
 		case "frame":
 			frame, _ := strconv.Atoi(v)
-			f.Progress.Frame = frame
+			f.progress.Frame = frame
 		case "fps":
 			fps, _ := strconv.ParseFloat(v, 64)
-			f.Progress.FPS = fps
+			f.progress.FPS = fps
 		case "bitrate":
 			v = strings.Replace(v, "kbits/s", "", -1)
 			bitrate, _ := strconv.ParseFloat(v, 64)
-			f.Progress.Bitrate = bitrate
+			f.progress.Bitrate = bitrate
 		case "total_size":
 			size, _ := strconv.Atoi(v)
-			f.Progress.TotalSize = size
+			f.progress.TotalSize = size
 		case "out_time_ms":
 			outTimeMS, _ := strconv.Atoi(v)
-			f.Progress.OutTimeMS = outTimeMS
+			f.progress.OutTimeMS = outTimeMS
 		case "out_time":
-			f.Progress.OutTime = v
+			f.progress.OutTime = v
 		case "dup_frames":
 			frames, _ := strconv.Atoi(v)
-			f.Progress.DupFrames = frames
+			f.progress.DupFrames = frames
 		case "drop_frames":
 			frames, _ := strconv.Atoi(v)
-			f.Progress.DropFrames = frames
+			f.progress.DropFrames = frames
 		case "speed":
-			f.Progress.Speed = v
+			f.progress.Speed = v
 		case "progress":
 			progress, _ := strconv.ParseFloat(v, 64)
-			f.Progress.Progress = progress
+			f.progress.Progress = progress
 		}
 	}
 }
 
-func (f *FFmpeg) trackProgress() {
-	f.Progress.quit = make(chan struct{})
-	ticker := time.NewTicker(updateInterval)
+// readTempFile returns the captured stderr of the encoder.
+func readTempFile(f *os.File) string {
+	if f == nil {
+		return ""
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return ""
+	}
+	b, err := ioutil.ReadAll(io.LimitReader(f, 64*1024))
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}
 
-	for {
-		select {
-		case <-f.Progress.quit:
-			ticker.Stop()
-			return
-		case <-ticker.C:
-			// log.Info((f.Progress)
+// lastLine returns the last non-empty line of s, truncated for error messages.
+func lastLine(s string) string {
+	lines := strings.Split(strings.TrimSpace(s), "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := strings.TrimSpace(lines[i])
+		if line != "" {
+			if len(line) > 300 {
+				line = line[:300]
+			}
+			return line
 		}
 	}
+	return "ffmpeg failed"
 }
 
-func (f *FFmpeg) finish() {
-	close(f.Progress.quit)
-}
-
-// Utilities for parsing ffmpeg options.
-func parseOptions(input, output, data string) []string {
+// parseOptions translates the preset data into ffmpeg command line arguments.
+func parseOptions(input, output, data string) ([]string, error) {
 	args := []string{
 		"-hide_banner",
 		"-loglevel", "error", // Set loglevel to fail job on errors.
@@ -243,7 +395,7 @@ func parseOptions(input, output, data string) []string {
 	// Decode JSON get options list from data.
 	options := &ffmpegOptions{}
 	if err := json.Unmarshal([]byte(data), &options); err != nil {
-		panic(err)
+		return nil, fmt.Errorf("invalid ffmpeg options: %w", err)
 	}
 
 	// If raw options provided, add the list of raw options from ffmpeg presets.
@@ -252,7 +404,7 @@ func parseOptions(input, output, data string) []string {
 			args = append(args, strings.Split(v, " ")...)
 		}
 		args = append(args, output)
-		return args
+		return args, nil
 	}
 
 	// Set options from struct.
@@ -265,8 +417,9 @@ func parseOptions(input, output, data string) []string {
 
 	// Add output arg last.
 	args = append(args, output)
-	return args
+	return args, nil
 }
+
 func setFormatFlags(opt formatOptions) []string {
 	args := []string{}
 

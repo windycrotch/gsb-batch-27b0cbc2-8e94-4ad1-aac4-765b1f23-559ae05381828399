@@ -2,6 +2,7 @@ package net
 
 import (
 	"bufio"
+	"context"
 	"io"
 	"net/textproto"
 	"net/url"
@@ -37,43 +38,73 @@ func NewFTP(addr string, username string, password string) *FTP {
 	}
 }
 
+// dial opens an FTP connection bound to ctx so a cancelled job aborts promptly.
+func (f *FTP) dial(ctx context.Context) (*ftp.ServerConn, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return ftp.Dial(f.Addr,
+		ftp.DialWithTimeout(f.Timeout*time.Second),
+		ftp.DialWithContext(ctx))
+}
+
 // Download download a file from an FTP connection.
-func (f *FTP) Download(job types.Job) error {
+func (f *FTP) Download(ctx context.Context, job types.Job) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	log.Info("downloading from FTP: ", job.Source)
 
 	// Create FTP connection.
-	c, err := ftp.Dial(f.Addr, ftp.DialWithTimeout(f.Timeout*time.Second))
+	c, err := f.dial(ctx)
 	if err != nil {
 		log.Error(err)
 		return err
 	}
 
 	// Login.
-	err = c.Login(f.Username, f.Password)
-	if err != nil {
+	if err = c.Login(f.Username, f.Password); err != nil {
 		log.Error(err)
+		c.Quit()
 		return err
 	}
 
 	resp, err := c.Retr(job.Source)
 	if err != nil {
 		log.Error(err)
+		c.Quit()
 		return err
 	}
 	defer resp.Close()
 
-	outputFile, _ := os.OpenFile(job.LocalSource, os.O_WRONLY|os.O_CREATE, 0644)
+	outputFile, err := os.OpenFile(job.LocalSource, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	if err != nil {
+		resp.Close()
+		c.Quit()
+		return err
+	}
 	defer outputFile.Close()
 
 	reader := bufio.NewReader(resp)
 	p := make([]byte, 1024*4)
 
 	for {
-		n, err := reader.Read(p)
-		if err == io.EOF {
+		if err := ctx.Err(); err != nil {
+			c.Quit()
+			return err
+		}
+		n, readErr := reader.Read(p)
+		if readErr == io.EOF {
 			break
 		}
-		outputFile.Write(p[:n])
+		if readErr != nil {
+			c.Quit()
+			return readErr
+		}
+		if _, writeErr := outputFile.Write(p[:n]); writeErr != nil {
+			c.Quit()
+			return writeErr
+		}
 	}
 
 	// Quit connection.
@@ -81,74 +112,83 @@ func (f *FTP) Download(job types.Job) error {
 		log.Error(err)
 		return err
 	}
-	return err
+	return ctx.Err()
 }
 
 // Upload uploads a file to FTP.
-func (f *FTP) Upload(job types.Job) error {
+func (f *FTP) Upload(ctx context.Context, job types.Job) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	log.Info("uploading files to FTP: ", job.Destination)
 	defer log.Info("upload complete")
 
 	// Get list of files in output dir.
-	filelist := []string{}
-	filepath.Walk(path.Dir(job.LocalSource)+"/dst", func(path string, f os.FileInfo, err error) error {
-		if isDirectory(path) {
-			return nil
-		}
-		filelist = append(filelist, path)
-		return nil
-	})
+	filelist, err := listFiles(path.Dir(job.LocalSource) + "/dst")
+	if err != nil {
+		return err
+	}
 
-	f.uploadDir(filelist, job)
+	return f.uploadDir(ctx, filelist, job)
+}
+
+func (f *FTP) uploadDir(ctx context.Context, filelist []string, job types.Job) error {
+	for _, file := range filelist {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := f.uploadFile(ctx, file, job); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
-func (f *FTP) uploadDir(filelist []string, job types.Job) {
-	for _, file := range filelist {
-		f.uploadFile(file, job)
-	}
-}
-
-// UploadFile uploads a file from an FTP connection.
-func (f *FTP) uploadFile(path string, job types.Job) error {
+// uploadFile uploads a file from an FTP connection.
+func (f *FTP) uploadFile(ctx context.Context, filePath string, job types.Job) error {
 	// Create FTP connection.
-	c, err := ftp.Dial(f.Addr, ftp.DialWithTimeout(f.Timeout*time.Second))
+	c, err := f.dial(ctx)
 	if err != nil {
-		log.Error(err)
 		return err
 	}
 
 	// Login.
-	err = c.Login(f.Username, f.Password)
-	if err != nil {
-		log.Error(err)
+	if err = c.Login(f.Username, f.Password); err != nil {
+		c.Quit()
 		return err
 	}
 
-	file, err := os.Open(path)
-	defer file.Close()
+	file, err := os.Open(filePath)
 	if err != nil {
+		c.Quit()
 		return err
 	}
+	defer file.Close()
 	reader := bufio.NewReader(file)
 
 	// Set destination path.
 	parsedURL, _ := url.Parse(job.Destination)
-	key := parsedURL.Path + filepath.Base(path)
+	key := parsedURL.Path + filepath.Base(filePath)
 
-	// Create directory.
-	err = c.MakeDir(parsedURL.Path)
-	if err != nil && err.(*textproto.Error).Msg != ErrorFileExists {
+	// Create directory. A pre-existing directory is fine.
+	if err = c.MakeDir(parsedURL.Path); err != nil {
+		if protoErr, ok := err.(*textproto.Error); !ok || protoErr.Msg != ErrorFileExists {
+			log.Error(err)
+			c.Quit()
+			return err
+		}
+	}
+
+	if err = c.Stor(key, reader); err != nil {
+		log.Error(err)
+		c.Quit()
+		return err
+	}
+	if err := c.Quit(); err != nil {
 		log.Error(err)
 		return err
 	}
-
-	err = c.Stor(key, reader)
-	if err != nil {
-		log.Error(err)
-		return err
-	}
-	return nil
+	return ctx.Err()
 }
 
 // ListFiles lists FTP files for a given prefix.
@@ -159,9 +199,8 @@ func (f *FTP) ListFiles(prefix string) ([]*ftp.Entry, error) {
 		return nil, err
 	}
 
-	err = c.Login(f.Username, f.Password)
-	if err != nil {
-		log.Error(err)
+	if err = c.Login(f.Username, f.Password); err != nil {
+		c.Quit()
 		return nil, err
 	}
 
@@ -171,5 +210,5 @@ func (f *FTP) ListFiles(prefix string) ([]*ftp.Entry, error) {
 		log.Error(err)
 		return nil, err
 	}
-	return entries, nil
+	return entries, err
 }

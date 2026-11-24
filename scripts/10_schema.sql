@@ -7,9 +7,11 @@ create table jobs
     primary key,
   preset        varchar(128) not null,
   created_date timestamp default CURRENT_TIMESTAMP,
-  status       varchar(64),
-  source       varchar(128),
-  destination  varchar(128)
+  status           varchar(64),
+  source           varchar(128),
+  destination      varchar(128),
+  run_id           varchar(128),
+  cancel_requested boolean default false not null
 );
 
 alter table jobs
@@ -23,6 +25,9 @@ create unique index jobs_guid_uindex
 
 create index jobs_status_index
   on jobs (status);
+
+create index jobs_run_id_index
+  on jobs (run_id);
 
 -- auto-generated definition
 create table encode

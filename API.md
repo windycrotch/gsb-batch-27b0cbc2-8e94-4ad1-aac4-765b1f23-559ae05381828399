@@ -200,6 +200,12 @@ Content-Type: application/json
 POST /api/jobs/:job_id/cancel
 ```
 
+Requests cancellation of a job. The running stage is stopped as soon as the
+worker observes the request (a running FFmpeg or FFprobe process is killed,
+transfers abort), the job's temporary directory is removed and the job ends in
+`cancelled`. Cancelling an already terminal job is a no-op and reports
+`"cancelled": false`.
+
 ##### Response
 ```
 Content-Type: application/json
@@ -207,6 +213,7 @@ Content-Type: application/json
 ```json
 {
   "status": 200,
+  "cancelled": true
 }
 ```
 
@@ -216,6 +223,11 @@ Content-Type: application/json
 ```
 POST /api/jobs/:job_id/restart
 ```
+
+Queues a cancelled or failed job for a new execution. The previous execution is
+invalidated (its run id no longer matches), its progress is reset and any late
+progress or status write it performs is discarded. The job moves to
+`restarting` and starts from a clean working directory.
 
 ##### Response
 ```

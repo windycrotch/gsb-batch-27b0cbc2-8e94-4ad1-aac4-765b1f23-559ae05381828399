@@ -72,29 +72,25 @@ func (c *Context) SendJob(job *work.Job) error {
 		Destination: destination,
 	}
 
-	// Check if job is cancelled.
+	// A job that was cancelled before it started must not run at all.
 	db := data.New()
-	jobStatus, _ := db.Jobs.GetJobStatusByGUID(guid)
-	if jobStatus == types.JobCancelled {
+	state, err := db.Jobs.GetJobRunStateByGUID(guid)
+	if err != nil {
+		log.Error(err)
+		return nil
+	}
+	if state.Status == types.JobCancelled || state.CancelRequested {
 		return nil
 	}
 
-	// Start job.
-	runEncodeJob(j)
+	// Start job. The lifecycle decides whether this execution may own the job.
+	lifecycle := NewLifecycle(config.Get().WorkDirectory)
+	if _, err := lifecycle.Run(jobContext(), j); err != nil {
+		log.Error(err)
+	}
 	log.Infof("worker: completed %s!\n", j.Preset)
 	return nil
 }
-
-func startJob(id int, j types.Job) {
-	log.Infof("worker: started %s\n", j.Preset)
-
-	// runWorkflow(j)
-	log.Infof("worker: completed %s!\n", j.Preset)
-}
-
-// func (c *Context) Export(job *work.Job) error {
-// 	return nil
-// }
 
 // Config defines configuration for creating a NewWorker.
 type Config struct {
@@ -131,9 +127,6 @@ func NewWorker(workerCfg Config) {
 
 	// Map the name of jobs to handler functions
 	pool.Job(config.Get().WorkerJobName, (*Context).SendJob)
-
-	// Customize options:
-	// pool.JobWithOptions("export", work.JobOptions{Priority: 10, MaxFails: 1}, (*Context).Export)
 
 	// Start processing jobs
 	pool.Start()

@@ -184,8 +184,19 @@ func updateJobByIDHandler(c *gin.Context) {
 		return
 	}
 
+	previousStatus := job.Status
 	if json.Status != "" {
 		job.Status = json.Status
+	}
+
+	// Manually moving a job to a non-terminal status must also reset the run
+	// binding, otherwise a previous execution would still be considered the
+	// owner and keep writing to it. An update that does not change the status
+	// must never steal a running execution's ownership.
+	if job.Status != previousStatus && !types.IsTerminalStatus(job.Status) {
+		if _, err := db.Jobs.RestartJobRunByGUID(job.GUID); err != nil {
+			log.Error(err)
+		}
 	}
 
 	updatedJob := db.Jobs.UpdateJobByID(id, *job)
@@ -215,12 +226,21 @@ func cancelJobByIDHandler(c *gin.Context) {
 		return
 	}
 
-	// Update status.
+	// Mark the job as cancelled. The running execution observes the request on
+	// its next write or poll and stops the active stage.
 	db := data.New()
-	db.Jobs.UpdateJobStatusByID(id, types.JobCancelled)
+	cancelled, err := db.Jobs.RequestJobCancelByID(id)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"status":  http.StatusInternalServerError,
+			"message": err.Error(),
+		})
+		return
+	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"status": http.StatusOK,
+		"status":    http.StatusOK,
+		"cancelled": cancelled,
 	})
 }
 
@@ -234,14 +254,28 @@ func restartJobByIDHandler(c *gin.Context) {
 		return
 	}
 
-	// Update status.
 	db := data.New()
-	db.Jobs.UpdateJobStatusByID(id, types.JobRestarting)
+	job, err := db.Jobs.GetJobByID(int64(id))
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{
+			"status":  http.StatusNotFound,
+			"message": "Job does not exist",
+		})
+		return
+	}
 
-	job, _ := db.Jobs.GetJobByID(int64(id))
+	// Invalidate the previous execution and reset its progress. Any late write
+	// from it is rejected because its run id no longer matches.
+	if _, err := db.Jobs.RestartJobRunByGUID(job.GUID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"status":  http.StatusInternalServerError,
+			"message": err.Error(),
+		})
+		return
+	}
 
 	// Send back to work queue.
-	_, err := enqueuer.Enqueue(config.Get().WorkerJobName, work.Q{
+	_, err = enqueuer.Enqueue(config.Get().WorkerJobName, work.Q{
 		"guid":        job.GUID,
 		"preset":      job.Preset,
 		"source":      job.Source,
